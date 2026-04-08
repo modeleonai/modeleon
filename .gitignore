@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Build artifacts
+*.xlsx
+
+# Environment / secrets
+.env
+.env.*
+
+# OS
+.DS_Store
+
+# AI coding tools
+CLAUDE.md
+.claude/
+.cursor/
+.cursorignore
+.cursorules
+.copilot/
+.github/copilot/
