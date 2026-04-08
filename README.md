@@ -30,7 +30,7 @@ model.to_excel("forecast.xlsx")
 
 Every cell is a live formula you can audit, extend, and trust.
 
-> **Status:** Early development. Star this repo to follow progress.
+> **Coming soon.** Star this repo to follow progress.
 
 [modeleon.ai](https://modeleon.ai) | [PyPI](https://pypi.org/project/modeleon/)
 
