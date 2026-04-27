@@ -1,0 +1,7 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or how-to
+    url: https://github.com/modeleonai/modeleon/discussions
+    about: |
+      For questions about how to model something or whether Modeleon
+      fits your use case, please use Discussions instead of Issues.

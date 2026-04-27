@@ -1,0 +1,86 @@
+name: Bug report
+description: Report something Modeleon does wrong (incorrect output, crash, unexpected behaviour).
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug report. A small reproducer and version
+        info help us diagnose much faster — please fill in the fields
+        below.
+
+        Heads up: Modeleon is maintained by one person, so triage
+        timelines are weeks, not days. Issues with full reproducers
+        get attention first.
+
+  - type: textarea
+    id: reproducer
+    attributes:
+      label: Minimal reproducer
+      description: |
+        5–20 lines of Python that triggers the bug. Self-contained and
+        runnable as-is. Paste the code (no screenshots).
+      render: python
+      placeholder: |
+        import modeleon as mo
+
+        with mo.MultiVariable("Test") as model:
+            x = mo.Variable(10)
+            y = x + 1
+            print(y.value)   # expected 11, got ???
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+      description: One or two sentences describing the expected outcome.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: What actually happened?
+      description: |
+        The output, traceback, or wrong value. Paste the full
+        traceback as text (not a screenshot).
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: modeleon-version
+    attributes:
+      label: Modeleon version
+      description: "`pip show modeleon` → look at the Version: line"
+      placeholder: "0.1.2"
+    validations:
+      required: true
+
+  - type: input
+    id: python-version
+    attributes:
+      label: Python version
+      description: "`python --version`"
+      placeholder: "3.12.4"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: "macOS 14.5 / Ubuntu 22.04 / Windows 11"
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: |
+        Optional. Workarounds you tried, related issues, or context
+        about the model you're building.

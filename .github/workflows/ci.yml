@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Primary: ubuntu across all supported Python versions.
+        # Secondary: one job on Windows and macOS to catch path /
+        # filesystem quirks that Linux masks (backslashes, file
+        # locking, case-insensitive paths).
+        include:
+          - os: ubuntu-latest
+            python-version: "3.12"
+          - os: ubuntu-latest
+            python-version: "3.13"
+          - os: windows-latest
+            python-version: "3.12"
+          - os: macos-latest
+            python-version: "3.12"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install
+        run: |
+          pip install -e ".[dev]"
+          pip install nbclient nbformat ipykernel
+        shell: bash
+      - name: Lint
+        run: ruff check src/ tests/
+        shell: bash
+      - name: Typecheck
+        run: mypy src/modeleon/
+        continue-on-error: true  # warn but don't block until strict passes
+        shell: bash
+      - name: Test
+        run: pytest -q
+        shell: bash

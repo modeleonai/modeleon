@@ -1,30 +1,52 @@
 [build-system]
-requires = ["hatchling<1.27"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
 name = "modeleon"
-version = "0.1.1"
+version = "0.1.2"
 description = "Financial Model Engineering — Python code compiles to live Excel formulas"
 requires-python = ">=3.12"
-license = {text = "Apache-2.0"}
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 authors = [{name = "Modeleon", email = "admin@modeleon.ai"}]
 readme = "README.md"
-keywords = ["financial-modeling", "excel", "python", "formulas"]
+keywords = [
+    "financial-modeling",
+    "excel",
+    "openpyxl",
+    "formulas",
+    "spreadsheet",
+    "forecasting",
+    "finance",
+    "dsl",
+]
 classifiers = [
-    "Development Status :: 2 - Pre-Alpha",
-    "License :: OSI Approved :: Apache Software License",
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Office/Business :: Financial",
+    "Topic :: Office/Business :: Financial :: Spreadsheet",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
 ]
 dependencies = [
-    "pydantic>=2.0",
     "openpyxl>=3.1",
+    "numpy>=1.26",
+    "python-dateutil>=2.8",
 ]
 
 [project.urls]
 Homepage = "https://modeleon.ai"
 Repository = "https://github.com/modeleonai/modeleon"
+Documentation = "https://modeleon.ai/docs"
+Changelog = "https://github.com/modeleonai/modeleon/blob/main/CHANGELOG.md"
+Issues = "https://github.com/modeleonai/modeleon/issues"
 
 [project.optional-dependencies]
 dev = [
@@ -35,10 +57,28 @@ dev = [
 ]
 
 [project.entry-points."modeleon.plugins"]
-# Pro registers here: pro = "modeleon_pro.plugin"
+# Extensions register here, e.g.  myext = "myext.plugin"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/modeleon"]
+
+# Sdist contents — keep README, LICENSE, NOTICE, CHANGELOG,
+# CONTRIBUTING, pyproject.toml, src/, tests/, examples/. Exclude
+# internal docs (CLAUDE.md), notebooks (large + non-essential for
+# distribution), build artifacts, and any stray xlsx outputs.
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "CLAUDE.md",
+    "notebooks/",
+    "*.xlsx",
+    "**/__pycache__",
+    "**/.pytest_cache",
+    "**/.ruff_cache",
+    "**/.mypy_cache",
+    "dist/",
+    "build/",
+    "*.egg-info/",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -46,6 +86,21 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+
+[tool.ruff.lint]
+# N802: function name should be lowercase.
+# We deliberately use Excel casing (SUM, MAX, MIN, AVERAGE, ABS, ROUND, INT, MOD, IF)
+# for the public helpers so ``mo.SUM(revenues)`` reads the same as the
+# ``=SUM(...)`` cell it compiles to — Python-Excel parity is the thesis.
+ignore = ["N802"]
+
+[tool.ruff.lint.per-file-ignores]
+# F841: unused local variables. Tests routinely assign Variables to
+#   locals (``revenue = mo.Variable(...)``) for frame introspection to
+#   pick up the name; many of those are not read again in the test body.
+# E702: multi-statement on one line. Tests use it for compact setup.
+# F401: unused imports. Some tests import fixtures for re-export.
+"tests/**/*.py" = ["F841", "E702", "F401"]
 
 [tool.mypy]
 python_version = "3.12"

@@ -1,0 +1,38 @@
+name: Feature request
+description: Suggest a new capability or API.
+title: "[feature] "
+labels: ["feature"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For larger feature ideas, please consider opening a
+        [Discussion](https://github.com/modeleonai/modeleon/discussions)
+        first to talk through the use case before filing this issue.
+
+  - type: textarea
+    id: use-case
+    attributes:
+      label: What are you trying to model?
+      description: |
+        Describe the financial / business modeling problem first.
+        What does the user want to express? What's painful about
+        doing it today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed-api
+    attributes:
+      label: Proposed API (optional)
+      description: |
+        If you have a sketch, paste it. Otherwise leave blank — the
+        problem statement is more important than the proposed
+        solution.
+      render: python
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What did you try / consider?
+      description: Existing modeleon APIs, workarounds, other libraries.
