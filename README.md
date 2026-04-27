@@ -3,6 +3,7 @@
 [![PyPI](https://img.shields.io/pypi/v/modeleon.svg?color=0d9a9f)](https://pypi.org/project/modeleon/)
 [![Python](https://img.shields.io/badge/python-3.12+-0d9a9f.svg)](https://python.org)
 [![License](https://img.shields.io/badge/license-Apache_2.0-0d9a9f.svg)](LICENSE)
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/modeleonai/modeleon/blob/main/notebooks/01_first_model.ipynb)
 
 **Write Python. Ship real Excel formulas.**
 
