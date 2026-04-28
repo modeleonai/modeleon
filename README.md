@@ -178,3 +178,7 @@ Apache 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 **Releases:** [CHANGELOG](CHANGELOG.md) · [GitHub releases](https://github.com/modeleonai/modeleon/releases)
 
 [modeleon.ai](https://modeleon.ai) · [PyPI](https://pypi.org/project/modeleon/)
+
+---
+
+<p align="center">Built with ❤️ from Kazakhstan</p>
