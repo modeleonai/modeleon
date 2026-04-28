@@ -11,7 +11,7 @@
 > **MultiVariable** — a concept, modeled as a set of Variables and sub-concepts.  
 > **Excel** — one cell-traceable snapshot of a MultiVariable.
 
-<video src="assets/demo.mp4" autoplay muted loop playsinline width="100%"></video>
+![Modeleon demo — Python on the left, live Excel formulas on the right](assets/demo.gif)
 
 ```python
 import modeleon as mo
