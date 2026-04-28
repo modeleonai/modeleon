@@ -91,6 +91,20 @@ ruff check src/ tests/              # lint
 
 The full suite runs in a few seconds.
 
+### Working on notebooks
+
+Cell outputs in `notebooks/*.ipynb` produce noisy diffs and can leak
+local paths. Strip outputs before committing — easiest is to install
+[`nbstripout`](https://github.com/kynan/nbstripout) once per clone:
+
+```bash
+pip install nbstripout
+nbstripout --install
+```
+
+After that, every `git add` of an `.ipynb` strips its outputs
+automatically.
+
 ## Code of conduct
 
 Be respectful in issues, discussions, and PR review. Don't make
