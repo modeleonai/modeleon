@@ -29,12 +29,12 @@ forecast.to_excel("forecast.xlsx")
 
 The resulting `forecast.xlsx`:
 
-|   | A         | B          |
-|---|-----------|------------|
-| 1 | Revenue   | `1000000`  |
-| 2 | COGS %    | `0.6`      |
-| 3 | Cogs      | `=B1*B2`   |
-| 4 | Profit    | `=B1-B3`   |
+|   | A             | B          |
+|---|---------------|------------|
+| 1 | Revenue ($)   | `1000000`  |
+| 2 | COGS %        | `0.6`      |
+| 3 | Cogs          | `=B1*B2`   |
+| 4 | Profit        | `=B1-B3`   |
 
 `B3` is `=B1*B2` — a real Excel formula, not the baked value `600000`.
 
@@ -156,6 +156,8 @@ Also: `IRR`, `NPV`, `XIRR`, `PMT`, `FV`, `PV` · `SUM`, `MAX`, `MIN`, `AVERAGE` 
 ## In a notebook
 
 Every Variable, MultiVariable, and Model has a built-in `_repr_html_`. In Jupyter you see a live grid of values + formulas with click-to-trace-precedents — Excel's "Trace Precedents" button, in the browser. Toggle "Formulas" to flip every cell to its underlying expression.
+
+![Modeleon notebook trace-precedents — clicking a formula cell highlights its inputs in gold](assets/notebook-trace-precedents.png)
 
 Try it without installing anything: [Open the first-model notebook in Colab](https://colab.research.google.com/github/modeleonai/modeleon/blob/main/notebooks/01_first_model.ipynb).
 
