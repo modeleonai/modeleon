@@ -157,7 +157,7 @@ Also: `IRR`, `NPV`, `XIRR`, `PMT`, `FV`, `PV` · `SUM`, `MAX`, `MIN`, `AVERAGE` 
 
 Every Variable, MultiVariable, and Model has a built-in `_repr_html_`. In Jupyter you see a live grid of values + formulas with click-to-trace-precedents — Excel's "Trace Precedents" button, in the browser. Toggle "Formulas" to flip every cell to its underlying expression.
 
-![Modeleon notebook trace-precedents — clicking a formula cell highlights its inputs in gold](assets/notebook-trace-precedents.png)
+![Modeleon notebook trace-precedents — clicking a formula cell highlights its inputs in gold](assets/notebook-trace-image.png)
 
 Try it without installing anything: [Open the first-model notebook in Colab](https://colab.research.google.com/github/modeleonai/modeleon/blob/main/notebooks/01_first_model.ipynb).
 
