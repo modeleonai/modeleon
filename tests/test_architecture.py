@@ -30,7 +30,7 @@ class TestCoreIsRendererNeutral:
     def test_no_compile_imports_at_module_scope(self):
         offenders = []
         for py in sorted(CORE_DIR.rglob("*.py")):
-            tree = ast.parse(py.read_text(), filename=str(py))
+            tree = ast.parse(py.read_text(encoding="utf-8"), filename=str(py))
             for node in tree.body:  # only module-level nodes
                 if isinstance(node, ast.ImportFrom):
                     mod = node.module or ""
