@@ -100,7 +100,11 @@ class TestExcelOutput:
         model.demo.launch = mo.Variable('2025-01-15', display_name='Launch')
         model.demo.y = mo.YEAR(model.demo.launch)
         model.demo.eom = mo.EOMONTH(model.demo.launch, 1)
-        model.demo.header = mo.CONCAT(mo.UPPER(mo.Variable('q1 ')), mo.Variable('report'))
+        # Inputs to CONCAT/UPPER are attached to the model so the
+        # renderer resolves them to real cells (no cross-scope fallback).
+        model.demo.prefix = mo.Variable('q1 ')
+        model.demo.suffix = mo.Variable('report')
+        model.demo.header = mo.CONCAT(mo.UPPER(model.demo.prefix), model.demo.suffix)
 
         model.to_excel(str(tmp_path / 'demo.xlsx'))
         assert (tmp_path / 'demo.xlsx').exists()

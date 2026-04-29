@@ -6,9 +6,11 @@ Style note: every test uses **explicit attribute assignment**
 short-alias convenience — it never auto-attaches anything.
 """
 
+import pytest
 from openpyxl import load_workbook
 
 import modeleon as mo
+from modeleon.core.errors import CrossScopeReferenceWarning
 
 
 class TestRole:
@@ -142,7 +144,8 @@ class TestExternalRefInlining:
         model.derived = mo.MultiVariable("Derived", excel_props={'tab': True})
         model.derived.result = rate * 1000
 
-        model.to_excel(tmp_path / "solo.xlsx")
+        with pytest.warns(CrossScopeReferenceWarning):
+            model.to_excel(tmp_path / "solo.xlsx")
 
         path = tmp_path / "solo.xlsx"
         wb = load_workbook(path)
@@ -167,7 +170,8 @@ class TestExternalRefInlining:
             periods=3,
         )
 
-        model.to_excel(tmp_path / "growth.xlsx")
+        with pytest.warns(CrossScopeReferenceWarning):
+            model.to_excel(tmp_path / "growth.xlsx")
 
         path = tmp_path / "growth.xlsx"
         wb = load_workbook(path)
