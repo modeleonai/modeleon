@@ -8,7 +8,7 @@ target format, not crash.
 
 This locks in the graceful-degradation contract that makes
 backend-specific functions (pandas-native ``EWMA``, SQL-only ``LAG``,
-etc.) usable in other renderers. See ADR-010.
+etc.) usable in other renderers.
 """
 
 from __future__ import annotations

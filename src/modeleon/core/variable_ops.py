@@ -26,16 +26,35 @@ construct results).
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import Any, List, Optional, TYPE_CHECKING
 
-from .expr import BinOp, Compare, Literal, UnaryOp, VarRef
+from .expr import BinOp, Compare, Expr, Literal, UnaryOp, VarRef
 
 if TYPE_CHECKING:
+    from .unit import Unit
     from .variable import Variable
 
 
 class _VariableArithmetic:
-    """Operator-overloading mixin for :class:`Variable`."""
+    """Operator-overloading mixin for :class:`Variable`.
+
+    The attributes/methods declared below are provided by the concrete
+    :class:`Variable` subclass — declared here under ``TYPE_CHECKING``
+    so type-checkers know the mixin expects them on ``self``. They have
+    no runtime effect.
+    """
+
+    # Attributes provided by the Variable subclass — type-only annotations.
+    _value: Any
+    _expr: Optional[Expr]
+    _keys: Optional[List[Any]]
+    _unit: Optional["Unit"]
+    var_type: str
+    value_type: str
+
+    if TYPE_CHECKING:
+        def _as_operand(self, parenthesize: bool = False) -> Expr: ...
+        def _set_expr(self, expr: Expr) -> None: ...
 
     # ─── Broadcasting ───────────────────────────────────────────
     #
@@ -332,7 +351,7 @@ class _VariableArithmetic:
 
     def __pos__(self) -> "Variable":
         """+a is a no-op — return self."""
-        return self
+        return self  # type: ignore[return-value]  # mixin self is the concrete Variable at runtime
 
     # ─── Comparisons ───────────────────────────────────────────
     #
@@ -344,14 +363,17 @@ class _VariableArithmetic:
         """Shared implementation for all comparison operators."""
         from .variable import Variable
 
+        # ``self`` is always a :class:`Variable` at runtime — the mixin is
+        # only mounted on Variable. The casts below tell mypy that.
+        self_var: "Variable" = self  # type: ignore[assignment]
         if isinstance(other, Variable):
             result = Variable()
-            result._set_expr(Compare(op_symbol, VarRef(self), VarRef(other)))
+            result._set_expr(Compare(op_symbol, VarRef(self_var), VarRef(other)))
             lv, rv = self._align_keyed_values(self, other)
             result._value = self._broadcast_operation(lv, rv, op_func)
         else:
             result = Variable()
-            result._set_expr(Compare(op_symbol, VarRef(self), Literal(other)))
+            result._set_expr(Compare(op_symbol, VarRef(self_var), Literal(other)))
             result._value = self._broadcast_operation(self._value, other, op_func)
 
         if isinstance(result._value, list) and len(result._value) > 1:
@@ -361,10 +383,14 @@ class _VariableArithmetic:
 
     # ─── Comparison dunders ────────────────────────────────────
 
-    def __eq__(self, other) -> "Variable":
+    # ``__eq__`` / ``__ne__`` deliberately return a :class:`Variable`
+    # (a comparison expression) rather than ``bool`` — the engine treats
+    # ``a == b`` as a formula-building operator. The override mismatch
+    # against ``object`` is intentional, not a bug.
+    def __eq__(self, other) -> "Variable":  # type: ignore[override]
         return self._comparison_op(other, '==', lambda a, b: a == b)
 
-    def __ne__(self, other) -> "Variable":
+    def __ne__(self, other) -> "Variable":  # type: ignore[override]
         return self._comparison_op(other, '!=', lambda a, b: a != b)
 
     def __lt__(self, other) -> "Variable":

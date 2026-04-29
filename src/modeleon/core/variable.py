@@ -27,16 +27,20 @@ declaration below wires them in; callers don't touch the mixins
 directly.
 """
 
-from typing import Optional, Set, Any, List, Dict
+from typing import Optional, Set, Any, List, Dict, TYPE_CHECKING
 
 from .humanize import humanize_identifier
+from .component import Component
 from .expr import Expr, MethodCall, Paren, Subscript, VarRef
 from .qpath import QPath
 from .variable_init import _VariableInit
 from .variable_ops import _VariableArithmetic
 
+if TYPE_CHECKING:
+    from .multi_variable import MultiVariableBase
 
-class Variable(_VariableInit, _VariableArithmetic):
+
+class Variable(_VariableInit, _VariableArithmetic, Component):
     """
     Pure variable - computation logic only
 
@@ -68,7 +72,7 @@ class Variable(_VariableInit, _VariableArithmetic):
     })
 
     def __init__(self, value=None, value_type: str = "float", var_type: str = "scalar",
-                 display_name: str = None, formula=None, pyformula=None, unit=None, keys=None,
+                 display_name: Optional[str] = None, formula=None, pyformula=None, unit=None, keys=None,
                  excel_props=None, **kwargs):
         """Create a Variable from exactly one of ``value``, ``formula``, or ``pyformula``.
 
@@ -117,17 +121,18 @@ class Variable(_VariableInit, _VariableArithmetic):
             )
 
         # --- identity + default fields ---
-        # Qualified-path identity. Starts as ``None``; the ``.path``
-        # property synthesizes a floating-namespace path from
-        # ``id(self)`` until adoption crystallizes a rooted path.
-        # Internal storage only — read via ``.path``.
-        self._qualified_id: Optional[QPath] = None
-        # python_name is a property — backed by _python_name with lazy
-        # caller-frame discovery on first miss. Mirrors the same pattern
-        # on MultiVariableBase so visually-equivalent code (``bb = mo.X(...)``)
-        # produces ``bb.python_name == 'bb'`` regardless of whether X is
-        # Variable or MultiVariable.
-        self._python_name: Optional[str] = None
+        # ``_qualified_id``, ``_python_name``, ``_display_name``, and
+        # ``_excel_props`` are initialized on the :class:`Component`
+        # parent (with excel_props validated against ``_EXCEL_PROP_KEYS``).
+        # The ``.path`` property below synthesizes a floating-namespace
+        # path from ``id(self)`` until adoption crystallizes a rooted
+        # path.
+        super().__init__(display_name=display_name, excel_props=excel_props)
+        # Adoption back-pointers: set by ``MultiVariableBase._register_component``
+        # when this Variable is attached to a parent MV. Default ``None`` so
+        # the ``.path`` property can read them without ``getattr`` fallbacks.
+        self._owner: Optional["MultiVariableBase"] = None
+        self._component_name: Optional[str] = None
         self._value: Any = None
         # _expr is the structured source of truth for this Variable's
         # formula. The ``.formula`` string property is a read-through
@@ -187,12 +192,10 @@ class Variable(_VariableInit, _VariableArithmetic):
         # --- final type + metadata ---
         self.var_type = var_type
         self.value_type = value_type
-        # is_formula is a derived @property — see below
-        self._display_name: Optional[str] = (
-            None if display_name is None else str(display_name)
-        )
+        # is_formula is a derived @property — see below.
+        # ``_display_name`` and ``_excel_props`` were set on Component
+        # via ``super().__init__`` above.
 
-        self._process_excel_props(excel_props)
         self._process_kwargs(kwargs)
 
     # Construction dispatchers (_resolve_keys, _init_from_formula,
@@ -221,8 +224,8 @@ class Variable(_VariableInit, _VariableArithmetic):
         """
         if self._qualified_id is not None:
             return self._qualified_id
-        owner = getattr(self, "_owner", None)
-        comp_name = getattr(self, "_component_name", None)
+        owner = self._owner
+        comp_name = self._component_name
         # Always derive from the owner when adopted — even if the
         # owner's path is currently floating. Otherwise two Variables
         # adopted under different floating owners (``a.x`` and ``b.x``)
@@ -237,10 +240,7 @@ class Variable(_VariableInit, _VariableArithmetic):
             return self._qualified_id
         return QPath.floating(id(self), kind="v")
 
-    @property
-    def id(self) -> str:
-        """Dotted-string form of :attr:`path` — the canonical string id."""
-        return str(self.path)
+    # ``id`` property is inherited from :class:`Base`.
 
     @property
     def value(self) -> Any:
@@ -397,50 +397,13 @@ class Variable(_VariableInit, _VariableArithmetic):
         """
         return {ref.id for ref in self._dependency_refs}
     
-    def set_python_name(self, name: str) -> 'Variable':
-        """Set the Python variable name (e.g., 'revenue', 'cogs')"""
-        self.python_name = name
-        return self
-
-    @property
-    def python_name(self) -> Optional[str]:
-        """The Python identifier this Variable is bound to as a component.
-
-        Set when the Variable is adopted by a parent MV via
-        ``mv.attr = some_variable`` (the attribute name becomes the
-        ``python_name``), or explicitly via ``var.python_name = 'x'``.
-        Returns ``None`` for unattached Variables — operator
-        intermediates, top-level scratch use, or anything not yet
-        wired into an MV tree.
-        """
-        return self._python_name
-
-    @python_name.setter
-    def python_name(self, value: Optional[str]) -> None:
-        self._python_name = value
+    # ``python_name`` property + setter inherited from :class:`Base`.
+    # ``excel_props`` property, ``set_style``, ``set_display_name``,
+    # ``set_python_name`` inherited from :class:`Component`.
 
     # ═══════════════════════════════════════════════════════
     #  METADATA METHODS
     # ═══════════════════════════════════════════════════════
-
-    @property
-    def excel_props(self) -> Dict[str, Any]:
-        """Excel-renderer hints attached to this Variable. Read-only view."""
-        return self._excel_props
-
-    def set_style(self, **kwargs) -> 'Variable':
-        """Update Excel-renderer styling hints (bold, bg, font_color,
-        number_format, …). Unknown keys are silently ignored.
-        """
-        for k, v in kwargs.items():
-            if k in self._EXCEL_PROP_KEYS:
-                self._excel_props[k] = v
-        return self
-
-    def set_display_name(self, display_name: str) -> 'Variable':
-        """Set the display name."""
-        self._display_name = display_name
-        return self
 
     @property
     def display_name(self) -> str:
@@ -464,7 +427,7 @@ class Variable(_VariableInit, _VariableArithmetic):
             return self._display_name
         identifier = (
             self.python_name
-            or getattr(self, '_component_name', None)
+            or self._component_name
             or self.path.leaf
         )
         return humanize_identifier(identifier)
@@ -690,6 +653,9 @@ class Variable(_VariableInit, _VariableArithmetic):
 
     def _get_by_key(self, key):
         """Named-key lookup: returns a scalar Variable pointing at the match."""
+        # Caller (``__getitem__``) only invokes this branch when ``self._keys``
+        # is truthy. The assert pins that contract for type-checkers.
+        assert self._keys is not None
         if key not in self._keys:
             raise KeyError(
                 f"Key {key!r} not found on this Variable. "

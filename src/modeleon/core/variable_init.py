@@ -14,7 +14,7 @@ mutate ``self`` directly (setting ``_value``, ``_expr``,
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Dict, FrozenSet, List, Optional, TYPE_CHECKING
 
 from .expr import Expr, ListExpr, Literal, VarRef
 
@@ -35,7 +35,25 @@ def _plugin_variable_kwargs() -> set:
 
 class _VariableInit:
     """Construction mixin: dispatchers for value / formula / pyformula,
-    type coercion, auto-detection, and kwarg sorting."""
+    type coercion, auto-detection, and kwarg sorting.
+
+    Attributes/methods listed below are provided by the concrete
+    :class:`Variable` subclass — declared here for type-checkers.
+    """
+
+    # Attributes provided by Variable. Listed here so writes inside this
+    # mixin (e.g. ``self._source_code = ...``) line up with their final
+    # types on the concrete class.
+    _EXCEL_PROP_KEYS: FrozenSet[str]
+    pyformula: Optional[str]
+    _source_code: Optional[str]
+    _value: Any
+    _expr: Optional[Expr]
+    _raw_formula_str: Optional[str]
+    _dependency_refs: List["Variable"]
+
+    if TYPE_CHECKING:
+        def _set_expr(self, expr: Expr) -> None: ...
 
     @staticmethod
     def _resolve_keys(keys) -> tuple[Optional[list], Optional["Variable"]]:
@@ -155,7 +173,8 @@ class _VariableInit:
         # Copy _source_code if every Variable item shares the same one
         var_items = [v for v in items if isinstance(v, Variable)]
         if var_items and all(v._source_code for v in var_items):
-            source_codes = [v._source_code for v in var_items]
+            # ``all(...)`` above guarantees every entry is a non-empty str.
+            source_codes: List[str] = [v._source_code for v in var_items]  # type: ignore[misc]
             if len(set(source_codes)) == 1:
                 self._source_code = source_codes[0]
 
@@ -224,14 +243,6 @@ class _VariableInit:
                 f"``excel_props={{'bold': True, 'bg': '#eef', ...}}``."
             )
 
-    def _process_excel_props(self, excel_props: Optional[Dict[str, Any]]) -> None:
-        """Validate and store ``excel_props``. Unknown keys raise."""
-        props: Dict[str, Any] = dict(excel_props) if excel_props else {}
-        unknown = set(props) - self._EXCEL_PROP_KEYS
-        if unknown:
-            raise TypeError(
-                f"Variable(excel_props=...) got unknown key(s): "
-                f"{sorted(unknown)}. "
-                f"Known keys: {sorted(self._EXCEL_PROP_KEYS)}."
-            )
-        self._excel_props: Dict[str, Any] = props
+    # ``_process_excel_props`` consolidated into
+    # ``Component._validate_excel_props`` and called via
+    # ``super().__init__(..., excel_props=...)`` from Variable.__init__.

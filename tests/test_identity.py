@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Qualified-path identity (ADR-008).
+"""Qualified-path identity.
 
 Every Variable / MultiVariable carries a ``.path: QPath`` from the
 model root. Paths crystallize at adoption time (via attribute

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for ``QPath`` — the qualified-path identity type (ADR-008)."""
+"""Tests for ``QPath`` — the qualified-path identity type."""
 
 from __future__ import annotations
 

@@ -52,7 +52,7 @@ class Unit(MultiVariableClass):
 
     _DIMENSIONLESS_SYMBOLS = {'%', 'x', 'bps', 'pp'}
 
-    def __init__(self, symbol: str = None, *, _components: Dict[str, int] = None, **kwargs):
+    def __init__(self, symbol: Optional[str] = None, *, _components: Optional[Dict[str, int]] = None, **kwargs):
         self._unit_components: Dict[str, int] = {}
         self._display_symbol: Optional[str] = None
 

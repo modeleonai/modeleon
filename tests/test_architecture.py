@@ -2,8 +2,9 @@
 """Architectural guardrails.
 
 These tests enforce invariants that the codebase already follows but
-would be easy to break accidentally in a future PR. Each test here
-documents a design decision in ADR-010.
+would be easy to break accidentally in a future PR. Each test pins a
+load-bearing structural decision so accidental regressions surface
+loudly.
 """
 
 from __future__ import annotations
@@ -41,7 +42,7 @@ class TestCoreIsRendererNeutral:
                         if alias.name.startswith("modeleon.compile"):
                             offenders.append(f"{py.relative_to(CORE_DIR)}: import {alias.name}")
         assert not offenders, (
-            "core/ modules must not import from compile/ at module scope "
-            "(see ADR-010). Move the import inside the method that needs "
-            "it for runtime dispatch. Offenders:\n  " + "\n  ".join(offenders)
+            "core/ modules must not import from compile/ at module scope. "
+            "Move the import inside the method that needs it for runtime "
+            "dispatch. Offenders:\n  " + "\n  ".join(offenders)
         )

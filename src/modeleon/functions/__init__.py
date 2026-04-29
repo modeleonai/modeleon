@@ -15,8 +15,8 @@ Organized by topic:
 The :class:`Unit` type lives in :mod:`modeleon.core.unit` — it's a
 primitive used by :class:`Variable` itself, not a formula helper.
 
-Backend compatibility convention (see ADR-010). Most helpers build a
-plain :class:`~modeleon.core.expr.FuncCall` with no backend hint —
+Backend compatibility convention. Most helpers build a plain
+:class:`~modeleon.core.expr.FuncCall` with no backend hint —
 every renderer emits them natively (``SUM`` → ``=SUM(...)`` in Excel,
 ``SUM(...)`` in JSON, ``df.sum()`` in a future pandas renderer).
 Functions that are native to a specific target — today just the Excel

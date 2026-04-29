@@ -46,7 +46,7 @@ def _extract_cashflow_values(cash_flows) -> List[float]:
 _EXCEL_ONLY = frozenset({'excel'})
 """Render-backend set for Excel-native financial functions — IRR / NPV /
 XIRR / PMT / FV / PV. Excel emits these natively; other renderers fall
-back to inlining ``_value``. See ADR-010."""
+back to inlining ``_value``."""
 
 
 def _wrap_with_formula(value: float, func_name: str, args: list) -> Variable:

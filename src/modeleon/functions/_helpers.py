@@ -92,7 +92,7 @@ def make_func_var(
         render_backends: Renderers that emit this function natively
             (``None`` = universal; every renderer handles it). Forwarded
             to :class:`FuncCall`; non-matching renderers fall back to
-            inlining ``_value``. See ADR-010.
+            inlining ``_value``.
         compute_backends: Compute environments that evaluate this
             function natively at runtime (``None`` = universal). Rarely
             populated today; distinguishes render target from compute

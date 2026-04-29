@@ -5,8 +5,8 @@ Runs each example script in a temp directory and diffs the produced .xlsx
 against a committed baseline under ``tests/golden/``. Compares cell values
 and formulas (data_type + value), ignores formatting/styles/metadata.
 
-The harness is the safety net for the qualified-path identity migration
-(ADR-008): every checkpoint must leave every baseline bit-identical at the
+The harness is the regression net for the qualified-path identity
+machinery: any change must leave every baseline bit-identical at the
 formula/value level. A drift in any cell is a stop-the-line signal.
 
 Bootstrap: if ``tests/golden/<name>.xlsx`` is missing, the test copies the

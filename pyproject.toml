@@ -105,3 +105,16 @@ ignore = ["N802"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
+
+# Engine-wide opt-out for the four "annotation gap" categories. These
+# are style — annotating every helper, container generic, and Any-return
+# would touch ~150 spots without catching real bugs. The bug-finding
+# strict checks (assignment, arg-type, call-arg, union-attr, operator,
+# return-value, override, attr-defined) stay on. Ratchet up category-by-
+# category as files get incrementally annotated.
+disable_error_code = [
+    "no-untyped-def",
+    "no-untyped-call",
+    "type-arg",
+    "no-any-return",
+]

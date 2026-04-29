@@ -8,7 +8,7 @@ the AST and needs every function call represented as a ``FuncCall`` (or
 equivalent) node.
 
 This test pins the invariant across every public function in the
-``functions/`` package. See ADR-010.
+``functions/`` package.
 """
 
 from __future__ import annotations

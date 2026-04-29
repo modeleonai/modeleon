@@ -21,11 +21,34 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    pass
+    from .multi_variable import MultiVariableBase
 
 
 class _MVInspect:
-    """Tree navigation + cycle detection + serialization mixin."""
+    """Tree navigation + cycle detection + serialization mixin.
+
+    Attributes listed below are provided by the concrete
+    :class:`MultiVariableBase` subclass — declared here for
+    type-checkers.
+    """
+
+    # Attributes provided by MultiVariableBase.
+    _components: Dict[str, Any]
+    _component_order: List[str]
+    _parent: Optional["MultiVariableBase"]
+    _creation_params: Dict[str, Any]
+    _qualified_id: Any
+    python_name: Optional[str]
+    id: str
+
+    if TYPE_CHECKING:
+        # ``_is_sheet`` and ``display_name`` are read-only properties on
+        # MultiVariableBase; declared here as such so the mixin's
+        # type-only view matches the concrete class.
+        @property
+        def _is_sheet(self) -> bool: ...
+        @property
+        def display_name(self) -> str: ...
 
     # ─── Component introspection ────────────────────────────────
 

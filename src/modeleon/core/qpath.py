@@ -80,4 +80,4 @@ class QPath:
         return QPath((_FLOATING_SEGMENT, f"{kind}{token:x}"))
 
 
-QPath.ROOT = QPath(())  # type: ignore[misc]
+QPath.ROOT = QPath(())

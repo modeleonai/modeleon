@@ -77,6 +77,9 @@ def to_excel(path: str | Path, root: "MultiVariableBase") -> None:
     translator = ExcelTranslator(addresses, var_to_sheet)
 
     wb = Workbook()
+    # ``Workbook()`` always creates a default sheet — the assert pins
+    # that contract for type-checkers (Workbook.active is Optional).
+    assert wb.active is not None
     wb.remove(wb.active)
 
     for sheet_mv in roots:

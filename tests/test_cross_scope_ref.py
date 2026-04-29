@@ -3,8 +3,8 @@
 
 When a formula references a Variable outside the current emission's
 layout, the Excel renderer falls back to inlining the value as a
-literal (Policy A, ADR-010). Historically this happened silently,
-which made two beginner mistakes hard to spot:
+literal. Historically this happened silently, which made two beginner
+mistakes hard to spot:
 
 1. Cross-model reference — using ``m1.s.x`` in a formula inside
    ``m2``, then emitting ``m2``.

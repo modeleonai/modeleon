@@ -209,7 +209,7 @@ class ExcelRenderer:
         # Variable not in this emission's layout. Two inlining strategies:
         # - if it has its own AST, recurse into it so we reach real cells;
         # - otherwise (plain input referenced from outside the emission
-        #   subtree), Policy A: inline its value as an Excel literal.
+        #   subtree), inline its value as an Excel literal.
         if node.var._expr is not None:
             return self.walker.render(node.var._expr, ctx)
         _warn_out_of_scope_ref(node.var, ctx)
@@ -293,8 +293,8 @@ class ExcelRenderer:
 
         # Backend-specific function: FuncCall declared ``render_backends``
         # without including Excel. Can't render natively — inline the
-        # owning Variable's value as a literal (Policy A extended from
-        # VarRef).
+        # owning Variable's value as a literal, the same fallback used
+        # by VarRef when its target is outside the current emission.
         if node.render_backends is not None and 'excel' not in node.render_backends:
             return self._fallback_funccall(node, ctx)
 

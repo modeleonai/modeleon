@@ -56,6 +56,7 @@ from typing import Dict, List, Optional, Any, TYPE_CHECKING
 import inspect
 
 # Re-exported so code that imports these from modeleon.multi_variable keeps working.
+from .component import Component
 from .mv_context import _MVLifecycle
 from .mv_inspect import _MVInspect
 from .qpath import QPath
@@ -65,7 +66,7 @@ if TYPE_CHECKING:
 
 
 
-class MultiVariableBase(_MVLifecycle, _MVInspect):
+class MultiVariableBase(_MVLifecycle, _MVInspect, Component):
     """
     Base class with internal machinery for grouped Variables and nested MultiVariables.
     
@@ -113,42 +114,23 @@ class MultiVariableBase(_MVLifecycle, _MVInspect):
             **kwargs: Captured on ``self._creation_params`` for
                   inspection by downstream tooling.
         """
-        excel_props = dict(excel_props) if excel_props else {}
-        unknown = set(excel_props) - self._EXCEL_PROP_KEYS
-        if unknown:
-            raise TypeError(
-                f"MultiVariable(excel_props=...) got unknown key(s): "
-                f"{sorted(unknown)}. "
-                f"Known keys: {sorted(self._EXCEL_PROP_KEYS)}."
-            )
-        # Qualified-path identity. Starts as ``None``; the ``.path``
-        # property synthesizes a floating-namespace path from
-        # ``id(self)`` until adoption crystallizes a rooted path.
-        self._qualified_id: Optional[QPath] = None
-        
-        # python_name = the Python identifier this MV is bound to as
-        # a component of its parent. display_name = the user-facing
-        # label (constructor arg). Stored separately to keep concepts
-        # distinct. ``python_name`` is set when the MV is adopted by
-        # a parent (``parent.child = mv`` triggers
-        # ``_register_component`` which assigns it).
-        self._python_name: Optional[str] = None
-        self._display_name: Optional[str] = (
-            None if display_name is None else str(display_name)
-        )
-        
+        # ``_qualified_id``, ``_python_name``, ``_display_name``, and
+        # ``_excel_props`` are initialized on :class:`Component`; the
+        # excel_props dict is validated against ``_EXCEL_PROP_KEYS`` there.
+        # Adoption (``parent.child = mv`` → ``_register_component``) is
+        # what later sets ``_python_name``.
+        super().__init__(display_name=display_name, excel_props=excel_props)
+
         self._creation_params: Dict[str, Any] = kwargs.copy()
-        self._excel_props: Dict[str, Any] = excel_props
 
         # Component storage (Variables and nested MultiVariables)
         self._components: Dict[str, Any] = {}
         self._component_order: List[str] = []
 
         # Layout role is a derived internal marker. Users set
-        # ``excel_props={'tab': True}`` to mark an Excel tab; that
-        # becomes ``_excel_props={'tab': True}`` internally. The writer and layout
-        # engine read ``_role`` / ``_is_sheet`` as before.
-        if excel_props.get('tab'):
+        # ``excel_props={'tab': True}`` to mark an Excel tab; the writer
+        # and layout engine read ``_role`` / ``_is_sheet`` from there.
+        if self._excel_props.get('tab'):
             self._role = 'sheet'
         else:
             self._role = type(self)._role
@@ -216,21 +198,7 @@ class MultiVariableBase(_MVLifecycle, _MVInspect):
             value = self._components.get(name, value)
         super().__setattr__(name, value)
     
-    @property
-    def python_name(self) -> Optional[str]:
-        """The Python identifier this MV is bound to as a component.
-
-        Set when this MV is adopted by a parent via
-        ``parent.attr = mv`` (the attribute name becomes the
-        ``python_name``), or explicitly via ``mv.python_name = 'x'``.
-        Returns ``None`` for unattached MVs (top-level objects, or
-        MVs constructed but not yet wired into a parent).
-        """
-        return self._python_name
-
-    @python_name.setter
-    def python_name(self, value: Optional[str]) -> None:
-        self._python_name = value
+    # ``python_name`` property + setter are inherited from :class:`Base`.
 
     @property
     def path(self) -> QPath:
@@ -262,10 +230,7 @@ class MultiVariableBase(_MVLifecycle, _MVInspect):
             return self._qualified_id
         return QPath.floating(id(self), kind="m")
 
-    @property
-    def id(self) -> str:
-        """Dotted-string form of :attr:`path` — the canonical string id."""
-        return str(self.path)
+    # ``id`` property is inherited from :class:`Base`.
 
     @property
     def display_name(self) -> str:
@@ -288,6 +253,9 @@ class MultiVariableBase(_MVLifecycle, _MVInspect):
 
     @display_name.setter
     def display_name(self, value: Optional[str]) -> None:
+        # Setter mirrors Component.set_display_name; redeclared here so
+        # the property + setter pair sits on the concrete class with the
+        # custom getter above.
         self._display_name = value
 
     def __repr__(self) -> str:

@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Public API surface — stabilized extension points.
 
-Locks in the audit outcome (ADR-010 / public API pass):
-
 - ``.value``, ``.expr``, ``.formula``, ``.source_code`` are public
   properties. Underscored forms (``_value``, ``_expr``,
   ``_source_code``) remain internal storage and may change.

@@ -131,10 +131,10 @@ class TestToExcel:
                     assert "{" not in cell.value
 
 
-class TestPolicyAExternalRefs:
+class TestExternalRefInlining:
     """When a subtree's formulas reference Variables outside the subtree,
     the translator inlines the external value as an Excel literal
-    (Policy A) instead of emitting a broken ``_var_N`` identifier."""
+    instead of emitting a broken ``_var_N`` identifier."""
 
     def test_external_scalar_ref_inlines_value(self, tmp_path):
         rate = mo.Variable(0.05, display_name='Rate')  # lives outside any sheet

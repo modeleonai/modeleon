@@ -32,7 +32,7 @@ resolved them at module scope.
 from __future__ import annotations
 
 import warnings
-from typing import Any, TYPE_CHECKING
+from typing import Any, Optional, TYPE_CHECKING
 
 from .qpath import QPath
 
@@ -74,12 +74,25 @@ def _crystallize_subtree(item: Any, path: QPath) -> None:
 
 
 class _MVLifecycle:
-    """Context-manager + adoption mixin for :class:`MultiVariableBase`."""
+    """Context-manager + adoption mixin for :class:`MultiVariableBase`.
+
+    Attributes listed below are provided by the concrete
+    :class:`MultiVariableBase` subclass — declared here for
+    type-checkers.
+    """
+
+    # Attributes provided by MultiVariableBase.
+    _components: dict
+    _component_order: list
+    _display_name: Optional[str]
+    _python_name: Optional[str]
+    _qualified_id: Any
+    _role: str
 
     # ─── Context-manager protocol ───────────────────────────────
 
     def __enter__(self) -> "MultiVariableBase":
-        return self
+        return self  # type: ignore[return-value]  # mixin self is the concrete MV at runtime
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         return None
@@ -128,18 +141,15 @@ class _MVLifecycle:
                 existing._parent = None
                 existing._name_in_parent = None
             elif isinstance(existing, Variable):
-                if hasattr(existing, '_owner'):
-                    existing._owner = None
-                if hasattr(existing, '_component_name'):
-                    existing._component_name = None
+                existing._owner = None
+                existing._component_name = None
             existing._qualified_id = None
             existing._python_name = None
             del self._components[name]
 
         # Clone-on-ownership-change.
         if isinstance(component, Variable) and not isinstance(component, MultiVariableBase):
-            owner = getattr(component, '_owner', None)
-            if owner is not None and owner is not self:
+            if component._owner is not None and component._owner is not self:
                 component = component.copy()
         elif isinstance(component, MultiVariableBase):
             if component._parent is not None and component._parent is not self:
@@ -149,12 +159,15 @@ class _MVLifecycle:
         if name not in self._component_order:
             self._component_order.append(name)
 
+        # ``self`` is always a :class:`MultiVariableBase` at runtime — the mixin
+        # is only mounted on MultiVariableBase. Cast for the type-checker.
+        self_mv: "MultiVariableBase" = self  # type: ignore[assignment]
         if isinstance(component, MultiVariableBase):
-            component._parent = self
+            component._parent = self_mv
             component._name_in_parent = name
             component._python_name = name
         elif isinstance(component, Variable):
-            component._owner = self
+            component._owner = self_mv
             component._component_name = name
             component._python_name = name
 
@@ -177,7 +190,9 @@ class _MVLifecycle:
         from .multi_variable import MultiVariableBase
         from .variable import Variable
 
-        clone = object.__new__(type(self))
+        # ``object.__new__(type(self))`` returns a fresh instance of the
+        # concrete MV subclass — typed as the same class as ``self``.
+        clone: "MultiVariableBase" = object.__new__(type(self))  # type: ignore[assignment]
         MultiVariableBase.__init__(
             clone,
             display_name=self._display_name,

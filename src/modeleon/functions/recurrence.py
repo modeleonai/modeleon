@@ -20,7 +20,7 @@ import inspect
 import math
 import operator
 import re
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from ..core.expr import Expr, Literal, SelfRef, VarRef
 from ..core.variable import Variable
@@ -42,7 +42,7 @@ from ..core.variable import Variable
 # Rejected: attribute access, subscripts, comprehensions, lambdas, walrus
 # assignments, imports, arbitrary function calls.
 
-_SAFE_BIN_OPS = {
+_SAFE_BIN_OPS: Dict[type, Callable[[Any, Any], Any]] = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,
     ast.Mult: operator.mul,
@@ -52,13 +52,13 @@ _SAFE_BIN_OPS = {
     ast.FloorDiv: operator.floordiv,
 }
 
-_SAFE_UNARY_OPS = {
+_SAFE_UNARY_OPS: Dict[type, Callable[[Any], Any]] = {
     ast.USub: operator.neg,
     ast.UAdd: operator.pos,
     ast.Not: operator.not_,
 }
 
-_SAFE_COMPARE_OPS = {
+_SAFE_COMPARE_OPS: Dict[type, Callable[[Any, Any], bool]] = {
     ast.Eq: operator.eq, ast.NotEq: operator.ne,
     ast.Lt: operator.lt, ast.LtE: operator.le,
     ast.Gt: operator.gt, ast.GtE: operator.ge,
@@ -139,10 +139,12 @@ def _safe_eval(node: ast.AST, names: Dict[str, Any]) -> Any:
         return fn(_safe_eval(node.left, names), _safe_eval(node.right, names))
 
     if isinstance(node, ast.UnaryOp):
-        fn = _SAFE_UNARY_OPS.get(type(node.op))
-        if fn is None:
+        # Distinct name from the BinOp branch's ``fn`` to keep type
+        # narrowing clean — unary ops take one argument, binary takes two.
+        unary_fn = _SAFE_UNARY_OPS.get(type(node.op))
+        if unary_fn is None:
             raise ValueError(f"Unary operator not allowed: {type(node.op).__name__}")
-        return fn(_safe_eval(node.operand, names))
+        return unary_fn(_safe_eval(node.operand, names))
 
     if isinstance(node, ast.Compare):
         left = _safe_eval(node.left, names)
@@ -403,6 +405,11 @@ def recurrence(
         values = _eval_lambda(formula, start_value, periods_resolved)
         recurrence_expr = None
     else:
+        if formula is None:
+            raise TypeError(
+                "recurrence(start, formula, ...) requires a formula — pass a "
+                "string template (e.g. '{prev} * (1 + {rate})') or a lambda."
+            )
         values = _eval_template(
             formula, start_value, periods_resolved,
             _per_period_values(variables, periods_resolved),

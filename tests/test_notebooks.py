@@ -4,8 +4,6 @@
 Runs every `.ipynb` under ``packages/engine/notebooks/`` via nbclient and
 asserts no cell raises. Skipped when nbclient isn't installed (nbclient
 is not a core test dep).
-
-Part of the CP0 safety net for ADR-008.
 """
 
 from __future__ import annotations
