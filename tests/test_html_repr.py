@@ -168,6 +168,32 @@ class TestModelHtmlPositional:
         # otherwise the cross-tab path silently regressed.
         assert "=100.0 * 50" not in html
 
+    def test_toolbar_button_labels_stay_stable_across_states(self):
+        # The Formulas / Stacked toolbar buttons indicate their state
+        # by colour (cream + teal active tint), not by swapping the
+        # label to "Values" / "Tabbed". Animation comes from the
+        # ``label.mo-btn`` transition on background + colour.
+        m = mo.Model("m")
+        m.inputs = mo.MultiVariable("Inputs", excel_props={"tab": True})
+        m.inputs.price = mo.Variable(100, display_name="Price")
+        m.outputs = mo.MultiVariable("Outputs", excel_props={"tab": True})
+        m.outputs.revenue = m.inputs.price * mo.Variable(2)
+
+        html = m._repr_html_()
+
+        import re
+
+        formula_contents = re.findall(
+            r"mo-formula-btn::after \{ content: '([^']+)'", html,
+        )
+        stack_contents = re.findall(
+            r"mo-stack-btn::after \{ content: '([^']+)'", html,
+        )
+        # Exactly one content rule per button — no flip to "Values" /
+        # "Tabbed" lurking anywhere in the emitted CSS.
+        assert formula_contents == ["Formulas"]
+        assert stack_contents == ["Stacked"]
+
     def test_each_panel_carries_its_name_for_stacked_mode(self):
         # The "Stacked" toolbar toggle hides the tab bar and reveals
         # every panel at once — so each panel's title must stay in

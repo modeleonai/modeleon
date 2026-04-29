@@ -168,12 +168,6 @@ class TestBinOpPrecedenceParens:
     accordingly.
     """
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="render_binop doesn't wrap a lower-precedence child of "
-               "multiplication in parens — `a * (1 - b)` collapses to "
-               "`a * 1 - b` and Excel evaluates as `(a * 1) - b`.",
-    )
     def test_subtraction_inside_multiplication(self, tmp_path):
         # ``a * (1 - b)`` — subtraction binds looser than multiplication,
         # so the right-hand subtree needs parens. Multiplication has no
@@ -190,12 +184,6 @@ class TestBinOpPrecedenceParens:
         cells = _cells(tmp_path / "p.xlsx", "S")
         assert cells["B3"] == "=B1 * (1 - B2)"
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="render_binop doesn't wrap children of `**` (exponent) — "
-               "`(a/b) ** (1/c)` collapses to `a / b ^ 1 / c`, which "
-               "Excel reads left-to-right as `((a/b)^1)/c`.",
-    )
     def test_division_and_exponent_groups(self, tmp_path):
         # ``(a / b) ** (1 / c)`` — both children of ``**`` are divisions
         # which bind tighter than ``**`` in Excel's left-associative

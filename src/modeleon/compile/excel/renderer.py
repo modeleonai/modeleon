@@ -64,6 +64,23 @@ _PY_TO_EXCEL_OP: Dict[str, str] = {
 }
 
 
+# Operator precedence in Excel formulas. Higher binds tighter. A child BinOp
+# whose precedence is *strictly less* than the parent's must be wrapped in
+# parens; same-precedence children only need wrapping on the right side of
+# non-commutative operators (``a - (b - c)`` ≠ ``(a - b) - c``).
+_BINOP_PRECEDENCE: Dict[str, int] = {
+    "**": 4, "^": 4,
+    "*": 3, "/": 3, "//": 3, "%": 3,
+    "+": 2, "-": 2,
+    "&": 1,
+    "==": 0, "!=": 0, "<": 0, "<=": 0, ">": 0, ">=": 0,
+}
+
+# Non-commutative-on-the-right ops: same-precedence right child needs parens.
+# `a - b - c` is fine (left-associative) but `a - (b - c)` must keep them.
+_NON_COMMUTATIVE_RIGHT: set[str] = {"-", "/", "//", "%", "**", "^"}
+
+
 # Functions that accept an Excel range for any list-valued VarRef argument.
 # The translator renders those args as ranges (``B2:F2``) and leaves
 # scalar VarRefs / literals as normal. Covers classic aggregates (SUM,
@@ -216,16 +233,69 @@ class ExcelRenderer:
         return _value_to_excel_literal(_value_at_period(node.var._value, ctx.period_idx))
 
     def render_binop(self, node: BinOp, ctx: RenderCtx) -> str:
-        left = self.walker.render(node.left, ctx)
-        right = self.walker.render(node.right, ctx)
         op = node.op
-        # // → INT(a/b), % → MOD(a,b) — Excel has no direct operator for these
+        # // → INT(a/b), % → MOD(a,b). Inside INT/MOD the relevant parent op
+        # is ``/`` (precedence 3); the comma in MOD separates and needs no
+        # parens-handling on either operand.
         if op == "//":
+            left = self._render_operand(node.left, "/", ctx, side="left")
+            right = self._render_operand(node.right, "/", ctx, side="right")
             return f"INT({left}/{right})"
         if op == "%":
+            left = self.walker.render(node.left, ctx)
+            right = self.walker.render(node.right, ctx)
             return f"MOD({left},{right})"
+
+        left = self._render_operand(node.left, op, ctx, side="left")
+        right = self._render_operand(node.right, op, ctx, side="right")
         excel_op = _PY_TO_EXCEL_OP.get(op, op)
         return f"{left} {excel_op} {right}"
+
+    def _render_operand(
+        self, child: Expr, parent_op: str, ctx: RenderCtx, *, side: str
+    ) -> str:
+        """Render a BinOp operand and wrap in parens iff Excel precedence
+        would otherwise re-associate the expression incorrectly.
+
+        Wrapping is decided by the *effective* top-level operator of the
+        rendered string — `_effective_op` follows VarRefs into floating
+        Variables (whose `_expr` is rendered inline) so we don't miss
+        compound subtrees that present as VarRef in the AST.
+        """
+        rendered = self.walker.render(child, ctx)
+        effective = self._effective_op(child)
+        if effective is None:
+            return rendered
+        parent_prec = _BINOP_PRECEDENCE.get(parent_op, 0)
+        child_prec = _BINOP_PRECEDENCE.get(effective, 0)
+        if child_prec < parent_prec:
+            return f"({rendered})"
+        if (
+            child_prec == parent_prec
+            and side == "right"
+            and parent_op in _NON_COMMUTATIVE_RIGHT
+        ):
+            return f"({rendered})"
+        return rendered
+
+    def _effective_op(self, node: Expr) -> str | None:
+        """The operator that would govern this node's rendered string, or
+        ``None`` if it renders as an atomic token (cell ref, literal,
+        function call, already-parenthesized subexpr).
+
+        Follows VarRefs into floating Variables, since their `_expr` is
+        rendered inline at the parent's call site.
+        """
+        if isinstance(node, BinOp):
+            return node.op
+        if isinstance(node, VarRef):
+            var = node.var
+            if var.id in self.addresses:
+                return None  # rendered as a cell address — atomic
+            if var._expr is not None:
+                return self._effective_op(var._expr)
+            return None
+        return None
 
     def render_subscript(self, node: Subscript, ctx: RenderCtx) -> str:
         if not isinstance(node.base, VarRef):

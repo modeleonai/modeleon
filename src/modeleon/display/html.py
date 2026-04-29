@@ -501,10 +501,10 @@ _TOGGLE_STYLES = (
     "{{ background: #fffaf2; color: #07464a; }}"
     "{root} label.mo-btn.mo-formula-btn::before "
     "{{ content: '\u0192\u00a0'; font-weight: 600; color: #bfa163; margin-right: 2px; }}"
+    # Label stays "Formulas" in both states — the cream/teal active
+    # tint plus the brighter gold prefix carry the on/off signal,
+    # animated by the background/color transition on ``label.mo-btn``.
     "{root} label.mo-btn.mo-formula-btn::after {{ content: 'Formulas'; }}"
-    "{root} input.mo-toggle:checked ~ * label.mo-btn.mo-formula-btn::after, "
-    "{root} input.mo-toggle:checked ~ label.mo-btn.mo-formula-btn::after "
-    "{{ content: 'Values'; }}"
     # Per-cell click-to-inspect: focusing a formula cell shows its
     # formula. Outline uses bright teal so the active cell pops.
     "{root} td.mo-cell {{ cursor: pointer; transition: background 80ms ease; }}"
@@ -581,13 +581,13 @@ _TAB_STYLES = (
     "{{ border-top: 1px solid #c4cec6; border-radius: 4px; }}"
     "{root} label.mo-btn.mo-stack-btn::before "
     "{{ content: '\u25a6\u00a0'; font-weight: 600; color: #bfa163; margin-right: 2px; }}"
+    # Label stays "Stacked" in both states — same convention as the
+    # Formulas toggle: the active cream/teal tint indicates state,
+    # animated through the shared ``transition`` on ``label.mo-btn``.
     "{root} label.mo-btn.mo-stack-btn::after {{ content: 'Stacked'; }}"
     "{root} input.mo-stack:checked ~ * label.mo-btn.mo-stack-btn, "
     "{root} input.mo-stack:checked ~ label.mo-btn.mo-stack-btn "
     "{{ background: #fffaf2; color: #07464a; }}"
-    "{root} input.mo-stack:checked ~ * label.mo-btn.mo-stack-btn::after, "
-    "{root} input.mo-stack:checked ~ label.mo-btn.mo-stack-btn::after "
-    "{{ content: 'Tabbed'; }}"
 )
 
 
@@ -598,6 +598,11 @@ def _precedents_script(uid: str) -> str:
     formula references gets a dashed gold outline + cream background —
     the same visual idea as Excel's "Trace Precedents" button. Losing
     focus clears the highlight.
+
+    Focusing a cell never switches tabs — that would be a navigation
+    side-effect on what is otherwise a peek action. Precedents on
+    other tabs still get the ``mo-dep`` class so they're visibly
+    highlighted whenever the user manually flips to that tab.
 
     Pure-CSS focus-outline and click-to-show-formula already work
     without this script; it's a progressive enhancement. If JS is
