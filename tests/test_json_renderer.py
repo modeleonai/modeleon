@@ -26,7 +26,7 @@ def _render_json(var):
 
 def _build_model():
     model = mo.MultiVariable("m")
-    model.python_name = "model"
+    model._python_name = "model"
     model.s = mo.MultiVariable("s", excel_props={'tab': True})
     return model
 

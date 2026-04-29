@@ -29,7 +29,7 @@ class TestFloatingIdentity:
 
     def test_python_name_set_explicitly_crystallizes(self):
         v = mo.Variable(1)
-        v.python_name = 't'
+        v._python_name = 't'
         # An unattached Variable with a python_name resolves to ROOT.t
         assert v.id == 't'
 
@@ -39,30 +39,30 @@ class TestAttachmentSetsPath:
 
     def test_attached_variable_has_path_under_parent(self):
         m = mo.MultiVariable("M")
-        m.python_name = 'm'
+        m._python_name = 'm'
         m.x = mo.Variable(1)
         assert m.x.id == 'm.x'
         assert m.x.python_name == 'x'
 
     def test_attached_sub_mv_has_path_under_parent(self):
         m = mo.MultiVariable("M")
-        m.python_name = 'm'
+        m._python_name = 'm'
         m.s = mo.MultiVariable("S", excel_props={'tab': True})
         assert m.s.id == 'm.s'
         assert m.s.python_name == 's'
 
     def test_deeply_nested_paths(self):
         m = mo.MultiVariable("M")
-        m.python_name = 'm'
+        m._python_name = 'm'
         m.s = mo.MultiVariable("S", excel_props={'tab': True})
         m.s.x = mo.Variable(10)
         assert m.s.x.id == 'm.s.x'
 
     def test_explicit_python_name_overrides_default(self):
         m = mo.MultiVariable("M")
-        m.python_name = 'root'
+        m._python_name = 'root'
         m.x = mo.Variable(1)
-        m.x.python_name = 'override'
+        m.x._python_name = 'override'
         # python_name set explicitly is honored.
         assert m.x.python_name == 'override'
 
@@ -72,7 +72,7 @@ class TestCrossSheetIdentity:
 
     def test_same_name_different_sheets_distinct_paths(self):
         m = mo.MultiVariable("M")
-        m.python_name = 'm'
+        m._python_name = 'm'
         m.a = mo.MultiVariable("A", excel_props={'tab': True})
         m.a.cogs = mo.Variable(100)
         m.b = mo.MultiVariable("B", excel_props={'tab': True})
@@ -87,25 +87,25 @@ class TestQualifiedPath:
 
     def test_model_path_from_python_name(self):
         m = mo.MultiVariable("Acme")
-        m.python_name = 'm'
+        m._python_name = 'm'
         assert m.path == QPath(("m",))
 
     def test_sheet_path_under_model(self):
         m = mo.MultiVariable("Acme")
-        m.python_name = 'm'
+        m._python_name = 'm'
         m.pnl = mo.MultiVariable("P&L", excel_props={'tab': True})
         assert m.pnl.path == QPath(("m", "pnl"))
 
     def test_variable_path_under_sheet(self):
         m = mo.MultiVariable("Acme")
-        m.python_name = 'm'
+        m._python_name = 'm'
         m.pnl = mo.MultiVariable("P&L", excel_props={'tab': True})
         m.pnl.revenue = mo.Variable(1_000_000)
         assert m.pnl.revenue.path == QPath(("m", "pnl", "revenue"))
 
     def test_factory_style_components_crystallize(self):
         m = mo.MultiVariable("Forecast")
-        m.python_name = 'm'
+        m._python_name = 'm'
         m.assumptions = mo.MultiVariable(
             "Assumptions", excel_props={'tab': True},
             tax_rate=mo.Variable(0.25),
@@ -121,10 +121,10 @@ class TestCrossModelIsolation:
 
     def test_two_models_have_independent_trees(self):
         a = mo.MultiVariable("A")
-        a.python_name = 'a'
+        a._python_name = 'a'
         a.x = mo.Variable(1)
         b = mo.MultiVariable("B")
-        b.python_name = 'b'
+        b._python_name = 'b'
         b.x = mo.Variable(2)
 
         assert a.x.id == 'a.x'
@@ -139,7 +139,7 @@ class TestDualKeyedAddresses:
         from modeleon.compile.excel.layout import LayoutEngine
 
         m = mo.MultiVariable("M")
-        m.python_name = 'm'
+        m._python_name = 'm'
         m.s = mo.MultiVariable("S", excel_props={'tab': True})
         m.s.x = mo.Variable(1, display_name='X')
         engine = LayoutEngine([m.s])
@@ -153,7 +153,7 @@ class TestDependencyProjection:
 
     def test_dependencies_use_qualified_paths(self):
         m = mo.MultiVariable("M")
-        m.python_name = 'm'
+        m._python_name = 'm'
         m.a = mo.Variable(10)
         m.b = mo.Variable(20)
         m.c = m.a + m.b

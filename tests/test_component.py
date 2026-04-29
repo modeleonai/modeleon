@@ -95,8 +95,9 @@ class TestComponentExcelProps:
 
 
 class TestComponentSetters:
-    """``set_display_name`` and ``set_python_name`` are inherited from
-    Component and chain ``self``."""
+    """``set_display_name`` is inherited from Component and chains
+    ``self``. ``python_name`` setting goes through adoption or
+    ``Model``, not a chaining helper."""
 
     def test_set_display_name_chains_on_variable(self):
         v = mo.Variable(1)
@@ -110,18 +111,6 @@ class TestComponentSetters:
         assert result is m
         assert m._display_name == "P&L"
 
-    def test_set_python_name_chains_on_variable(self):
-        v = mo.Variable(1)
-        result = v.set_python_name("revenue")
-        assert result is v
-        assert v.python_name == "revenue"
-
-    def test_set_python_name_chains_on_multivariable(self):
-        m = mo.MultiVariable()
-        result = m.set_python_name("pnl")
-        assert result is m
-        assert m.python_name == "pnl"
-
     def test_chaining_preserves_concrete_type(self):
         """``Self`` typing on chaining methods means the returned object
         retains the subclass type — chained calls keep access to
@@ -130,7 +119,6 @@ class TestComponentSetters:
             mo.Variable(1_000_000)
             .set_display_name("Revenue")
             .set_style(bold=True)
-            .set_python_name("revenue")
         )
         # If ``Self`` typing is wrong, the chain returns ``Component``
         # and ``.value`` (Variable-only) wouldn't be type-resolvable.

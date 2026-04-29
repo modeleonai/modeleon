@@ -98,7 +98,7 @@ class MultiVariableBase(_MVLifecycle, _MVInspect, Component):
         self,
         display_name: Optional[str] = None,
         excel_props: Optional[Dict[str, Any]] = None,
-        **kwargs
+        **kwargs: Any,
     ):
         """
         Initialize MultiVariableBase.
@@ -111,17 +111,33 @@ class MultiVariableBase(_MVLifecycle, _MVInspect, Component):
                    ``'row'`` / ``'col'`` (explicit placement), plus
                    styling (``'bold'``, ``'bg'``, ``'number_format'``, …
                    see :attr:`_EXCEL_PROP_KEYS`). Unknown keys raise.
-            **kwargs: Captured on ``self._creation_params`` for
-                  inspection by downstream tooling.
+
+        ``MultiVariableBase`` itself accepts only ``display_name`` and
+        ``excel_props``. The :class:`MultiVariable` subclass is what
+        users instantiate; it absorbs Variable / MV-typed kwargs as
+        components and forwards the rest here. Anything that lands in
+        ``kwargs`` at this layer is a typo and raises ``TypeError`` —
+        mirrors :class:`Variable`'s strict-kwarg discipline.
         """
+        if kwargs:
+            raise TypeError(
+                f"{type(self).__name__}() got unexpected keyword argument(s): "
+                f"{', '.join(sorted(kwargs))}. "
+                f"Known kwargs: display_name, excel_props. "
+                f"For component children, assign attributes "
+                f"(``mv.revenue = mo.Variable(...)``) or use the factory form "
+                f"(``MultiVariable(revenue=mo.Variable(...))``). "
+                f"For styling and structural placement, pass "
+                f"``excel_props={{'row': N, 'col': N, 'bold': True, ...}}``. "
+                f"For top-level naming, use ``mo.Model('name')``."
+            )
+
         # ``_qualified_id``, ``_python_name``, ``_display_name``, and
         # ``_excel_props`` are initialized on :class:`Component`; the
         # excel_props dict is validated against ``_EXCEL_PROP_KEYS`` there.
         # Adoption (``parent.child = mv`` → ``_register_component``) is
         # what later sets ``_python_name``.
         super().__init__(display_name=display_name, excel_props=excel_props)
-
-        self._creation_params: Dict[str, Any] = kwargs.copy()
 
         # Component storage (Variables and nested MultiVariables)
         self._components: Dict[str, Any] = {}
@@ -324,7 +340,13 @@ class MultiVariableClass(MultiVariableBase):
         from .variable import Variable
         self._Variable_class = Variable
 
+        # Pop the kwargs the parent ``MultiVariableBase`` recognizes;
+        # everything else is a template parameter (``start_users=100``,
+        # ``churn_rate=0.05``) for ``compute()`` or attribute storage.
         display_name = kwargs.pop('display_name', None)
+        excel_props = kwargs.pop('excel_props', None)
+
+        super().__init__(display_name=display_name, excel_props=excel_props)
 
         self._input_variables: Dict[str, 'Variable'] = {}
 
@@ -333,9 +355,6 @@ class MultiVariableClass(MultiVariableBase):
             setattr(self, key, extracted)
             if isinstance(value, Variable):
                 self._input_variables[key] = value
-
-        base_kwargs = {k: getattr(self, k) for k in kwargs if hasattr(self, k)}
-        super().__init__(display_name=display_name, **base_kwargs)
 
         # If compute() is overridden by subclass, call it with resolved params
         if type(self).compute is not MultiVariableClass.compute:
@@ -417,9 +436,17 @@ class MultiVariable(MultiVariableBase):
         Args:
             display_name: User-friendly label (e.g. "Income Statement").
             **components: Named Variables or MultiVariables to include,
-                plus optional ``excel_props={'tab': True}`` to mark an Excel tab.
+                plus optional ``excel_props={'tab': True}`` to mark an
+                Excel tab.
         """
         from .variable import Variable
+
+        # Carve out the kwargs ``MultiVariableBase`` recognizes by name
+        # so they're forwarded explicitly rather than treated as
+        # candidate components.
+        base_kwargs: Dict[str, Any] = {}
+        if "excel_props" in components:
+            base_kwargs["excel_props"] = components.pop("excel_props")
 
         registerable = {}
         other_kwargs = {}
@@ -429,7 +456,7 @@ class MultiVariable(MultiVariableBase):
             else:
                 other_kwargs[comp_name] = value
 
-        super().__init__(display_name=display_name, **other_kwargs)
+        super().__init__(display_name=display_name, **base_kwargs, **other_kwargs)
 
         for name, comp in registerable.items():
             self._register_component(name, comp)

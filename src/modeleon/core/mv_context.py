@@ -73,6 +73,23 @@ def _crystallize_subtree(item: Any, path: QPath) -> None:
             _crystallize_subtree(child, path.child(comp_name))
 
 
+def _invalidate_subtree_paths(item: Any) -> None:
+    """Recursively clear ``_qualified_id`` so paths re-resolve on next read.
+
+    Used when an adoptee is re-rooted under a new parent — its old
+    cached path is stale, and the parent itself may not yet be rooted
+    (so :func:`_crystallize_subtree` has nothing to write). Clearing
+    lets the lazy ``path`` property walk the owner chain on access.
+    """
+    from .multi_variable import MultiVariableBase
+
+    item._qualified_id = None
+    if isinstance(item, MultiVariableBase):
+        for comp_name in item._component_order:
+            child = item._components[comp_name]
+            _invalidate_subtree_paths(child)
+
+
 class _MVLifecycle:
     """Context-manager + adoption mixin for :class:`MultiVariableBase`.
 
@@ -118,9 +135,30 @@ class _MVLifecycle:
 
         The replaced component is orphaned: its parent / owner links are
         cleared and its qualified path reverts to the floating namespace.
+
+        Model demotion: when a :class:`~modeleon.core.model.Model` is
+        adopted into another container it stops being a root, so its
+        runtime class is rewritten to :class:`MultiVariable`. The
+        memory layout is identical (Model adds no slots or fields
+        beyond MultiVariable's), the user's reference still points to
+        the same object, and any Model-specific type checks downstream
+        correctly report the demoted instance.
         """
-        from .multi_variable import MultiVariableBase
+        from .model import Model
+        from .multi_variable import MultiVariable, MultiVariableBase
         from .variable import Variable
+
+        # Demote a Model to a plain MultiVariable on adoption — Models
+        # are top-level roots by contract; once adopted they are sub-
+        # trees. The class swap is layout-safe because Model adds no
+        # state beyond what MultiVariable already has. Sheet-vs-section
+        # rendering is decided positionally by the renderer (1st-level
+        # children of the render root become sheets, deeper become
+        # sections), so demotion doesn't touch ``_is_sheet`` /
+        # ``excel_props`` — the user's explicit markers are respected
+        # if they set any.
+        if isinstance(component, Model):
+            component.__class__ = MultiVariable  # type: ignore[assignment]
 
         if name in self._components:
             existing = self._components[name]
@@ -170,6 +208,12 @@ class _MVLifecycle:
             component._owner = self_mv
             component._component_name = name
             component._python_name = name
+
+        # The adoptee may have a cached ``_qualified_id`` from a prior
+        # life — e.g. a demoted Model whose path was crystallized at
+        # ``ROOT.child(name)`` before adoption. Clear the subtree so
+        # the lazy ``path`` property re-resolves through the new owner.
+        _invalidate_subtree_paths(component)
 
         # Crystallize qualified path. When the parent is already
         # rooted, descend into the adoptee and set every descendant's

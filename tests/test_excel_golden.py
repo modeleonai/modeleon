@@ -20,6 +20,7 @@ the source of truth — no "roughly equals" assertions.
 
 from __future__ import annotations
 
+import pytest
 from openpyxl import load_workbook
 
 import modeleon as mo
@@ -145,3 +146,107 @@ class TestSelfRefTimeSeries:
             "A1": "Growth",     "B1": 1.1,          "C1": 1.1,          "D1": 1.1,
             "A2": "Users",      "B2": "=100",       "C2": "=B2 * C1",   "D2": "=C2 * D1",
         }
+
+
+class TestBinOpPrecedenceParens:
+    """Mixed-precedence binops must keep their parentheses in the
+    emitted Excel formula.
+
+    The current renderer (``render_binop`` in
+    :file:`compile/excel/renderer.py`) emits ``{left} {op} {right}``
+    flat, with no precedence-aware wrapping. ``__truediv__`` /
+    ``__rtruediv__`` / ``__neg__`` pass ``parenthesize=True`` to the
+    arithmetic chokepoint as a partial workaround — that's why
+    ``(a + b) / c`` already comes out correct (covered as a
+    counter-example below). But ``__mul__`` / ``__pow__`` / etc.
+    don't, so ``a * (1 - b)`` collapses to ``=B1 * 1 - B2`` and Excel
+    silently computes the wrong result.
+
+    These tests pin the **correct** emitted formulas. The two known-
+    broken shapes are xfail-marked; flip them to pass once the
+    renderer compares parent/child operator precedence and wraps
+    accordingly.
+    """
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="render_binop doesn't wrap a lower-precedence child of "
+               "multiplication in parens — `a * (1 - b)` collapses to "
+               "`a * 1 - b` and Excel evaluates as `(a * 1) - b`.",
+    )
+    def test_subtraction_inside_multiplication(self, tmp_path):
+        # ``a * (1 - b)`` — subtraction binds looser than multiplication,
+        # so the right-hand subtree needs parens. Multiplication has no
+        # ``parenthesize=True`` workaround.
+        model = mo.MultiVariable("M")
+        model.s = mo.MultiVariable("S", excel_props={'tab': True})
+        with model.s as s:
+            s.a = mo.Variable(2.0, display_name='A')
+            s.b = mo.Variable(0.5, display_name='B')
+            s.x = (s.a * (1 - s.b)).set_display_name('X')
+
+        model.to_excel(tmp_path / "p.xlsx")
+
+        cells = _cells(tmp_path / "p.xlsx", "S")
+        assert cells["B3"] == "=B1 * (1 - B2)"
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="render_binop doesn't wrap children of `**` (exponent) — "
+               "`(a/b) ** (1/c)` collapses to `a / b ^ 1 / c`, which "
+               "Excel reads left-to-right as `((a/b)^1)/c`.",
+    )
+    def test_division_and_exponent_groups(self, tmp_path):
+        # ``(a / b) ** (1 / c)`` — both children of ``**`` are divisions
+        # which bind tighter than ``**`` in Excel's left-associative
+        # exponent. Parens needed to preserve grouping.
+        model = mo.MultiVariable("M")
+        model.s = mo.MultiVariable("S", excel_props={'tab': True})
+        with model.s as s:
+            s.a = mo.Variable(2.0, display_name='A')
+            s.b = mo.Variable(0.5, display_name='B')
+            s.c = mo.Variable(3.0, display_name='C')
+            s.y = ((s.a / s.b) ** (1 / s.c)).set_display_name('Y')
+
+        model.to_excel(tmp_path / "p.xlsx")
+
+        cells = _cells(tmp_path / "p.xlsx", "S")
+        assert cells["B4"] == "=(B1 / B2) ^ (1 / B3)"
+
+    def test_addition_inside_division_keeps_parens(self, tmp_path):
+        # Counter-example pinning the existing partial workaround:
+        # ``__truediv__`` passes ``parenthesize=True`` so its operands
+        # do get wrapped. ``(a + b) / c`` therefore renders correctly
+        # today; if the renderer fix lands and removes this hack, the
+        # general precedence-aware logic must still produce the same
+        # output here.
+        model = mo.MultiVariable("M")
+        model.s = mo.MultiVariable("S", excel_props={'tab': True})
+        with model.s as s:
+            s.a = mo.Variable(10.0, display_name='A')
+            s.b = mo.Variable(20.0, display_name='B')
+            s.c = mo.Variable(5.0, display_name='C')
+            s.z = ((s.a + s.b) / s.c).set_display_name('Z')
+
+        model.to_excel(tmp_path / "p.xlsx")
+
+        cells = _cells(tmp_path / "p.xlsx", "S")
+        assert cells["B4"] == "=(B1 + B2) / B3"
+
+    def test_same_precedence_does_not_wrap(self, tmp_path):
+        # When child and parent share precedence (e.g. both
+        # multiplication), left-associativity already gives the right
+        # result and no extra parens should appear — the future fix
+        # must not over-wrap.
+        model = mo.MultiVariable("M")
+        model.s = mo.MultiVariable("S", excel_props={'tab': True})
+        with model.s as s:
+            s.a = mo.Variable(2.0, display_name='A')
+            s.b = mo.Variable(3.0, display_name='B')
+            s.c = mo.Variable(4.0, display_name='C')
+            s.p = (s.a * s.b * s.c).set_display_name('P')
+
+        model.to_excel(tmp_path / "p.xlsx")
+
+        cells = _cells(tmp_path / "p.xlsx", "S")
+        assert cells["B4"] == "=B1 * B2 * B3"

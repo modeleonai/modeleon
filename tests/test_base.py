@@ -66,26 +66,30 @@ class TestBaseFields:
         assert m._display_name is None
 
 
-class TestBasePythonNameProperty:
-    """``python_name`` getter/setter is inherited from Base."""
+class TestBasePythonNameReadOnly:
+    """``python_name`` is a read-only property inherited from Base.
+    It's set internally by adoption (``parent.x = node`` writes
+    ``node._python_name = "x"``) or by ``Model('name')`` for the root.
+    Public assignment is rejected."""
 
-    def test_set_via_property(self):
+    def test_property_is_read_only(self):
         v = mo.Variable(1)
-        v.python_name = "revenue"
-        assert v.python_name == "revenue"
-        assert v._python_name == "revenue"
+        with pytest.raises(AttributeError):
+            v.python_name = "revenue"
 
-    def test_set_via_property_on_mv(self):
+    def test_property_is_read_only_on_mv(self):
         m = mo.MultiVariable("Tab")
-        m.python_name = "pnl"
-        assert m.python_name == "pnl"
-        assert m._python_name == "pnl"
+        with pytest.raises(AttributeError):
+            m.python_name = "pnl"
 
-    def test_clear_via_property(self):
-        v = mo.Variable(1)
-        v.python_name = "x"
-        v.python_name = None
-        assert v.python_name is None
+    def test_adoption_sets_python_name(self):
+        m = mo.Model("m")
+        m.x = mo.Variable(1)
+        assert m.x.python_name == "x"
+
+    def test_model_constructor_sets_python_name(self):
+        acme = mo.Model("acme")
+        assert acme.python_name == "acme"
 
 
 class TestBaseIdProperty:
@@ -102,10 +106,24 @@ class TestBaseIdProperty:
         assert m.id == str(m.path)
 
     def test_adopted_id_is_qualified(self):
-        with mo.MultiVariable("Pnl") as pnl:
+        # ``Model`` is the canonical top-level entry — its ``name``
+        # crystallizes the root path so adopted children inherit a
+        # rooted prefix.
+        pnl = mo.Model("pnl")
+        pnl.revenue = mo.Variable(100)
+        assert pnl.id == "pnl"
+        assert pnl.revenue.id == "pnl.revenue"
+
+    def test_top_level_mv_without_python_name_stays_floating(self):
+        # ``with mo.MultiVariable() as pnl:`` aliases the local binding
+        # but does not set ``_python_name``. The MV stays floating;
+        # adopted Variables inherit a floating prefix.
+        with mo.MultiVariable() as pnl:
             pnl.revenue = mo.Variable(100)
-        # After adoption + path crystallization through python_name discovery
-        assert pnl.revenue.id.endswith("revenue")
+        assert pnl.path.is_floating
+        assert pnl.revenue.path.is_floating
+        assert pnl.revenue.python_name == "revenue"  # set by adoption
+        assert pnl.python_name is None  # never set
 
 
 class TestBaseSubclassDirectly:

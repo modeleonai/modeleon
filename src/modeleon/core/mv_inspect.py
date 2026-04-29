@@ -36,7 +36,7 @@ class _MVInspect:
     _components: Dict[str, Any]
     _component_order: List[str]
     _parent: Optional["MultiVariableBase"]
-    _creation_params: Dict[str, Any]
+    _excel_props: Dict[str, Any]
     _qualified_id: Any
     python_name: Optional[str]
     id: str
@@ -183,10 +183,7 @@ class _MVInspect:
             'python_name': self.python_name,
             'name': self.display_name,
             'components': self._component_order,
-            'params': {
-                k: repr(v) if not isinstance(v, (str, int, float, bool, list, dict, type(None))) else v
-                for k, v in self._creation_params.items()
-            },
+            'excel_props': dict(self._excel_props),
             'sheet': self.sheet_name,
             'is_sheet': self._is_sheet,
             'parent': self._parent.id if self._parent else None,

@@ -178,39 +178,132 @@ def _label_with_unit(var) -> str:
 class _Ctx:
     """Per-render context: address table + translator + var→sheet map.
 
-    Built once per top-level ``_repr_html_`` call (model / sheet / mv)
-    and threaded down to per-cell renders so we can show real Excel
-    formulas without re-building the layout for every Variable.
+    Built once per top-level ``_repr_html_`` call (model / sheet / mv /
+    bare Variable) and threaded down to per-cell renders so we can
+    show real Excel formulas without re-building the layout for every
+    Variable.
 
-    Failures during construction (e.g. an MV with no Sheet inside it)
-    yield ``None`` — callers fall back to plain-value rendering.
+    ``section_header_rows`` carries ``{section_id: (row, col)}`` from
+    :class:`~modeleon.compile.excel.layout.LayoutEngine` so the table
+    renderer can label section header rows with their flat-layout row
+    numbers.
+
+    Failures during construction (e.g. a bare MultiVariable used for
+    grouping with no Sheet inside it) yield ``None`` — callers fall
+    back to plain-value rendering.
     """
     addresses: dict
     translator: Any
     var_to_sheet: dict
+    section_header_rows: dict
 
 
-def _build_ctx(root) -> Optional[_Ctx]:
-    """Build a translator context for *root*. Returns ``None`` if the
-    root has no Sheets to lay out (e.g. a bare MultiVariable used for
-    grouping)."""
+def _ctx_from_layout(roots, *, flatten_nested_sheets: bool = False) -> Optional[_Ctx]:
+    """Build a translator context for the given layout roots.
+
+    A root is either a :class:`MultiVariableBase` (sheet/section
+    subtree) or a :class:`Variable` (laid out as one row on a
+    synthesized sheet). When ``flatten_nested_sheets`` is set, sub-MVs
+    marked ``_is_sheet=True`` render as sections inside their parent's
+    flat layout — used by the HTML repr's per-tab rendering so
+    formulas reference cells against the visible flat layout.
+
+    Returns ``None`` when there's nothing to lay out.
+    """
     try:
         from ..compile.excel.layout import LayoutEngine
         from ..compile.excel.translator import ExcelTranslator
-        from ..compile.excel.writer import _build_var_to_sheet, _collect_root_sheets
 
-        roots = _collect_root_sheets(root)
         if not roots:
             return None
-        addresses = LayoutEngine(roots).compute_addresses()
+        engine = LayoutEngine(roots, flatten_nested_sheets=flatten_nested_sheets)
+        addresses = engine.compute_addresses()
         if not addresses:
             return None
-        var_to_sheet = _build_var_to_sheet(addresses, roots)
+        var_to_sheet: dict[str, str] = {}
+        for sheet_name, var_ids in engine.sheet_map.items():
+            for var_id in var_ids:
+                var_to_sheet[var_id] = sheet_name
         translator = ExcelTranslator(addresses, var_to_sheet)
-        return _Ctx(addresses=addresses, translator=translator, var_to_sheet=var_to_sheet)
+        return _Ctx(
+            addresses=addresses,
+            translator=translator,
+            var_to_sheet=var_to_sheet,
+            section_header_rows=dict(engine.section_header_rows),
+        )
     except Exception as exc:
         logger.debug("HTML repr: translator context unavailable (%s)", exc)
         return None
+
+
+def _build_ctx(root) -> Optional[_Ctx]:
+    """Build a flat-layout context for an MV root (used by ``model_html``
+    per-tab rendering). Each tab's panel reads as one continuous flat
+    sheet — section headers claim real rows, formulas reference cells
+    against that layout."""
+    return _ctx_from_layout([root], flatten_nested_sheets=True)
+
+
+def _make_overview_sheet(root, direct_var_names: list[str]):
+    """Wrap a root's direct Variables in a virtual sheet so the
+    overview tab can be laid out in isolation. Mirrors the writer's
+    ``_make_virtual_sheet`` shape — never attaches to a parent, never
+    mints a new path.
+    """
+    from ..core.multi_variable import MultiVariable
+
+    virt = object.__new__(MultiVariable)
+    virt._role = 'sheet'
+    virt._display_name = (
+        root.display_name or getattr(root, 'python_name', None) or "Sheet1"
+    )
+    virt._components = {}
+    virt._component_order = []
+    virt._parent = None
+    virt._name_in_parent = None
+    virt._qualified_id = None
+    virt._python_name = None
+    virt._excel_props = {'tab': True}
+    for name in direct_var_names:
+        virt._components[name] = root._components[name]
+        virt._component_order.append(name)
+    return virt
+
+
+def _merge_ctxs(ctxs: list[_Ctx]) -> Optional[_Ctx]:
+    """Union per-panel contexts into a single workbook-wide context.
+
+    HTML repr lays each tab out independently so row numbers and
+    section headers reflect the panel's own flat layout. Cross-tab
+    formula references, however, need the translator to see *every*
+    tab's addresses at once — otherwise an out-of-panel ``VarRef``
+    falls through the literal-fallback path (printing ``100.0`` where
+    Excel would print ``=Inputs!B1``). Merging the per-panel address
+    dicts and rebuilding one translator gives every panel a renderer
+    that resolves cross-tab references the same way ``to_excel`` does.
+
+    Address keys are var ids — each Variable lives on exactly one tab,
+    so the union is conflict-free.
+    """
+    from ..compile.excel.translator import ExcelTranslator
+
+    if not ctxs:
+        return None
+
+    addresses: dict = {}
+    var_to_sheet: dict = {}
+    section_header_rows: dict = {}
+    for ctx in ctxs:
+        addresses.update(ctx.addresses)
+        var_to_sheet.update(ctx.var_to_sheet)
+        section_header_rows.update(ctx.section_header_rows)
+
+    return _Ctx(
+        addresses=addresses,
+        translator=ExcelTranslator(addresses, var_to_sheet),
+        var_to_sheet=var_to_sheet,
+        section_header_rows=section_header_rows,
+    )
 
 
 def _parse_addr(addr: str) -> tuple[str, int]:
@@ -664,19 +757,26 @@ def _tabbed_wrapper(
 
 
 def variable_html(var) -> str:
-    """Render a single Variable as an HTML table row."""
-    ctx = _build_ctx(var._owner) if getattr(var, '_owner', None) is not None else None
-    label = _label_with_unit(var)
-    value = var._value
-    values = value if isinstance(value, list) else [value]
-    cells_and_flags = [_render_var_cell(var, v, i, ctx) for i, v in enumerate(values)]
-    has_formula = any(has for _, has in cells_and_flags)
-    cells = "".join(cell for cell, _ in cells_and_flags)
-    table = (
-        f'<table style="{_TABLE}">'
-        f'<tr><th style="{_TH_LABEL}">{html.escape(str(label))}</th>{cells}</tr>'
-        f"</table>"
-    )
+    """Render a single Variable as an Excel-style table.
+
+    Lays the Variable out as a one-row pseudo-sheet via
+    :class:`~modeleon.compile.excel.layout.LayoutEngine` (the sheet
+    inherits the Variable's display name) and reuses
+    :func:`_render_mv_table` so the row reads the same as inside any
+    other repr — column letters across the top, row number on the
+    left, real addresses + formulas in each cell. Cross-scope
+    references fall through the renderer's literal fallback.
+    """
+    import warnings as _warnings
+    from ..compile.excel.layout import LayoutEngine
+    from ..core.errors import CrossScopeReferenceWarning
+
+    pseudo_sheet = LayoutEngine._make_variable_sheet(var)
+    ctx = _ctx_from_layout([pseudo_sheet])
+
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("ignore", CrossScopeReferenceWarning)
+        table, has_formula = _render_mv_table(pseudo_sheet, ctx, suppress_title=True)
     return _toggle_wrapper(_next_uid(), table, has_any_formula=has_formula)
 
 
@@ -758,8 +858,11 @@ def _collect_rows(mv, direct_only: bool = False) -> tuple[list, int]:
     list-valued Variables (1 if everything is scalar).
 
     ``direct_only=True`` skips sub-MVs entirely (used by the synthetic
-    first tab in :func:`model_html` — sub-MVs get their own tabs, so
-    rendering them as nested sections here would double-up).
+    overview tab in :func:`model_html` — sub-MVs get their own tabs,
+    so rendering them as nested sections here would double-up). All
+    sub-MVs render as sections regardless of their ``_is_sheet`` flag;
+    sheet-vs-section is decided positionally by :func:`model_html`,
+    not by per-node markers.
     """
     from ..core.variable import Variable
     from ..core.multi_variable import MultiVariableBase
@@ -773,10 +876,12 @@ def _collect_rows(mv, direct_only: bool = False) -> tuple[list, int]:
             values = comp._value if isinstance(comp._value, list) else [comp._value]
             max_cols = max(max_cols, len(values))
             rows.append(('var', label, comp, values))
-        elif isinstance(comp, MultiVariableBase) and not comp._is_sheet:
+        elif isinstance(comp, MultiVariableBase):
             if direct_only:
                 continue
-            rows.append(('section', comp.display_name, None, None))
+            # Carry the sub-MV through so the renderer can look up the
+            # section's flat-layout row from ``section_rows``.
+            rows.append(('section', comp.display_name, comp, None))
             sub_rows, sub_cols = _collect_rows(comp)
             max_cols = max(max_cols, sub_cols)
             rows.extend(sub_rows)
@@ -788,6 +893,7 @@ def _render_mv_table(
     ctx: Optional[_Ctx],
     direct_only: bool = False,
     suppress_title: bool = False,
+    section_rows: Optional[dict] = None,
 ) -> tuple[str, bool]:
     """Build the inner table HTML for a MultiVariable + whether it
     contains at least one computed cell (to decide whether the
@@ -849,8 +955,22 @@ def _render_mv_table(
     has_formula = False
     for kind, label, var, values in rows:
         if kind == 'section':
+            # ``var`` here is the section's sub-MV; its layout-side
+            # section row (when LayoutEngine recorded one) is the row
+            # we display.
+            sec_id = (
+                getattr(var, 'python_name', None)
+                or getattr(var, '_name_in_parent', None)
+                or getattr(var, 'id', None)
+            )
+            sec_row_label = ''
+            if ctx is not None and sec_id is not None:
+                section_header_rows = getattr(ctx, 'section_header_rows', None) or {}
+                sec_pos = section_header_rows.get(sec_id)
+                if sec_pos:
+                    sec_row_label = str(sec_pos[0])
             body += (
-                f'<tr><th style="{_TH_ROW}"></th>'
+                f'<tr><th style="{_TH_ROW}">{sec_row_label}</th>'
                 f'<th style="{_SECTION}" colspan="{max_cols + 1}">'
                 f"{html.escape(str(label))}</th></tr>"
             )
@@ -914,21 +1034,25 @@ def multi_variable_html(mv, ctx: Optional[_Ctx] = None) -> str:
 
 
 def model_html(root) -> str:
-    """Render any MultiVariable as an Excel-style tabbed view.
+    """Render any MultiVariable as a hierarchical tabbed view.
 
-    - First-depth sub-MultiVariables → one tab each.
-    - Direct Variables on ``root`` → collected into an unnamed first tab.
-    - Single tab → plain table without the tab bar.
-    - Multiple tabs → tabbed interface with shared formula toggle.
+    Positional rule:
 
-    The translator context is built once for the whole tree so cross-sheet
-    formula references (``=Assumptions!B3``) resolve correctly; rendering
-    each panel in isolation would only know its own addresses.
+    - The render root is the "file" (workbook).
+    - First-depth sub-MultiVariables → one tab each (sheets).
+    - Direct Variables on ``root`` → collected into an overview tab
+      labeled with the root's own name.
+    - Deeper sub-MultiVariables (grandchildren and below) →
+      nested sections inside whichever first-depth tab they live in.
+
+    Each tab gets its own flat-layout context — section headers claim
+    real rows, formulas reference cells against that panel's flat
+    layout. Cross-tab references fall through the renderer's literal
+    fallback (out-of-scope ``VarRef`` inlines its value).
     """
     from ..core.variable import Variable
     from ..core.multi_variable import MultiVariableBase
 
-    ctx = _build_ctx(root)
     title = (
         f'<div style="font-family:\'Inter\',system-ui,sans-serif;'
         f"font-weight:700;font-size:15px;color:#07464a;"
@@ -949,26 +1073,62 @@ def model_html(root) -> str:
     if not direct_var_names and not sub_mvs:
         return f"{title}<i>(empty)</i>"
 
-    # Track which panels came from real sub-MVs (auto-promoted tabs in
-    # Excel) vs. the synthetic overview of direct Variables on the root.
-    # A single sub-MV panel still wants the Excel-tab visual; a single
-    # synthetic overview panel doesn't (it'd label the tab with the root's
-    # own name, which reads as redundant).
+    # Track which panels came from real sub-MVs (auto-promoted tabs)
+    # vs. the synthetic overview of direct Variables on the root.
     panels_and_flags: list[tuple[str, str, bool, bool]] = []
 
+    # Pass 1: compute each panel's flat layout independently so row
+    # numbers and section headers reflect its own grid.
+    overview_label = (
+        root.display_name
+        or getattr(root, 'python_name', None)
+        or "Sheet1"
+    )
+    panel_ctxs: list[_Ctx] = []
+    panel_specs: list[tuple] = []  # (label, panel_mv, ctx, direct_only, is_overview)
     if direct_var_names:
-        table, has_f = _render_mv_table(root, ctx, direct_only=True)
-        overview_label = (
-            root.display_name
-            or getattr(root, 'python_name', None)
-            or "Sheet1"
+        # Lay out only the root's direct Variables under a virtual
+        # sheet named after the root — sub-MV variables get their
+        # addresses on their own panels, and including them here would
+        # double-assign addresses when the panel ctxs merge.
+        overview_virt = _make_overview_sheet(root, direct_var_names)
+        overview_ctx = _ctx_from_layout(
+            [overview_virt], flatten_nested_sheets=True,
         )
-        panels_and_flags.append((overview_label, table, has_f, False))
-
+        if overview_ctx is not None:
+            panel_ctxs.append(overview_ctx)
+        panel_specs.append((overview_label, root, overview_ctx, True, False))
     for name, mv in sub_mvs:
-        table, has_f = _render_mv_table(mv, ctx)
+        panel_ctx = _build_ctx(mv)
+        if panel_ctx is not None:
+            panel_ctxs.append(panel_ctx)
         label = mv.display_name or getattr(mv, 'python_name', None) or name
-        panels_and_flags.append((label, table, has_f, True))
+        panel_specs.append((label, mv, panel_ctx, False, True))
+
+    # Pass 2: union per-panel addresses into a single translator so
+    # cross-tab ``VarRef``s resolve to ``Inputs!B1`` instead of
+    # falling through to a literal. Each panel still uses its own
+    # layout for row labels.
+    shared_ctx = _merge_ctxs(panel_ctxs)
+
+    for label, panel_mv, panel_ctx, direct_only, is_subtab in panel_specs:
+        render_ctx = panel_ctx
+        if shared_ctx is not None and panel_ctx is not None:
+            render_ctx = _Ctx(
+                addresses=panel_ctx.addresses,
+                translator=shared_ctx.translator,
+                var_to_sheet=panel_ctx.var_to_sheet,
+                section_header_rows=panel_ctx.section_header_rows,
+            )
+        # Don't suppress the panel title — the ``.mo-panel-title``
+        # div stays in the markup and the CSS hides it in tabbed mode
+        # (where the tab label is the heading) and reveals it in
+        # stacked mode (where no tab bar is visible, so each panel
+        # needs its own header to be identifiable).
+        table, has_f = _render_mv_table(
+            panel_mv, render_ctx, direct_only=direct_only, suppress_title=False,
+        )
+        panels_and_flags.append((label, table, has_f, is_subtab))
 
     has_any_formula = any(has for _, _, has, _ in panels_and_flags)
 

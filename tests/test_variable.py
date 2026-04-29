@@ -111,7 +111,7 @@ class TestCopy:
 
     def test_copy_method(self):
         original = Variable(1000, display_name="Revenue")
-        original.set_python_name("revenue")
+        original._python_name = "revenue"
         duplicate = original.copy()
         assert duplicate._value == 1000
         assert duplicate.formula == "revenue.copy()"
@@ -119,7 +119,7 @@ class TestCopy:
     def test_copy_copy_dunder(self):
         import copy as _copy
         original = Variable([1, 2, 3])
-        original.set_python_name("nums")
+        original._python_name = "nums"
         duplicate = _copy.copy(original)
         assert duplicate._value == [1, 2, 3]
         assert duplicate.formula == "nums.copy()"
@@ -127,7 +127,7 @@ class TestCopy:
     def test_both_paths_produce_equivalent_formulas(self):
         import copy as _copy
         v = Variable(100)
-        v.set_python_name("v")
+        v._python_name = "v"
         assert v.copy().formula == _copy.copy(v).formula
 
 
@@ -150,7 +150,7 @@ class TestPyFormula:
 
     def test_pyformula_wrapping_variable_tracks_dependency(self):
         source = Variable(1000)
-        source.set_python_name("revenue")
+        source._python_name = "revenue"
         wrapped = Variable(pyformula=source)
         assert wrapped._value == 1000
         assert wrapped.pyformula == "revenue"
@@ -190,15 +190,11 @@ class TestPythonName:
         mv.revenue = Variable(1_000_000)
         assert mv.revenue.python_name == 'revenue'
 
-    def test_explicit_set(self):
+    def test_python_name_property_is_read_only(self):
+        import pytest
         v = Variable(1)
-        v.python_name = 'custom'
-        assert v.python_name == 'custom'
-
-    def test_set_python_name_method_still_works(self):
-        v = Variable(1)
-        v.set_python_name('revenue')
-        assert v.python_name == 'revenue'
+        with pytest.raises(AttributeError):
+            v.python_name = 'custom'
 
 
 class TestDependenciesAsProperty:
@@ -221,7 +217,7 @@ class TestDependenciesAsProperty:
         slot. ``c.dependencies`` echoes the names the parent gave them."""
         import modeleon as mo
         mv = mo.MultiVariable("M")
-        mv.python_name = "mv"      # crystallizes mv's path to ROOT.child("mv")
+        mv._python_name = "mv"      # crystallizes mv's path to ROOT.child("mv")
         mv.a = Variable(10)
         mv.b = Variable(20)
         mv.c = mv.a + mv.b

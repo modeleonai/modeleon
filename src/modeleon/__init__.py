@@ -62,6 +62,7 @@ from modeleon.core.multi_variable import (
     MultiVariableClass,
     MultiVariable,
 )
+from modeleon.core.model import Model
 from modeleon.core.errors import CircularDependencyError, CrossScopeReferenceWarning
 from modeleon.core.mv_context import ModelStructureWarning
 from modeleon.core.unit import Unit
@@ -97,6 +98,7 @@ __all__ = [
     "Variable",
     "MultiVariable",
     "MultiVariableClass",
+    "Model",
     "Unit",
     # Exceptions / warnings
     "CircularDependencyError",

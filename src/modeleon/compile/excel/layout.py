@@ -15,11 +15,13 @@ The :class:`VariableAddresses` dataclass lives alongside in
 module and its consumers (writer, translator).
 """
 
-from typing import Dict, Iterator, List
+from typing import Dict, Iterator, List, Sequence, Union
 
 from .addresses import VariableAddresses
 from ...core.multi_variable import MultiVariableBase
 from ...core.variable import Variable
+
+LayoutRoot = Union[Variable, MultiVariableBase]
 
 
 class LayoutEngine:
@@ -48,14 +50,31 @@ class LayoutEngine:
       (dict-keyed Variables without a datetime axis to name columns).
     """
 
-    def __init__(self, roots: List[MultiVariableBase]):
+    def __init__(
+        self,
+        roots: Sequence[LayoutRoot],
+        flatten_nested_sheets: bool = False,
+    ):
         """Store the roots; state fills in at ``compute_addresses()``.
 
         Args:
-            roots: Top-level MultiVariableBase instances. Usually the
-                Sheet/Model subtree the writer is about to emit.
+            roots: Top-level layout roots. Each entry is either a
+                :class:`MultiVariableBase` (sheet/section subtree) or a
+                :class:`Variable` (lays out as a single row on a
+                synthesized sheet named after the Variable). Usually
+                the Sheet/Model subtree the writer is about to emit;
+                HTML repr passes one root per rendered tab.
+            flatten_nested_sheets: When ``True``, sub-MVs marked
+                ``_is_sheet=True`` render as sections inside their
+                parent's flat layout instead of being skipped (and
+                emitted as separate sheets). HTML repr's per-tab
+                rendering uses this so a tab's panel reads as one
+                continuous flat sheet — section headers claim real
+                rows, formulas reference cells against the flat
+                layout. ``to_excel`` callers leave it ``False``.
         """
         self.roots = roots
+        self._flatten_nested_sheets = flatten_nested_sheets
         self.addresses: Dict[str, VariableAddresses] = {}
         self.sheet_map: Dict[str, list] = {}
         self.section_header_rows: Dict[str, tuple] = {}  # section_id -> (row, col)
@@ -81,7 +100,16 @@ class LayoutEngine:
         sheets = self._collect_sheets()
         
         for sheet_mv in sheets:
-            sheet_name = sheet_mv.sheet_name or sheet_mv.id
+            # Prefer the user-visible label over the qualified id —
+            # non-sheet MVs (used as panel roots in HTML repr) have
+            # ``sheet_name`` = None and a dotted ``id`` like ``t.h``.
+            # Falling back to ``display_name`` keeps cell addresses
+            # readable (``Acme!B2``, not ``t.h!B2``).
+            sheet_name = (
+                sheet_mv.sheet_name
+                or sheet_mv.display_name
+                or sheet_mv.id
+            )
             self.sheet_map[sheet_name] = []
             needs_header = self._sheet_needs_key_header(sheet_mv)
             if needs_header:
@@ -91,8 +119,7 @@ class LayoutEngine:
         
         return self.addresses
     
-    @staticmethod
-    def _sheet_needs_key_header(sheet_mv: MultiVariableBase) -> bool:
+    def _sheet_needs_key_header(self, sheet_mv: MultiVariableBase) -> bool:
         """Return True when a sheet has Variables with labeled keys
         but no datetime-valued Variable.
 
@@ -102,19 +129,21 @@ class LayoutEngine:
         """
         has_keys = False
         has_date_axis = False
-        for var in LayoutEngine._iter_sheet_variables(sheet_mv):
+        for var in self._iter_sheet_variables(sheet_mv):
             if var.var_type == 'datetime':
                 has_date_axis = True
             if getattr(var, '_keys', None):
                 has_keys = True
         return has_keys and not has_date_axis
 
-    @staticmethod
-    def _iter_sheet_variables(sheet_mv: MultiVariableBase) -> Iterator[Variable]:
+    def _iter_sheet_variables(self, sheet_mv: MultiVariableBase) -> Iterator[Variable]:
         """Yield every Variable reachable within a sheet, descending through
-        any depth of nested non-sheet sections. Nested sheets are pruned —
-        they become their own tabs and their contents are yielded when those
-        sheets are processed."""
+        any depth of nested non-sheet sections. By default, nested sheets
+        are pruned — they become their own tabs and their contents are
+        yielded when those sheets are processed. With
+        ``flatten_nested_sheets=True``, all sub-MVs (including
+        ``_is_sheet=True`` ones) are walked, since they render as
+        sections in the parent's flat layout."""
         stack: List[MultiVariableBase] = [sheet_mv]
         while stack:
             mv = stack.pop()
@@ -122,21 +151,74 @@ class LayoutEngine:
                 comp = mv._components[name]
                 if isinstance(comp, Variable):
                     yield comp
-                elif isinstance(comp, MultiVariableBase) and not comp._is_sheet:
+                elif isinstance(comp, MultiVariableBase):
+                    if comp._is_sheet and not self._flatten_nested_sheets:
+                        continue
                     stack.append(comp)
 
     def _collect_sheets(self) -> List[MultiVariableBase]:
-        """Collect all MVs with _is_sheet=True from roots (depth-first)."""
+        """Collect the sheet-level layout targets from the roots.
+
+        Default mode (``flatten_nested_sheets=False``): MV roots and
+        every ``_is_sheet=True`` descendant become sheets — preserves
+        Excel's auto-promotion behaviour for ``to_excel``. Variable
+        roots are wrapped via :meth:`_make_variable_sheet`.
+
+        Flat-tab mode (``flatten_nested_sheets=True``): only the
+        explicit roots become sheets. Nested ``_is_sheet=True``
+        descendants stay inside their parent's tree as sections —
+        :meth:`_layout_mv` no longer skips them in this mode.
+        """
         sheets: List[MultiVariableBase] = []
         for root in self.roots:
+            if isinstance(root, Variable):
+                sheets.append(self._make_variable_sheet(root))
+                continue
             if isinstance(root, MultiVariableBase):
-                if root._is_sheet:
+                if root not in sheets:
                     sheets.append(root)
-                for _name, comp in root.walk():
-                    if isinstance(comp, MultiVariableBase) and comp._is_sheet:
-                        if comp not in sheets:
-                            sheets.append(comp)
+                if not self._flatten_nested_sheets:
+                    for _name, comp in root.walk():
+                        if isinstance(comp, MultiVariableBase) and comp._is_sheet:
+                            if comp not in sheets:
+                                sheets.append(comp)
         return sheets
+
+    @staticmethod
+    def _make_variable_sheet(var: Variable) -> MultiVariableBase:
+        """Wrap a single Variable as a layout-able pseudo-sheet.
+
+        Used when callers (HTML repr in particular) want to lay out
+        a single Variable as if it were a one-row sheet — same
+        column conventions, same address shape — without first
+        having to attach it under an MV. The sheet inherits the
+        Variable's ``display_name`` (humanized from ``python_name``
+        when no explicit label is set) so the tab reads as the
+        Variable itself.
+        """
+        from ...core.multi_variable import MultiVariable
+
+        # An anonymous Variable (no explicit label, no python_name)
+        # would otherwise expose its synthesized auto-id — prefer a
+        # generic "Variable" tab name in that case.
+        if var._display_name:
+            tab_name = var._display_name
+        elif var.python_name:
+            tab_name = var.display_name
+        else:
+            tab_name = 'Variable'
+
+        sheet = object.__new__(MultiVariable)
+        sheet._role = 'sheet'
+        sheet._display_name = tab_name
+        sheet._components = {var.id: var}
+        sheet._component_order = [var.id]
+        sheet._parent = None
+        sheet._name_in_parent = None
+        sheet._qualified_id = None
+        sheet._python_name = None
+        sheet._excel_props = {'tab': True}
+        return sheet
     
     def _layout_mv(self, mv: MultiVariableBase, row: int, col: int, sheet_name: str) -> int:
         """Recursively lay out an MV and its children.
@@ -147,12 +229,12 @@ class LayoutEngine:
             comp = mv._components[name]
             
             if isinstance(comp, MultiVariableBase):
-                if comp._is_sheet:
+                if comp._is_sheet and not self._flatten_nested_sheets:
                     continue
                 section_id = comp.python_name or comp._name_in_parent or comp.id
 
-                explicit_row = comp._creation_params.get("row")
-                explicit_col = comp._creation_params.get("col")
+                explicit_row = comp._excel_props.get("row")
+                explicit_col = comp._excel_props.get("col")
                 proposed = explicit_row if explicit_row is not None else row
                 sec_row = max(proposed, row)
                 sec_row = self._ensure_row_free(sheet_name, sec_row)

@@ -85,3 +85,107 @@ class TestModelRepr:
         html = m._repr_html_()
         assert "Empty" in html
         assert "empty" in html
+
+
+class TestVariableReprAddresses:
+    """A lone Variable's repr lays out via the same LayoutEngine the
+    rest of the renderer uses, so the cell carries a real Excel
+    address keyed off the Variable's name. Pin these so the
+    `_make_variable_sheet` pseudo-sheet wrapper doesn't drift back to
+    a hard-coded `Variable!A1`/no-address shape."""
+
+    def test_anonymous_variable_default_tab_name(self):
+        # No display_name, no python_name → fall back to "Variable".
+        v = mo.Variable(42)
+        html = v._repr_html_()
+        assert 'data-cell="Variable!B1"' in html
+
+    def test_named_variable_uses_display_name_as_tab(self):
+        v = mo.Variable(100, display_name="Revenue")
+        html = v._repr_html_()
+        assert 'data-cell="Revenue!B1"' in html
+
+    def test_adopted_variable_uses_humanized_python_name(self):
+        m = mo.Model("m")
+        m.cogs = mo.Variable(60)
+        html = m.cogs._repr_html_()
+        assert 'data-cell="Cogs!B1"' in html
+
+    def test_recurrence_chain_gets_per_period_addresses(self):
+        r = mo.recurrence(start=1000, formula="{prev}*1.05", periods=4)
+        html = r._repr_html_()
+        for col in ("B", "C", "D", "E"):
+            assert f'data-cell="Variable!{col}1"' in html
+
+
+class TestModelHtmlPositional:
+    """``model_html`` treats the rendered root as the workbook itself:
+    first-depth sub-MVs become tabs, deeper sub-MVs become sections in
+    the panel's flat layout. The test here pins the user's `t.h = acme`
+    scenario — rendering ``t`` exposes one `Acme` tab where the inner
+    sheet-marked `pnl` falls through as a section at row 1."""
+
+    def test_nested_sheet_renders_as_section_in_parent_tab(self):
+        acme = mo.Model("acme")
+        with mo.MultiVariable(excel_props={"tab": True}) as pnl:
+            pnl.revenue = mo.Variable(1_000_000)
+            pnl.cogs = pnl.revenue * mo.Variable(0.6)
+        acme.pnl = pnl
+        t = mo.Model("t")
+        t.h = acme
+
+        html = t._repr_html_()
+
+        # The `Pnl` section header lands on row 1 of the Acme tab —
+        # the user's documented expectation. Cell addresses are
+        # zero-indexed against this flat layout, so cogs's formula
+        # references revenue via ``B2`` (row 2 in the panel).
+        assert 'data-cell="Acme!B2"' in html
+        assert 'data-cell="Acme!B3"' in html
+        # cogs formula references revenue's row in the flat layout.
+        assert "=B2 * 0.6" in html
+
+    def test_cross_tab_formula_uses_qualified_address(self):
+        # A formula on the Outputs tab that references Variables on the
+        # Inputs tab must render with sheet-qualified addresses
+        # (``=Inputs!B1 * Inputs!B2``), not fall through to inlined
+        # literals — this matches what ``to_excel`` produces. The fix
+        # is a workbook-wide translator built from the union of every
+        # panel's per-panel addresses.
+        m = mo.Model("m")
+        m.inputs = mo.MultiVariable("Inputs", excel_props={"tab": True})
+        m.inputs.price = mo.Variable(100.0, display_name="Price")
+        m.inputs.volume = mo.Variable(50, display_name="Volume")
+        m.outputs = mo.MultiVariable("Outputs", excel_props={"tab": True})
+        m.outputs.revenue = (m.inputs.price * m.inputs.volume).set_display_name(
+            "Revenue"
+        )
+
+        html = m._repr_html_()
+
+        assert "=Inputs!B1 * Inputs!B2" in html
+        # Sanity: the literal-fallback shape must NOT be present —
+        # otherwise the cross-tab path silently regressed.
+        assert "=100.0 * 50" not in html
+
+    def test_each_panel_carries_its_name_for_stacked_mode(self):
+        # The "Stacked" toolbar toggle hides the tab bar and reveals
+        # every panel at once — so each panel's title must stay in
+        # the markup as a ``.mo-panel-title`` div (CSS hides it in
+        # tabbed mode, shows it in stacked mode). Previously the panel
+        # titles were suppressed entirely, leaving stacked mode
+        # identifying nothing.
+        m = mo.Model("m")
+        m.inputs = mo.MultiVariable("Inputs", excel_props={"tab": True})
+        m.inputs.price = mo.Variable(100.0, display_name="Price")
+        m.outputs = mo.MultiVariable("Outputs", excel_props={"tab": True})
+        m.outputs.revenue = m.inputs.price * mo.Variable(2)
+
+        html = m._repr_html_()
+
+        import re
+
+        titles = re.findall(
+            r'<div class="mo-panel-title"[^>]*>([^<]+)</div>', html,
+        )
+        assert titles == ["Inputs", "Outputs"]

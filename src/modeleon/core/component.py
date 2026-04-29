@@ -84,14 +84,3 @@ class Component(Base):
         """Set the display label and return ``self`` for chaining."""
         self._display_name = display_name
         return self
-
-    def set_python_name(self, name: str) -> Self:
-        """Set the Python-binding name and return ``self`` for chaining.
-
-        Most users never call this — adoption sets it automatically when
-        a node is attached to a parent (``parent.attr = node``). It's
-        here for callers building nodes outside the standard adoption
-        path who still want a stable Python identifier.
-        """
-        self.python_name = name
-        return self

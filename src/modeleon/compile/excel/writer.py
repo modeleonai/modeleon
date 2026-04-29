@@ -62,7 +62,12 @@ def to_excel(path: str | Path, root: "MultiVariableBase") -> None:
             "Then call to_excel() on the enclosing MultiVariable."
         )
 
-    engine = LayoutEngine(roots)
+    # ``flatten_nested_sheets=True`` keeps nested ``_is_sheet=True``
+    # MVs as visual sections inside their containing sheet — the same
+    # positional rule the HTML repr applies, so a tree like
+    # ``t._is_sheet=True; t.h.pnl._is_sheet=True`` writes ``pnl`` as a
+    # section row in t's sheet rather than dropping it.
+    engine = LayoutEngine(roots, flatten_nested_sheets=True)
     addresses = engine.compute_addresses()
     if not addresses:
         raise ValueError(
@@ -94,43 +99,18 @@ def to_excel(path: str | Path, root: "MultiVariableBase") -> None:
 def _collect_root_sheets(root: "MultiVariableBase") -> list[MultiVariableBase]:
     """Collect sheets to emit from an explicit root.
 
-    Resolution order:
+    The root is the workbook itself — it never becomes its own tab.
+    First-depth structure decides the sheet list:
 
-    1. ``root`` has ``excel_props={'tab': True}`` → sole tab.
-    2. ``root`` has sheet-roled descendants anywhere → those become the tabs.
-    3. Fallback: no explicit sheet markers in the tree. Synthesize tabs
-       from ``root``'s first-depth structure — each first-depth
-       ``MultiVariable`` becomes a tab, and any direct Variables on
-       ``root`` are wrapped in a synthetic "overview" tab so they still
-       land in the workbook.
-    """
-    if root._is_sheet:
-        return [root]
+    - First-depth sub-MVs → one tab each (using the user's MV when it's
+      already sheet-roled, otherwise wrapped in a virtual sheet).
+    - Direct Variables on ``root`` → collected into a single synthesized
+      "overview" tab named after ``root`` so orphan inputs (no enclosing
+      MV) still land in the workbook.
 
-    # FIFO traversal so sheets land in declaration order (a stack with
-    # ``pop()`` reverses every level).
-    from collections import deque
-    sheets: list[MultiVariableBase] = []
-    queue = deque([root])
-    while queue:
-        mv = queue.popleft()
-        if mv is not root and mv._is_sheet:
-            sheets.append(mv)
-            continue  # Sheets are leaves of the tab hierarchy — don't recurse.
-        for child in mv._components.values():
-            if isinstance(child, MultiVariableBase):
-                queue.append(child)
-    if sheets:
-        return sheets
-
-    return _synthesize_sheets(root)
-
-
-def _synthesize_sheets(root: "MultiVariableBase") -> list[MultiVariableBase]:
-    """Create virtual sheets when the user hasn't marked any ``MultiVariable``
-    with ``excel_props={'tab': True}``. First-depth sub-MVs get promoted to sheets;
-    direct Variables on ``root`` are collected into a single synthetic
-    "overview" sheet named after ``root``.
+    Deeper sub-MVs (whether marked ``_is_sheet=True`` or not) render as
+    sections inside their containing tab — :class:`LayoutEngine` is
+    invoked with ``flatten_nested_sheets=True`` in :func:`to_excel`.
     """
     direct_vars: list[tuple[str, Variable]] = []
     sub_mvs: list[MultiVariableBase] = []
@@ -177,7 +157,6 @@ def _make_virtual_sheet(
     virt._name_in_parent = None
     virt._qualified_id = None
     virt._python_name = None
-    virt._creation_params = {}
     virt._excel_props = {'tab': True}
     for comp_name, comp in components:
         virt._components[comp_name] = comp
@@ -221,11 +200,12 @@ def _write_sheet(
 ) -> None:
     """Fill a worksheet: section-header labels for nested MVs, then a
     row per Variable (label + per-period values or formulas)."""
-    # Section headers first — every nested (non-sheet) MV gets its
-    # display_name written at the reserved (row, col) slot so the
-    # Cohorts / Assumptions / etc. layout reads naturally.
+    # Section headers first — every nested MV with a recorded slot
+    # gets its display_name at (row, col). In flatten mode, nested
+    # ``_is_sheet=True`` MVs render as sections inside their parent's
+    # sheet, so the ``_is_sheet`` flag isn't a filter here.
     for _, comp in sheet_mv.walk():
-        if isinstance(comp, MultiVariableBase) and not comp._is_sheet:
+        if isinstance(comp, MultiVariableBase):
             section_id = comp.python_name or comp._name_in_parent or comp.id
             pos = section_header_rows.get(section_id)
             if pos is not None and comp.display_name:

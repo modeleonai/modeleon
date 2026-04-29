@@ -25,6 +25,31 @@ class TestMultiVariableFactory:
         assert mv._display_name == "Income Statement"
 
 
+class TestMultiVariableStrictKwargs:
+    """``MultiVariable`` validates kwargs strictly — anything that isn't
+    ``display_name``, ``excel_props``, or a Variable / MultiVariable
+    component raises ``TypeError`` at construction. Mirrors
+    :class:`Variable`'s strict-kwarg discipline."""
+
+    def test_unknown_scalar_kwarg_raises(self):
+        with pytest.raises(TypeError, match="unexpected keyword argument"):
+            MultiVariable(row=5)
+
+    def test_unknown_typo_kwarg_raises(self):
+        with pytest.raises(TypeError, match="unexpected keyword argument"):
+            MultiVariable(typo_name="pnl")
+
+    def test_typo_with_typed_value_raises(self):
+        with pytest.raises(TypeError, match="unexpected keyword argument"):
+            MultiVariable(name=1)
+
+    def test_excel_props_row_col_canonical_path(self):
+        # ``row`` and ``col`` belong inside ``excel_props`` — that's the
+        # canonical container layout reads from.
+        mv = MultiVariable(excel_props={'row': 5, 'col': 2})
+        assert mv.excel_props == {'row': 5, 'col': 2}
+
+
 class TestMultiVariableImperative:
     def test_imperative_assignment_registers(self):
         mv = MultiVariable()

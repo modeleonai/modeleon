@@ -34,7 +34,10 @@ class Base:
         # crystallizes a rooted path.
         self._qualified_id: Optional[QPath] = None
         # The Python identifier this node is bound to as a component
-        # of its parent (set by adoption). Independent of display_name.
+        # of its parent. Set by adoption (``parent.x = node`` writes
+        # ``node._python_name = "x"`` directly) — there is no public
+        # constructor kwarg for this field. Top-level naming goes
+        # through :class:`~modeleon.core.model.Model` instead.
         self._python_name: Optional[str] = None
         # Explicit user-facing label, set via constructor. The
         # ``display_name`` property on each subclass falls back to a
@@ -47,16 +50,14 @@ class Base:
     def python_name(self) -> Optional[str]:
         """The Python identifier this node is bound to as a component.
 
-        Set when the node is adopted by a parent MV (the attribute name
-        becomes the ``python_name``), or explicitly via
-        ``node.python_name = 'x'``. Returns ``None`` for unattached
-        nodes.
+        Read-only. Set internally by adoption (``parent.x = node``
+        triggers the parent's ``_register_component`` which writes
+        ``node._python_name = "x"`` directly) or by
+        :class:`~modeleon.core.model.Model`'s constructor for the
+        root. Returns ``None`` for unattached nodes — there is no
+        frame-introspection auto-discovery.
         """
         return self._python_name
-
-    @python_name.setter
-    def python_name(self, value: Optional[str]) -> None:
-        self._python_name = value
 
     @property
     def path(self) -> QPath:

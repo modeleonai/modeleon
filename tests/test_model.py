@@ -1,221 +1,172 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the top-level ``MultiVariable`` container.
+"""Tests for :class:`Model` — the canonical top-level container.
 
-Style note: every test uses **explicit attribute assignment**
-(``mv.child = mo.Variable(...)``). The ``with`` block is purely a
-short-alias convenience — it never auto-attaches anything.
+A :class:`Model` is a :class:`MultiVariable` with one extra contract:
+its ``name`` positional crystallizes the root path at construction.
+Children adopted under it inherit the rooted prefix automatically.
 """
 
+from __future__ import annotations
+
 import pytest
-from openpyxl import load_workbook
 
 import modeleon as mo
-from modeleon.core.errors import CrossScopeReferenceWarning
+from modeleon.core.qpath import QPath
 
 
-class TestRole:
-    """MultiVariables carry a ``role``. Plain ones are ``'group'``;
-    ``excel_props={'tab': True}`` marks an Excel tab."""
+class TestModelConstruction:
+    def test_name_required(self):
+        with pytest.raises(TypeError, match="missing 1 required positional argument"):
+            mo.Model()  # type: ignore[call-arg]
 
-    def test_sheet_role(self):
-        s = mo.MultiVariable("P&L", excel_props={'tab': True})
-        assert s._role == 'sheet'
-        assert s._is_sheet is True
+    def test_name_must_be_string(self):
+        with pytest.raises(TypeError, match="non-empty string"):
+            mo.Model(42)  # type: ignore[arg-type]
 
-    def test_plain_mv_role(self):
-        mv = mo.MultiVariable(display_name="section")
-        assert mv._role == 'group'
-        assert mv._is_sheet is False
+    def test_empty_name_rejected(self):
+        with pytest.raises(TypeError, match="non-empty string"):
+            mo.Model("")
 
+    def test_basic_construction(self):
+        m = mo.Model("acme")
+        assert m.python_name == "acme"
+        assert m.id == "acme"
+        assert not m.path.is_floating
 
-class TestComponentAttachment:
-    """Components attach via ``parent.child = ...`` only."""
+    def test_display_name_defaults_to_humanized_name(self):
+        m = mo.Model("income_statement")
+        assert m.display_name == "Income Statement"
 
-    def test_attribute_assignment_attaches_sub_mv(self):
-        model = mo.MultiVariable("Acme")
-        model.pnl = mo.MultiVariable("P&L", excel_props={'tab': True})
+    def test_explicit_display_name_overrides_default(self):
+        m = mo.Model("acme", display_name="Acme Corp")
+        assert m.display_name == "Acme Corp"
+        assert m.python_name == "acme"
 
-        assert "pnl" in model._components
-        assert model._components["pnl"] is model.pnl
-        assert model.pnl._role == 'sheet'
-        assert model.pnl._parent is model
+    def test_excel_props_forwarded(self):
+        m = mo.Model("acme", excel_props={"tab": True})
+        assert m.excel_props == {"tab": True}
 
-    def test_attribute_assignment_attaches_variable(self):
-        sheet = mo.MultiVariable("P&L", excel_props={'tab': True})
-        sheet.revenue = mo.Variable(1_000_000, display_name='Revenue')
-
-        assert "revenue" in sheet._components
-        assert sheet.revenue._owner is sheet
-
-    def test_with_block_is_just_an_alias(self):
-        """``with mv as alias:`` binds ``alias`` to the same object as
-        ``mv`` for the body. It does not auto-attach anything."""
-        model = mo.MultiVariable("Acme")
-        model.pnl = mo.MultiVariable("P&L", excel_props={'tab': True})
-        with model.pnl as pnl:
-            assert pnl is model.pnl
-            pnl.revenue = mo.Variable(1_000_000)
-        assert "revenue" in model.pnl._components
-
-    def test_multiple_sheets(self):
-        model = mo.MultiVariable("Acme")
-        model.pnl = mo.MultiVariable("P&L", excel_props={'tab': True})
-        model.pnl.revenue = mo.Variable(1_000_000)
-        model.bs = mo.MultiVariable("Balance Sheet", excel_props={'tab': True})
-        model.bs.cash = mo.Variable(100_000)
-
-        assert set(model._components.keys()) == {"pnl", "bs"}
-
-    def test_variables_belong_to_their_owning_sheet_only(self):
-        """A Variable assigned to ``pnl`` is in ``pnl._components`` —
-        it is NOT also a child of the model."""
-        model = mo.MultiVariable("Acme")
-        model.pnl = mo.MultiVariable("P&L", excel_props={'tab': True})
-        model.pnl.revenue = mo.Variable(1_000_000, display_name='Revenue')
-        model.pnl.cogs = model.pnl.revenue * 0.6
-
-        assert "revenue" in model.pnl._components
-        assert "cogs" in model.pnl._components
-        assert "revenue" not in model._components
-        assert "cogs" not in model._components
-
-
-class TestToExcel:
-    """``model.to_excel()`` emits only the sheets reachable from the root."""
-
-    def test_single_model_emits_its_sheets(self, tmp_path):
-        model = mo.MultiVariable("Acme")
-        model.pnl = mo.MultiVariable("P&L", excel_props={'tab': True})
-        model.pnl.revenue = mo.Variable(1_000_000, display_name='Revenue')
-        model.pnl.cogs = model.pnl.revenue * 0.6
-
-        model.to_excel(tmp_path / "acme.xlsx")
-
-        path = tmp_path / "acme.xlsx"
-        wb = load_workbook(path)
-        assert wb.sheetnames == ["P&L"]
-
-    def test_two_models_no_cross_pollution(self, tmp_path):
-        """Emission scope is per-Model — a.xlsx doesn't see b's sheets."""
-        a = mo.MultiVariable("A")
-        a.sheet_a = mo.MultiVariable("Sheet A", excel_props={'tab': True})
-        a.sheet_a.x = mo.Variable(100, display_name='X')
-
-        b = mo.MultiVariable("B")
-        b.sheet_b = mo.MultiVariable("Sheet B", excel_props={'tab': True})
-        b.sheet_b.y = mo.Variable(200, display_name='Y')
-
-        a.to_excel(tmp_path / "a.xlsx")
-
-        a_path = tmp_path / "a.xlsx"
-        b.to_excel(tmp_path / "b.xlsx")
-        b_path = tmp_path / "b.xlsx"
-        assert load_workbook(a_path).sheetnames == ["Sheet A"]
-        assert load_workbook(b_path).sheetnames == ["Sheet B"]
-
-    def test_formula_resolves_within_model(self, tmp_path):
-        """Cross-sheet refs inside a Model produce valid Excel formulas."""
-        model = mo.MultiVariable("Acme")
-        model.pnl = mo.MultiVariable("P&L", excel_props={'tab': True})
-        model.pnl.revenue = mo.Variable(1_000_000, display_name='Revenue')
-        model.pnl.cogs = model.pnl.revenue * 0.6
-        model.summary = mo.MultiVariable("Summary", excel_props={'tab': True})
-        model.summary.pnl_cogs = model.pnl.cogs * 2
-
-        model.to_excel(tmp_path / "acme.xlsx")
-
-        path = tmp_path / "acme.xlsx"
-        wb = load_workbook(path)
-        summary = wb["Summary"]
-        for row in summary.iter_rows():
-            for cell in row:
-                if cell.value and isinstance(cell.value, str) and cell.value.startswith("="):
-                    assert "{" not in cell.value
-
-
-class TestExternalRefInlining:
-    """When a subtree's formulas reference Variables outside the subtree,
-    the translator inlines the external value as an Excel literal
-    instead of emitting a broken ``_var_N`` identifier."""
-
-    def test_external_scalar_ref_inlines_value(self, tmp_path):
-        rate = mo.Variable(0.05, display_name='Rate')  # lives outside any sheet
-        model = mo.MultiVariable("Solo")
-        model.derived = mo.MultiVariable("Derived", excel_props={'tab': True})
-        model.derived.result = rate * 1000
-
-        with pytest.warns(CrossScopeReferenceWarning):
-            model.to_excel(tmp_path / "solo.xlsx")
-
-        path = tmp_path / "solo.xlsx"
-        wb = load_workbook(path)
-        formulas = [
-            cell.value for row in wb["Derived"].iter_rows()
-            for cell in row
-            if isinstance(cell.value, str) and cell.value.startswith("=")
-        ]
-        assert any("0.05" in f and "_var_" not in f for f in formulas), formulas
-
-    def test_external_list_ref_inlines_per_period_value(self, tmp_path):
-        # Under new recurrence semantics period 0 = start (no formula),
-        # periods 1..N-1 apply the formula. So growth[1] and growth[2]
-        # land in formulas; growth[0] is unused.
-        growth = mo.Variable([0.05, 0.06, 0.07], display_name='Growth')
-        model = mo.MultiVariable("GrowthModel")
-        model.revenue_sheet = mo.MultiVariable("Revenue", excel_props={'tab': True})
-        model.revenue_sheet.revenue = mo.recurrence(
-            start=1000,
-            formula="{prev} * (1 + {g})",
-            g=growth,
-            periods=3,
+    def test_factory_components_forwarded(self):
+        m = mo.Model(
+            "quick",
+            revenue=mo.Variable(1_000_000),
+            cogs=mo.Variable(0.6),
         )
-
-        with pytest.warns(CrossScopeReferenceWarning):
-            model.to_excel(tmp_path / "growth.xlsx")
-
-        path = tmp_path / "growth.xlsx"
-        wb = load_workbook(path)
-        formulas = [
-            cell.value for row in wb["Revenue"].iter_rows()
-            for cell in row
-            if isinstance(cell.value, str) and cell.value.startswith("=")
-        ]
-        assert any("0.06" in f for f in formulas)
-        assert any("0.07" in f for f in formulas)
-        assert all("_var_" not in f for f in formulas), formulas
+        assert "revenue" in m._components
+        assert "cogs" in m._components
+        assert m.revenue._value == 1_000_000
 
 
-class TestSheetAsRoot:
-    """A Sheet alone is a valid emission root — no Model wrapper required."""
+class TestModelInheritance:
+    def test_model_is_multivariable(self):
+        m = mo.Model("m")
+        assert isinstance(m, mo.MultiVariable)
 
-    def test_sheet_emits_standalone(self, tmp_path):
-        sheet = mo.MultiVariable("Standalone", excel_props={'tab': True})
-        sheet.v = mo.Variable(42, display_name='V')
+    def test_model_supports_adoption(self):
+        m = mo.Model("m")
+        m.x = mo.Variable(1)
+        assert "x" in m._components
+        assert m.x._owner is m
 
-        sheet.to_excel(tmp_path / "sheet.xlsx")
+    def test_model_supports_with_block(self):
+        with mo.Model("m") as model:
+            model.x = mo.Variable(1)
+        assert model.x._value == 1
 
-        path = tmp_path / "sheet.xlsx"
-        assert load_workbook(path).sheetnames == ["Standalone"]
+
+class TestModelPathCrystallization:
+    """Adopting under a Model gives every descendant a rooted path
+    automatically — the model name is the only explicit naming gesture."""
+
+    def test_top_level_path_rooted(self):
+        m = mo.Model("acme")
+        assert m.path == QPath(("acme",))
+
+    def test_child_path_under_model(self):
+        m = mo.Model("acme")
+        m.pnl = mo.MultiVariable(excel_props={"tab": True})
+        assert m.pnl.path == QPath(("acme", "pnl"))
+
+    def test_grandchild_path_under_model(self):
+        m = mo.Model("acme")
+        m.pnl = mo.MultiVariable(excel_props={"tab": True})
+        m.pnl.revenue = mo.Variable(1_000_000)
+        assert m.pnl.revenue.path == QPath(("acme", "pnl", "revenue"))
+
+    def test_two_models_have_independent_trees(self):
+        a = mo.Model("a")
+        a.x = mo.Variable(1)
+        b = mo.Model("b")
+        b.x = mo.Variable(2)
+        assert a.x.id == "a.x"
+        assert b.x.id == "b.x"
+        assert a.x is not b.x
+
+    def test_factory_children_are_path_rooted(self):
+        m = mo.Model("acme", revenue=mo.Variable(1_000_000))
+        assert m.revenue.path == QPath(("acme", "revenue"))
 
 
-class TestAnyMVCanEmit:
-    """``.to_excel()`` lives on MultiVariableBase — any MV can emit itself."""
+class TestModelDemotionOnAdoption:
+    """A :class:`Model` is the root of a model tree by contract. Adopting
+    one into another container ends its root-ness — its runtime class
+    is rewritten to :class:`MultiVariable`. The user's reference still
+    points to the same object; only the type marker changes."""
 
-    def test_sheet_directly_emits(self, tmp_path):
-        sheet = mo.MultiVariable("P&L", excel_props={'tab': True})
-        sheet.revenue = mo.Variable(1_000_000, display_name='Revenue')
-        sheet.cogs = sheet.revenue * 0.6
-        sheet.to_excel(tmp_path / "pnl.xlsx")
-        path = tmp_path / "pnl.xlsx"
-        assert load_workbook(path).sheetnames == ["P&L"]
+    def test_adoption_demotes_to_multivariable(self):
+        a = mo.Model("a")
+        assert isinstance(a, mo.Model)
+        t = mo.Model("t")
+        t.a = a
+        # Same object — but its class is now MultiVariable, not Model.
+        assert t.a is a
+        assert not isinstance(a, mo.Model)
+        assert isinstance(a, mo.MultiVariable)
 
-    def test_plain_multivariable_with_sheets_emits(self, tmp_path):
-        """A plain MultiVariable acting as a root emits its child Sheets."""
-        root = mo.MultiVariable(display_name="root")
-        root.sheet_a = mo.MultiVariable("A", excel_props={'tab': True})
-        root.sheet_a.x = mo.Variable(1, display_name='X')
-        root.sheet_b = mo.MultiVariable("B", excel_props={'tab': True})
-        root.sheet_b.y = mo.Variable(2, display_name='Y')
-        root.to_excel(tmp_path / "any_mv.xlsx")
-        path = tmp_path / "any_mv.xlsx"
-        assert sorted(load_workbook(path).sheetnames) == ["A", "B"]
+    def test_adoption_under_multivariable_demotes(self):
+        sub = mo.Model("sub")
+        container = mo.MultiVariable()
+        container.sub = sub
+        assert not isinstance(sub, mo.Model)
+        assert isinstance(sub, mo.MultiVariable)
+
+    def test_demoted_path_inherits_parent_root(self):
+        a = mo.Model("a")
+        a.x = mo.Variable(1)   # rooted at 'a' before demotion
+        assert a.x.path == QPath(("a", "x"))
+
+        t = mo.Model("t")
+        t.a = a
+        # After demotion + adoption, ``a`` is a sub-tree of ``t``;
+        # its descendants reroot under the new prefix.
+        assert a.path == QPath(("t", "a"))
+        assert a.x.path == QPath(("t", "a", "x"))
+
+    def test_factory_pattern_demotes_model_components(self):
+        sub = mo.Model("sub")
+        outer = mo.MultiVariable(sub=sub)
+        assert outer.sub is sub
+        assert not isinstance(sub, mo.Model)
+        assert isinstance(sub, mo.MultiVariable)
+
+    def test_demoted_model_can_be_adopted_again_as_multivariable(self):
+        # Once demoted, the node behaves like any other MV — it can
+        # be re-adopted, replaced, etc. without the root-only check
+        # firing again.
+        a = mo.Model("a")
+        t1 = mo.Model("t1")
+        t1.a = a   # demotes
+        t2 = mo.Model("t2")
+        # Cross-parent adoption — clones rather than moves.
+        t2.a = a
+        assert t2.a.path == QPath(("t2", "a"))
+
+    def test_demotion_does_not_mutate_excel_props(self):
+        # Demotion is a class swap only; explicit Excel markers like
+        # ``tab`` aren't auto-set. Sheet-vs-section is decided
+        # positionally by the renderer, not baked on the object.
+        acme = mo.Model("acme")
+        t = mo.Model("t")
+        t.h = acme
+        assert not acme._is_sheet
+        assert acme.excel_props == {}

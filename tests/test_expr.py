@@ -53,7 +53,7 @@ class TestLiteral:
 class TestVarRef:
     def test_renders_python_name(self):
         v = mo.Variable(100)
-        v.set_python_name("revenue")
+        v._python_name = "revenue"
         assert VarRef(v).to_string() == "revenue"
 
     def test_falls_back_to_path_leaf(self):
@@ -79,7 +79,7 @@ class TestVarRef:
         may have picked up."""
         def build():
             vs = [mo.Variable(100)]
-            vs[0].set_python_name("revenue")
+            vs[0]._python_name = "revenue"
             return VarRef(vs[0]).to_string()
         assert build() == "revenue"
 
@@ -90,24 +90,24 @@ class TestVarRef:
 class TestBinOp:
     def test_renders_infix(self):
         a = mo.Variable(10)
-        a.set_python_name("a")
+        a._python_name = "a"
         b = mo.Variable(20)
-        b.set_python_name("b")
+        b._python_name = "b"
         expr = BinOp("+", VarRef(a), VarRef(b))
         assert expr.to_string() == "a + b"
 
     def test_scalar_right_operand(self):
         a = mo.Variable(10)
-        a.set_python_name("revenue")
+        a._python_name = "revenue"
         expr = BinOp("*", VarRef(a), Literal(0.65))
         assert expr.to_string() == "revenue * 0.65"
 
     def test_matches_dsl_output(self):
         """Round-trip: a + b constructed via the DSL should match the AST form."""
         a = mo.Variable(10, display_name="A")
-        a.set_python_name("a")
+        a._python_name = "a"
         b = mo.Variable(20, display_name="B")
-        b.set_python_name("b")
+        b._python_name = "b"
         c = a + b
         manual = BinOp("+", VarRef(a), VarRef(b))
         assert c.formula == manual.to_string()
@@ -122,7 +122,7 @@ class TestBinOp:
 class TestUnaryOp:
     def test_negation(self):
         v = mo.Variable(10)
-        v.set_python_name("revenue")
+        v._python_name = "revenue"
         assert UnaryOp("-", VarRef(v)).to_string() == "-revenue"
 
     def test_iter_refs(self):
@@ -133,14 +133,14 @@ class TestUnaryOp:
 class TestCompare:
     def test_eq(self):
         a = mo.Variable(10)
-        a.set_python_name("a")
+        a._python_name = "a"
         b = mo.Variable(20)
-        b.set_python_name("b")
+        b._python_name = "b"
         assert Compare("==", VarRef(a), VarRef(b)).to_string() == "a == b"
 
     def test_all_operators(self):
         v = mo.Variable(1)
-        v.set_python_name("x")
+        v._python_name = "x"
         for op in ("==", "!=", "<", "<=", ">", ">="):
             assert Compare(op, VarRef(v), Literal(0)).to_string() == f"x {op} 0"
 
@@ -151,22 +151,22 @@ class TestCompare:
 class TestSubscript:
     def test_positional_index(self):
         v = mo.Variable([1, 2, 3])
-        v.set_python_name("revenue")
+        v._python_name = "revenue"
         assert Subscript(VarRef(v), 0).to_string() == "revenue[0]"
 
     def test_named_key(self):
         v = mo.Variable({"Bear": 1, "Base": 2, "Bull": 3})
-        v.set_python_name("scenarios")
+        v._python_name = "scenarios"
         assert Subscript(VarRef(v), "Bear").to_string() == 'scenarios["Bear"]'
 
     def test_slice(self):
         v = mo.Variable([1, 2, 3, 4, 5])
-        v.set_python_name("revenue")
+        v._python_name = "revenue"
         assert Subscript(VarRef(v), slice(1, 4)).to_string() == "revenue[1:4]"
 
     def test_slice_with_step(self):
         v = mo.Variable([1, 2, 3, 4])
-        v.set_python_name("x")
+        v._python_name = "x"
         assert Subscript(VarRef(v), slice(0, 4, 2)).to_string() == "x[0:4:2]"
 
     def test_iter_refs_follows_base(self):
@@ -180,9 +180,9 @@ class TestListExpr:
 
     def test_mixed_vars_and_literals(self):
         a = mo.Variable(1)
-        a.set_python_name("revenue")
+        a._python_name = "revenue"
         b = mo.Variable(2)
-        b.set_python_name("costs")
+        b._python_name = "costs"
         expr = ListExpr([VarRef(a), Literal(0), VarRef(b), Literal(5)])
         assert expr.to_string() == "[revenue, 0, costs, 5]"
 
@@ -202,20 +202,20 @@ class TestFuncCall:
 
     def test_if(self):
         cond = mo.Variable(1)
-        cond.set_python_name("revenue")
+        cond._python_name = "revenue"
         thresh = Literal(1000)
         expr = FuncCall("IF", [Compare(">", VarRef(cond), thresh), Literal(100), Literal(0)])
         assert expr.to_string() == "IF(revenue > 1000, 100, 0)"
 
     def test_sum_single_arg(self):
         v = mo.Variable([1, 2, 3])
-        v.set_python_name("values")
+        v._python_name = "values"
         assert FuncCall("sum", [VarRef(v)]).to_string() == "sum(values)"
 
     def test_max_multi_arg(self):
-        a = mo.Variable(1); a.set_python_name("a")
-        b = mo.Variable(2); b.set_python_name("b")
-        c = mo.Variable(3); c.set_python_name("c")
+        a = mo.Variable(1); a._python_name = "a"
+        b = mo.Variable(2); b._python_name = "b"
+        c = mo.Variable(3); c._python_name = "c"
         assert FuncCall("max", [VarRef(a), VarRef(b), VarRef(c)]).to_string() == "max(a, b, c)"
 
     def test_iter_refs_follows_all_args(self):
@@ -228,17 +228,17 @@ class TestFuncCall:
 class TestMethodCall:
     def test_no_args(self):
         v = mo.Variable(1)
-        v.set_python_name("revenue")
+        v._python_name = "revenue"
         assert MethodCall(VarRef(v), "copy", [], {}).to_string() == "revenue.copy()"
 
     def test_positional_arg(self):
         v = mo.Variable(1)
-        v.set_python_name("revenue")
+        v._python_name = "revenue"
         assert MethodCall(VarRef(v), "shift", [1], {}).to_string() == "revenue.shift(1)"
 
     def test_positional_and_kwarg(self):
         v = mo.Variable(1)
-        v.set_python_name("debt")
+        v._python_name = "debt"
         assert (
             MethodCall(VarRef(v), "shift", [1], {"fill_value": 0}).to_string()
             == "debt.shift(1, fill_value=0)"
@@ -246,7 +246,7 @@ class TestMethodCall:
 
     def test_kwarg_only(self):
         v = mo.Variable(1)
-        v.set_python_name("revenue")
+        v._python_name = "revenue"
         assert (
             MethodCall(VarRef(v), "resample", [], {"method": "sum"}).to_string()
             == "revenue.resample(method=sum)"
@@ -265,7 +265,7 @@ class TestMethodCall:
 class TestSelfRef:
     def test_basic(self):
         flow = mo.Variable(100)
-        flow.set_python_name("cash_flow")
+        flow._python_name = "cash_flow"
         expr = SelfRef(
             start=Literal(0),
             template="{prev} + {flow}",
@@ -276,9 +276,9 @@ class TestSelfRef:
 
     def test_variable_start(self):
         opening = mo.Variable(1000)
-        opening.set_python_name("opening_cash")
+        opening._python_name = "opening_cash"
         flow = mo.Variable(100)
-        flow.set_python_name("flow")
+        flow._python_name = "flow"
         expr = SelfRef(
             start=VarRef(opening),
             template="{prev} + {flow}",
@@ -289,9 +289,9 @@ class TestSelfRef:
 
     def test_multiple_template_variables(self):
         churn = mo.Variable(0.05)
-        churn.set_python_name("churn")
+        churn._python_name = "churn"
         new = mo.Variable(10)
-        new.set_python_name("new")
+        new._python_name = "new"
         expr = SelfRef(
             start=Literal(1000),
             template="{prev} * (1 - {churn}) + {new}",
@@ -323,9 +323,9 @@ class TestComplexExpressions:
     def test_nested_arithmetic(self):
         """Mirrors the DSL's output for (a + b) * c without precedence parens
         (engine's binary op emits the flat form today)."""
-        a = mo.Variable(1); a.set_python_name("a")
-        b = mo.Variable(2); b.set_python_name("b")
-        c = mo.Variable(3); c.set_python_name("c")
+        a = mo.Variable(1); a._python_name = "a"
+        b = mo.Variable(2); b._python_name = "b"
+        c = mo.Variable(3); c._python_name = "c"
         # In the AST, we'd build: BinOp("*", BinOp("+", a, b), c)
         expr = BinOp("*", BinOp("+", VarRef(a), VarRef(b)), VarRef(c))
         assert expr.to_string() == "a + b * c"
@@ -340,8 +340,8 @@ class TestComplexExpressions:
 
     def test_full_pnl_shape(self):
         """Shape that mirrors a real P&L formula chain."""
-        revenue = mo.Variable(1_000_000); revenue.set_python_name("revenue")
-        cogs_pct = mo.Variable(0.6); cogs_pct.set_python_name("cogs_pct")
+        revenue = mo.Variable(1_000_000); revenue._python_name = "revenue"
+        cogs_pct = mo.Variable(0.6); cogs_pct._python_name = "cogs_pct"
 
         cogs_expr = BinOp("*", VarRef(revenue), VarRef(cogs_pct))
         gross_expr = BinOp("-", VarRef(revenue), cogs_expr)
