@@ -27,14 +27,13 @@ declaration below wires them in; callers don't touch the mixins
 directly.
 """
 
-from typing import Optional, Set, Any, List, Dict, TYPE_CHECKING
+from typing import Optional, Set, Any, Dict, List, Sequence, Tuple, TYPE_CHECKING
 
-from .axis import PositionalAxis
 from .humanize import humanize_identifier
 from .component import Component
 from .expr import Expr, MethodCall, Paren, Subscript, VarRef
 from .qpath import QPath
-from .shape import Shape, TimeBehavior
+from .shape import Shape
 from .variable_init import _VariableInit
 from .variable_ops import _VariableArithmetic
 
@@ -84,7 +83,7 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
 
     def __init__(self, value=None, value_type: str = "float", var_type: str = "scalar",
                  display_name: Optional[str] = None, formula=None, pyformula=None, unit=None, keys=None,
-                 excel_props=None, axis=None, time_behavior: Optional[TimeBehavior] = None,
+                 excel_props=None, indexed_by: Sequence['Variable'] = (),
                  **kwargs):
         """Create a Variable from exactly one of ``value``, ``formula``, or ``pyformula``.
 
@@ -112,6 +111,11 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
                 (``'bold'``, ``'bg'``, ``'number_format'``, …) and
                 formatting. See :attr:`_EXCEL_PROP_KEYS` for valid keys.
                 Unknown keys raise ``TypeError``.
+            indexed_by: Sequence of axis Variables this Variable is
+                laid out along. An axis is just another Variable —
+                typically one with a list of labels. Operator-built
+                Variables get this set automatically by broadcast; pure
+                inputs declare it here. Default ``()`` means scalar.
             **kwargs: Plugin-registered kwargs (e.g. ``control=`` from a
                 pro extension). Unknown kwargs raise TypeError so typos
                 don't silently disappear.
@@ -146,13 +150,6 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
         self._owner: Optional["MultiVariableBase"] = None
         self._component_name: Optional[str] = None
         self._value: Any = None
-        # Native-form storage — the data in its authoring space, keyed
-        # by something invariant under axis mutation. Populated from
-        # list / dict inputs at construction; ``None`` for scalars and
-        # for arithmetic intermediates (which set ``_value`` directly
-        # post-init). ``render_at(period_idx)`` reads through this
-        # when it's set, falling back to ``_value`` otherwise.
-        self._data: Optional[Dict[Any, Any]] = None
         # _expr is the structured source of truth for this Variable's
         # formula. The ``.formula`` string property is a read-through
         # view derived from ``_expr.to_string()`` — set ``_expr``
@@ -215,114 +212,35 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
         # ``_display_name`` and ``_excel_props`` were set on Component
         # via ``super().__init__`` above.
 
-        # --- shape inputs ---
-        # ``shape`` is a derived @property that reads these explicit
-        # inputs plus the current ``_value`` / ``_keys``. Storing the
-        # explicit kwargs separately means arithmetic intermediates —
-        # which call ``Variable()`` first and then assign ``_value`` —
-        # still get a current shape on every access.
-        self._explicit_axis_owner = axis
-        self._explicit_time_behavior: Optional[TimeBehavior] = time_behavior
-
-        # If the bound owner supports dependent tracking, register so
-        # axis mutations propagate to this Variable on next read.
-        if axis is not None and hasattr(axis, "_register_dependent"):
-            axis._register_dependent(self)
-
-        # --- native data storage ---
-        # Capture user-authored values in their native space so future
-        # axis mutations can re-render the view from native rather
-        # than mutating ``_value`` directly. Skipped for scalars and
-        # for formula-mode Variables whose ``_value`` will be assigned
-        # by an operator after construction.
-        self._populate_native_data(value, formula, pyformula)
+        # --- shape via dep graph ---
+        # ``_indexed_by`` is the authoritative declaration of which axes
+        # this Variable is laid out along. Operator-built Variables get
+        # this set automatically by ``_VariableArithmetic`` from the
+        # union of operand axes. Pure inputs declare it explicitly via
+        # the ``indexed_by=`` constructor kwarg.
+        #
+        # The dep graph itself (``_dependency_refs``) carries the rest
+        # of the shape story: axes are just Variables that other
+        # Variables happen to reference via ``indexed_by``. There is
+        # no separate AxisProvider registry.
+        self._indexed_by: Tuple['Variable', ...] = tuple(indexed_by) if indexed_by else ()
 
         self._process_kwargs(kwargs)
 
-    def _populate_native_data(self, value: Any, formula: Any, pyformula: Any) -> None:
-        """Capture the input as native data when applicable.
-
-        Native data is keyed by something invariant under axis
-        mutation — keys for keyed Variables, integer position for
-        plain lists. Scalars and formula-mode constructions skip
-        native storage; their ``_value`` is the source of truth.
-        """
-        if formula is not None or pyformula is not None:
-            return
-        if value is None or not isinstance(self._value, list):
-            return
-
-        if self._keys is not None and len(self._keys) == len(self._value):
-            self._data = {k: v for k, v in zip(self._keys, self._value)}
-        else:
-            self._data = {i: v for i, v in enumerate(self._value)}
-
-    def render_at(self, period_idx: int) -> Any:
-        """Resolve the value at a given view-period index.
-
-        When native ``_data`` is populated, looks up by integer
-        position (positional axis) or by the matching keys entry
-        (keyed Variable). Otherwise falls back to ``_value`` —
-        ``_value[period_idx]`` for list values, ``_value`` itself for
-        scalars.
-
-        Future axis-aware projections (e.g. wall-clock dates) will
-        plug in here without changing the caller signature.
-        """
-        if self._data is not None:
-            if self._keys is not None and period_idx < len(self._keys):
-                return self._data[self._keys[period_idx]]
-            if period_idx in self._data:
-                return self._data[period_idx]
-        if isinstance(self._value, list):
-            if 0 <= period_idx < len(self._value):
-                return self._value[period_idx]
-            return None
-        return self._value
-
-    def _on_axis_invalidated(self) -> None:
-        """Hook called when the bound axis owner mutates its axis.
-
-        The default implementation is a no-op — ``shape`` is a
-        derived ``@property`` that already reads the live owner on
-        every access, and ``_value`` remains the in-memory view.
-        Future view-caching layers can override here to drop or
-        rebuild caches when the underlying axis changes.
-        """
-        return None
-
     @property
     def shape(self) -> Shape:
-        """Current :class:`Shape` of this Variable.
+        """Tuple of axes this Variable is laid out along.
 
-        Derived on every access from explicit ``axis=`` /
-        ``time_behavior=`` inputs plus the current ``_value`` /
-        ``_keys``. Arithmetic-produced Variables (whose ``_value`` is
-        assigned after ``__init__``) report the right shape by the
-        time the caller reads ``.shape``.
+        Derived on every access from ``_indexed_by`` — pure dep-graph
+        read, no separate registry. Operator-built Variables have
+        ``_indexed_by`` populated by the broadcast in
+        :class:`~modeleon.core.variable_ops._VariableArithmetic`; pure
+        inputs declared their axes via the ``indexed_by=`` kwarg.
 
-        Resolution:
-
-        1. Explicit ``axis=`` — bind to that owner.
-        2. List value with no explicit axis — wrap an anonymous
-           :class:`PositionalAxis` of matching length.
-        3. Otherwise — scalar shape, keys propagated when present.
+        Scalars and Variables with no axis declarations return
+        ``Shape(())``.
         """
-        from .shape import _AnonymousPositionalProvider
-
-        keys_tuple = tuple(self._keys) if self._keys is not None else None
-        behavior = self._explicit_time_behavior
-
-        if self._explicit_axis_owner is not None:
-            return Shape(
-                axis_owner=self._explicit_axis_owner,
-                behavior=behavior,
-                keys=keys_tuple,
-            )
-        if isinstance(self._value, list):
-            anon = _AnonymousPositionalProvider(PositionalAxis(length=len(self._value)))
-            return Shape(axis_owner=anon, behavior=behavior, keys=keys_tuple)
-        return Shape(behavior=behavior, keys=keys_tuple)
+        return Shape(self._indexed_by)
 
     # Construction dispatchers (_resolve_keys, _init_from_formula,
     # _init_from_pyformula, _init_from_value, _build_compound_formula,
@@ -588,6 +506,7 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
         result._keys = list(self._keys) if self._keys is not None else None
         result._keys_source = self._keys_source
         result._excel_props = dict(self._excel_props)
+        result._indexed_by = self._indexed_by
         return result
 
     def __copy__(self) -> 'Variable':

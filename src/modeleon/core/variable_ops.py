@@ -26,7 +26,7 @@ construct results).
 
 from __future__ import annotations
 
-from typing import Any, List, Optional, TYPE_CHECKING
+from typing import Any, List, Optional, Tuple, TYPE_CHECKING
 
 from .expr import BinOp, Compare, Expr, Literal, UnaryOp, VarRef
 
@@ -278,7 +278,34 @@ class _VariableArithmetic:
             result.var_type = "list"
         k_left, k_right = (other, self) if reversed else (self, other)
         result._keys = self._propagate_keys(k_left, k_right)
+        result._indexed_by = self._propagate_indexed_by(k_left, k_right)
         return result
+
+    @staticmethod
+    def _propagate_indexed_by(left: Any, right: Any) -> Tuple[Any, ...]:
+        """Union the operands' ``_indexed_by`` axes, preserving the
+        order of first appearance (left wins ties).
+
+        Operator-built Variables inherit shape from this union — e.g.
+        ``revenue * cogs_pct`` of shapes ``(months, scenarios)`` and
+        ``()`` produces a result of shape ``(months, scenarios)``;
+        ``a * b`` over two distinct axes produces the cross-product
+        shape ``(left_axes..., right_axes...)``.
+
+        Compares axes by identity (``id``) — Variable's ``__eq__`` is
+        overridden to return a comparison expression, so ``axis in
+        seen`` would always go through that operator and produce
+        nonsense. Identity is the right relation for "same axis Variable".
+        """
+        la = getattr(left, '_indexed_by', ()) if left is not None else ()
+        ra = getattr(right, '_indexed_by', ()) if right is not None else ()
+        seen: list = list(la)
+        seen_ids = {id(a) for a in seen}
+        for axis in ra:
+            if id(axis) not in seen_ids:
+                seen.append(axis)
+                seen_ids.add(id(axis))
+        return tuple(seen)
 
     # ─── Binary dunders ────────────────────────────────────────
 
@@ -345,6 +372,7 @@ class _VariableArithmetic:
             result._value = -self._value
         result._unit = self._get_unit()
         result._keys = list(self._keys) if self._keys is not None else None
+        result._indexed_by = getattr(self, '_indexed_by', ())
         if isinstance(result._value, list) and len(result._value) > 1:
             result.var_type = 'list'
         return result
@@ -379,6 +407,7 @@ class _VariableArithmetic:
         if isinstance(result._value, list) and len(result._value) > 1:
             result.var_type = 'list'
         result._keys = self._propagate_keys(self, other)
+        result._indexed_by = self._propagate_indexed_by(self, other)
         return result
 
     # ─── Comparison dunders ────────────────────────────────────
