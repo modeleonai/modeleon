@@ -84,3 +84,27 @@ class Component(Base):
         """Set the display label and return ``self`` for chaining."""
         self._display_name = display_name
         return self
+
+    @property
+    def code(self) -> str:
+        """Render this node as a runnable Modeleon DSL snippet.
+
+        Sibling to ``_repr_html_`` and ``to_excel`` — same idea, target
+        is Python source. For a :class:`~modeleon.Variable` this is one
+        line (``name = mo.Variable(...)``). For a
+        :class:`~modeleon.MultiVariable` or :class:`~modeleon.Model`,
+        the header line plus every descendant qualified under this
+        node's ``python_name``.
+
+        Variable formulas keep their original form when every
+        reference resolves inside the rendered subtree; otherwise
+        they fall back to the computed value so the snippet runs
+        standalone (Excel-style values fallback).
+
+        Lossy w.r.t. user-written ``.py`` — only the DSL subset
+        round-trips. Code between Variable declarations (imports,
+        helpers, comments) lives in source bytes and is invisible
+        to runtime.
+        """
+        from ..display.code import render_code
+        return render_code(self)
