@@ -73,6 +73,25 @@ def _crystallize_subtree(item: Any, path: QPath) -> None:
             _crystallize_subtree(child, path.child(comp_name))
 
 
+def _run_adoption_hooks(item: Any) -> None:
+    """Run ``Variable._on_adopted`` over ``item`` (a Variable or an MV
+    subtree), walking ``_components`` directly.
+
+    Deliberately NEVER touches ``var.id`` / ``_collect_variables`` —
+    identity resolution on a still-floating subtree would CACHE the
+    floating qpaths (the projection assembly builds whole trees before
+    any root exists, and the run resolves their identity later).
+    """
+    from .multi_variable import MultiVariableBase
+    from .variable import Variable
+
+    if isinstance(item, MultiVariableBase):
+        for comp_name in item._component_order:
+            _run_adoption_hooks(item._components[comp_name])
+    elif isinstance(item, Variable):
+        item._on_adopted()
+
+
 def _invalidate_subtree_paths(item: Any) -> None:
     """Recursively clear ``_qualified_id`` so paths re-resolve on next read.
 
@@ -175,15 +194,7 @@ class _MVLifecycle:
                 stacklevel=3,
             )
             # Detach the old component so its state doesn't leak back.
-            if isinstance(existing, MultiVariableBase):
-                existing._parent = None
-                existing._name_in_parent = None
-            elif isinstance(existing, Variable):
-                existing._owner = None
-                existing._component_name = None
-            existing._qualified_id = None
-            existing._python_name = None
-            del self._components[name]
+            self._detach_component(name)
 
         # Clone-on-ownership-change.
         if isinstance(component, Variable) and not isinstance(component, MultiVariableBase):
@@ -193,9 +204,11 @@ class _MVLifecycle:
             if component._parent is not None and component._parent is not self:
                 component = component._clone()
 
-        self._components[name] = component
-        if name not in self._component_order:
-            self._component_order.append(name)
+        # Component storage: live object in ``__dict__``; name tracked
+        # in ``_component_names`` (the disambiguator vs private attrs).
+        self.__dict__[name] = component
+        if name not in self._component_names:
+            self._component_names.append(name)
 
         # ``self`` is always a :class:`MultiVariableBase` at runtime — the mixin
         # is only mounted on MultiVariableBase. Cast for the type-checker.
@@ -222,6 +235,46 @@ class _MVLifecycle:
         # happen later when an ancestor adopts us with a rooted path.
         if self._qualified_id is not None:
             _crystallize_subtree(component, self._qualified_id.child(name))
+
+        # Adoption hook — schedule materialization + the extent law
+        # (§16.6). Runs here for the direct adoptee (the ancestor chain
+        # is complete the moment back-pointers are set) and again when a
+        # floating subtree is mounted under a rooted parent. Idempotent.
+        #
+        # Walks ``_components`` DIRECTLY — never ``_collect_variables``,
+        # which computes ``var.id`` and would freeze FLOATING qpaths onto
+        # a subtree that gets its root only later (the projection
+        # assembly builds whole trees before any root exists).
+        _run_adoption_hooks(component)
+
+    def _detach_component(self, name: str) -> Any:
+        """Orphan and unregister the child named ``name``.
+
+        Clears the child's parent / owner back-links and floats its
+        path, then drops it from ``__dict__`` + ``_component_names``.
+        Returns the detached component, or ``None`` if there was no such
+        component. Shared by the replace branch of
+        :meth:`_register_component` and the public
+        :meth:`~modeleon.core.multi_variable.MultiVariableBase.remove`.
+        """
+        from .multi_variable import MultiVariableBase
+        from .variable import Variable
+
+        if name not in self._components:
+            return None
+        existing = self._components[name]
+        if isinstance(existing, MultiVariableBase):
+            existing._parent = None
+            existing._name_in_parent = None
+        elif isinstance(existing, Variable):
+            existing._owner = None
+            existing._component_name = None
+        existing._qualified_id = None
+        existing._python_name = None
+        self.__dict__.pop(name, None)
+        if name in self._component_names:
+            self._component_names.remove(name)
+        return existing
 
     def _clone(self) -> "MultiVariableBase":
         """Shallow clone: new MV with copied Variables and cloned child MVs.

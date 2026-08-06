@@ -24,6 +24,69 @@ from ...core.variable import Variable
 LayoutRoot = Union[Variable, MultiVariableBase]
 
 
+def _reject_rank2_emission(var: Variable) -> None:
+    """Refuse to lay out a rank≥2 (multi-axis) Variable (§14.4 gate).
+
+    The one-row layout would silently paint an (A×B) buffer as A·B
+    consecutive periods — plausible-looking, wrong numbers. A loud
+    error until axis-aware emission (column groups) lands.
+
+    Tracked Variables PASS (P3): they lay out as ONE row sized by
+    their time length — the display-default series row. The xlsx
+    writer expands tracked lines into per-track rows BEFORE layout
+    (``writer.expand_tracked_tree``); the grid-address path keys the
+    single row by the variable's qpath and reads the default series
+    from ``VariableRuntime.values``.
+    """
+    axes = getattr(var, '_indexed_by', ()) or ()
+    if len(axes) >= 2:
+        label = (getattr(var, '_display_name', None)
+                 or getattr(var, '_python_name', None) or 'variable')
+        raise ValueError(
+            f"'{label}' is laid out along {len(axes)} axes — Excel "
+            f"emission of multi-axis Variables is not supported yet. "
+            f"Emit a slice instead (drop an axis first), or keep the "
+            f"variable out of the workbook."
+        )
+
+
+def sheet_name_for(mv: MultiVariableBase) -> str:
+    """Canonical sheet name for a Sheet-roled MV.
+
+    Single source of truth — every layer that needs to know "which
+    sheet is this MV's tab?" calls this. Without one canonical
+    derivation the layout / writer / translator can disagree on the
+    sheet name (e.g. ``id="forecast"`` vs ``display_name="Forecast"``)
+    and the translator's case-sensitive ``current_sheet`` check fails
+    to suppress same-sheet qualifiers — every reference ends up
+    written as ``=Sheet!Bn`` even within the same sheet.
+
+    Priority:
+
+      1. ``excel_layout.sheet`` — structured layout override
+         (``mo.MultiVariable(excel_layout=ExcelLayout(sheet="P&L"))``).
+         Highest precedence because it's the explicit "rename this
+         sheet" tag in the layout system. Engine reads the attribute
+         opaquely; the layout type lives in pro.
+      2. ``sheet_name`` — explicitly set via ``excel_props={'tab': True,
+         'sheet_name': '…'}``. The legacy flag-dict path.
+      3. ``display_name`` — user-facing label. ``mo.Model("forecast")``
+         produces ``display_name="Forecast"`` (title-cased) which is
+         the right Excel tab name.
+      4. ``id`` — the qualified-path id (dotted, lowercase). Fallback
+         for panel roots used by the HTML repr where neither of the
+         above is set.
+    """
+    layout = getattr(mv, "_excel_layout", None)
+    if layout is not None:
+        # Read the ``sheet`` attribute off whatever object was passed;
+        # don't introspect the type (engine stays free of pro imports).
+        layout_sheet = getattr(layout, "sheet", None)
+        if layout_sheet:
+            return str(layout_sheet)
+    return mv.sheet_name or mv.display_name or mv.id
+
+
 class LayoutEngine:
     """Walks a MultiVariable tree and assigns Excel cell addresses.
 
@@ -79,6 +142,16 @@ class LayoutEngine:
         self.sheet_map: Dict[str, list] = {}
         self.section_header_rows: Dict[str, tuple] = {}  # section_id -> (row, col)
         self.sheets_with_key_header: set = set()
+        # id(sheet_mv) -> (start, grain, style) for the timeline header row.
+        # Keyed by object identity, not sheet name: a model and its ``.at()``
+        # clone share a display_name (so ``sheet_name_for`` collides), and
+        # name-keying would let the second overwrite the first.
+        self.time_headers: Dict[int, tuple] = {}
+        # DEDUPED sheet name -> the same (start, grain, style) tuple — the
+        # serializable projection for consumers outside this process (the
+        # in-process writer keeps the id() keying above; the deduped name
+        # is unique per compute_addresses pass, so no clone collision).
+        self.time_headers_by_sheet: Dict[str, tuple] = {}
         # sheet_name -> {row -> item_id that claimed it}
         self._occupied_rows: Dict[str, Dict[int, str]] = {}
 
@@ -98,25 +171,86 @@ class LayoutEngine:
     def compute_addresses(self) -> Dict[str, VariableAddresses]:
         """Walk all sheet-level MVs and assign addresses to every Variable."""
         sheets = self._collect_sheets()
-        
+
+        from ...core.time import (
+            DEFAULT_TIME_LABEL_STYLE,
+            TIME_LABEL_STYLES,
+            resolve_default_window,
+        )
+        from .view import resolve_excel_view
+
         for sheet_mv in sheets:
-            # Prefer the user-visible label over the qualified id —
-            # non-sheet MVs (used as panel roots in HTML repr) have
-            # ``sheet_name`` = None and a dotted ``id`` like ``t.h``.
-            # Falling back to ``display_name`` keeps cell addresses
-            # readable (``Acme!B2``, not ``t.h!B2``).
-            sheet_name = (
-                sheet_mv.sheet_name
-                or sheet_mv.display_name
-                or sheet_mv.id
-            )
+            # Unique per-sheet key for internal bookkeeping (``_occupied_rows``,
+            # ``sheet_map``). ``sheet_name_for`` collides for a model and its
+            # ``.at()`` clone (shared display_name); without a distinct key their
+            # row spaces merge and the second tab's rows slide down the sheet.
+            base_name = sheet_name_for(sheet_mv)
+            sheet_name = base_name
+            _suffix = 1
+            while sheet_name in self.sheet_map:
+                sheet_name = f"{base_name}{_suffix}"
+                _suffix += 1
             self.sheet_map[sheet_name] = []
-            needs_header = self._sheet_needs_key_header(sheet_mv)
-            if needs_header:
+
+            needs_key_header = self._sheet_needs_key_header(sheet_mv)
+            if needs_key_header:
                 self.sheets_with_key_header.add(sheet_name)
-            start_row = 2 if needs_header else 1
-            self._layout_mv(sheet_mv, row=start_row, col=1, sheet_name=sheet_name)
-        
+
+            # Resolve the view + time window from a Variable inside the sheet:
+            # variables keep their _owner→model link even when the sheet MV is a
+            # detached virtual wrapper (the same trick the orient lookup uses).
+            anchor_var = next(self._iter_sheet_variables(sheet_mv), None)
+            # ``resolve_excel_view`` returns the global house-default snapshot
+            # for ``None``, so no separate fallback is needed.
+            view = resolve_excel_view(anchor_var)
+            window = (
+                resolve_default_window(anchor_var) if anchor_var is not None else None
+            )
+
+            # Transpose (``orient='down'``) is supported for a FLAT sheet only —
+            # all direct children are Variables, no sub-sections. Anything nested
+            # falls back to the default across-layout (byte-identical).
+            sheet_vars = [
+                c for c in sheet_mv._components.values() if isinstance(c, Variable)
+            ]
+            is_flat = len(sheet_vars) == len(sheet_mv._components)
+            is_transposed = (view.orient or "across") == "down" and is_flat
+
+            # Timeline header: a period-label row at row 1 when the sheet has a
+            # resolved window (start + grain) and the view doesn't suppress it.
+            # Across-layout only — a transposed sheet runs periods DOWN, so its
+            # variable-name header_row already plays that role.
+            want_time_header = (
+                not is_transposed
+                and window is not None
+                and window.grain is not None
+                and window.start is not None
+                and view.time_header is not False
+            )
+            if want_time_header:
+                assert window is not None  # narrowed by want_time_header
+                style = view.time_label_format or DEFAULT_TIME_LABEL_STYLE
+                if style not in TIME_LABEL_STYLES:
+                    raise ValueError(
+                        f"ExcelView.time_label_format must be one of "
+                        f"{TIME_LABEL_STYLES}; got {style!r}."
+                    )
+                self.time_headers[id(sheet_mv)] = (window.start, window.grain, style)
+                self.time_headers_by_sheet[sheet_name] = (
+                    window.start,
+                    window.grain,
+                    style,
+                )
+
+            start_row = 2 if (needs_key_header or want_time_header) else 1
+
+            if is_transposed:
+                self._layout_mv_transposed(
+                    sheet_mv, header_row=start_row, start_col=1, sheet_name=sheet_name
+                )
+            else:
+                self._layout_mv(sheet_mv, row=start_row, col=1, sheet_name=sheet_name)
+
         return self.addresses
     
     def _sheet_needs_key_header(self, sheet_mv: MultiVariableBase) -> bool:
@@ -231,7 +365,9 @@ class LayoutEngine:
             if isinstance(comp, MultiVariableBase):
                 if comp._is_sheet and not self._flatten_nested_sheets:
                     continue
-                section_id = comp.python_name or comp._name_in_parent or comp.id
+                # Use the fully-qualified id so same-named sections on different
+                # sheets (e.g. control.dates vs timing.flags.dates) don't collide.
+                section_id = comp.id or comp.python_name or comp._name_in_parent
 
                 explicit_row = comp._excel_props.get("row")
                 explicit_col = comp._excel_props.get("col")
@@ -268,12 +404,22 @@ class LayoutEngine:
         distinguish "the cell that holds a formula" from "the first
         cell of a per-period values run."
         """
+        _reject_rank2_emission(var)
         name_addr = f"{self._col_to_letter(start_col)}{row}"
         values_start = start_col + 1
         formula_addr = f"{self._col_to_letter(values_start)}{row}"
 
         value = var._value
-        if isinstance(value, list) and len(value) > 1:
+        if type(value).__name__ == 'TrackValues':
+            # One row sized by the track time length — the display-
+            # default series (the writer path expands tracked lines
+            # BEFORE layout; this branch serves the grid-address path).
+            n = value.time_length or 1
+            value_addrs = [
+                f"{self._col_to_letter(values_start + i)}{row}"
+                for i in range(n)
+            ]
+        elif isinstance(value, list) and len(value) > 1:
             value_addrs = [
                 f"{self._col_to_letter(values_start + i)}{row}"
                 for i in range(len(value))
@@ -286,7 +432,46 @@ class LayoutEngine:
             formula=formula_addr,
             values=value_addrs,
         )
-    
+
+    def _layout_mv_transposed(
+        self, mv: MultiVariableBase, header_row: int, start_col: int, sheet_name: str
+    ) -> None:
+        """Lay out a flat sheet TRANSPOSED — periods down, Variables across.
+
+        Each Variable becomes a column: its label sits in ``header_row`` and its
+        values run down beneath it. Formulas and recurrences follow for free
+        because they reference the (now vertical) value addresses, not a fixed
+        across-pattern.
+        """
+        col = start_col
+        for name in mv._component_order:
+            comp = mv._components[name]
+            if isinstance(comp, Variable):
+                self.addresses[comp.id] = self._create_var_address_down(
+                    comp, header_row, col
+                )
+                self.sheet_map.setdefault(sheet_name, []).append(comp.id)
+                col += 1
+
+    def _create_var_address_down(
+        self, var: Variable, header_row: int, col: int
+    ) -> VariableAddresses:
+        """Addresses for a Variable laid out as a COLUMN (label on top, values
+        running down) — the transpose of :meth:`_create_var_address`."""
+        _reject_rank2_emission(var)
+        name_addr = f"{self._col_to_letter(col)}{header_row}"
+        values_start_row = header_row + 1
+        value = var._value
+        n = len(value) if isinstance(value, list) and len(value) > 1 else 1
+        value_addrs = [
+            f"{self._col_to_letter(col)}{values_start_row + i}" for i in range(n)
+        ]
+        return VariableAddresses(
+            name=name_addr,
+            formula=value_addrs[0],
+            values=value_addrs,
+        )
+
     @staticmethod
     def _col_to_letter(col: int) -> str:
         """Convert a 1-based column number to Excel letters.

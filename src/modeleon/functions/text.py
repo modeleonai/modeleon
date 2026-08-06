@@ -52,12 +52,26 @@ LOWER = _unary_text_func("LOWER", lambda s: str(s).lower(), 'string')
 LOWER.__doc__ = "Lowercase a string Variable or plain string (renders ``=LOWER(...)``)."
 
 
+def _concat_piece(v: Any) -> str:
+    """Render one operand value for concatenation, Excel-style.
+
+    ``None`` → empty; an integer-valued float (``2022.0``) → ``"2022"``
+    so period labels read ``"1Q 2022"`` not ``"1Q 2022.0"``.
+    """
+    if v is None:
+        return ""
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v)
+
+
 def CONCAT(*args: TextOperand) -> Variable:
     """Concatenate Variables and/or plain strings (renders ``=CONCAT(...)``).
 
-    Always returns a Variable with the ``=CONCAT(...)`` formula — even when
-    all inputs are plain strings, the Excel cell holds the formula, not the
-    collapsed text.
+    Element-wise over list (period-indexed) operands, so
+    ``mo.CONCAT(quarter, "Q ", year, " ", phase)`` over per-period
+    Variables yields per-period labels (``"1Q 2022 Ф"``, …). Always
+    returns a Variable carrying the ``=CONCAT(...)`` formula.
     """
     if not args:
         raise ValueError(
@@ -66,18 +80,28 @@ def CONCAT(*args: TextOperand) -> Variable:
             "Got 0 arguments."
         )
 
-    expr_args = []
-    pieces = []
+    raws, expr_args = [], []
     for a in args:
-        _, expr = text_operand(a)
+        raw, expr = text_operand(a)
+        raws.append(raw)
         expr_args.append(expr)
-        if isinstance(a, Variable):
-            pieces.append("" if a._value is None else str(a._value))
-        else:
-            pieces.append(str(a))
+
+    if any(isinstance(r, list) for r in raws):
+        n = max(len(r) for r in raws if isinstance(r, list))
+
+        def at(r: Any, i: int) -> Any:
+            if isinstance(r, list):
+                return r[i] if i < len(r) else r[-1]
+            return r
+
+        value: Any = ["".join(_concat_piece(at(r, i)) for r in raws) for i in range(n)]
+        var_type = 'list'
+    else:
+        value = "".join(_concat_piece(r) for r in raws)
+        var_type = 'scalar'
 
     source_code = "CONCAT(" + ", ".join(src(a) for a in args) + ")"
     return make_func_var(
-        "CONCAT", expr_args, "".join(pieces), 'string', 'scalar',
+        "CONCAT", expr_args, value, 'string', var_type,
         source_code=source_code,
     )

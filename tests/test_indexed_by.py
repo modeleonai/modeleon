@@ -15,6 +15,8 @@ ops, and the independence of ``_keys`` (keyed-list labels) from
 
 from __future__ import annotations
 
+import pytest
+
 import modeleon as mo
 from modeleon.core.shape import Shape, shape_of
 
@@ -55,8 +57,10 @@ class TestExplicitIndexedBy:
     def test_indexed_by_two_axes(self):
         months = mo.Variable(['Jan', 'Feb'])
         scenarios = mo.Variable(['Bear', 'Bull'])
+        # Flat row-major — the ONLY accepted cube spelling (§14.4):
+        # nested lists are ambiguous about which level is which axis.
         cube = mo.Variable(
-            [[80, 100], [85, 110]],
+            [80, 100, 85, 110],
             indexed_by=[months, scenarios],
         )
         assert cube._indexed_by == (months, scenarios)
@@ -93,9 +97,16 @@ class TestOperatorBroadcast:
         per_month = mo.Variable([100, 110], indexed_by=[months])
         per_scenario = mo.Variable([0.9, 1.1], indexed_by=[scenarios])
         # Broadcasting two disjoint axes yields the union — order is
-        # left then right.
+        # left then right — AND the true cross-product VALUE (row-major,
+        # last axis fastest). This assertion deliberately retires the
+        # "intentional interim" where a 4-cell label sat over a 2-cell
+        # diagonal (§14.4 first commit).
         combined = per_month * per_scenario
         assert combined._indexed_by == (months, scenarios)
+        assert combined._value == [
+            100 * 0.9, 100 * 1.1,   # Jan × (Bear, Bull)
+            110 * 0.9, 110 * 1.1,   # Feb × (Bear, Bull)
+        ]
 
     def test_unary_negation_preserves_indexed_by(self):
         months = mo.Variable(['Jan', 'Feb'])
@@ -122,7 +133,7 @@ class TestShapeOf:
         months = mo.Variable(['Jan', 'Feb'])
         scenarios = mo.Variable(['Bear', 'Bull'])
         cube = mo.Variable(
-            [[1, 2], [3, 4]], indexed_by=[months, scenarios],
+            [1, 2, 3, 4], indexed_by=[months, scenarios],
         )
         assert shape_of(cube) == Shape((months, scenarios))
 
@@ -270,6 +281,14 @@ class TestMultiStepBroadcast:
 
         result = per_month * per_scenario * per_product
         assert result._indexed_by == (months, scenarios, products)
+        # 8 cells, row-major over (months, scenarios, products).
+        want = [
+            m * s * pr
+            for m in (1.0, 2.0)
+            for s in (0.9, 1.1)
+            for pr in (10.0, 20.0)
+        ]
+        assert result._value == pytest.approx(want)
 
     def test_repeated_axis_in_chain_dedupes(self):
         months = mo.Variable(['Jan', 'Feb'])
@@ -357,5 +376,177 @@ class TestEdgeCases:
     def test_shape_length_is_product_of_axis_sizes(self):
         a = mo.Variable(['x', 'y', 'z'])
         b = mo.Variable(['p', 'q'])
-        v = mo.Variable([[0, 0], [0, 0], [0, 0]], indexed_by=[a, b])
+        v = mo.Variable([0, 0, 0, 0, 0, 0], indexed_by=[a, b])
         assert v.shape.length == 6   # 3 × 2
+
+
+class TestAxisedConstructionInvariant:
+    """§14.4 (1): a declared shape must be honored by the value."""
+
+    def test_length_mismatch_rejected_with_teaching_error(self):
+        months = mo.Variable(['Jan', 'Feb'])
+        scenarios = mo.Variable(['Bear', 'Bull'])
+        with pytest.raises(ValueError, match="require 4 value"):
+            mo.Variable([1.0, 2.0], indexed_by=[months, scenarios])
+
+    def test_nested_lists_rejected(self):
+        months = mo.Variable(['Jan', 'Feb'])
+        scenarios = mo.Variable(['Bear', 'Bull'])
+        with pytest.raises(ValueError, match="FLAT row-major"):
+            mo.Variable([[1.0, 2.0], [3.0, 4.0]],
+                        indexed_by=[months, scenarios])
+
+    def test_matching_flat_value_accepted(self):
+        months = mo.Variable(['Jan', 'Feb'])
+        scenarios = mo.Variable(['Bear', 'Bull'])
+        v = mo.Variable([1.0, 2.0, 3.0, 4.0], indexed_by=[months, scenarios])
+        assert v._value == [1.0, 2.0, 3.0, 4.0]
+        assert v._indexed_by == (months, scenarios)
+
+
+class TestIdentityAlignedBroadcast:
+    """§14.4 (2): the value under the union label is the cross-product."""
+
+    def test_scalar_still_broadcasts(self):
+        months = mo.Variable(['Jan', 'Feb'])
+        v = mo.Variable([10.0, 20.0], indexed_by=[months])
+        r = v * 2
+        assert r._value == [20.0, 40.0]
+        assert r._indexed_by == (months,)
+
+    def test_same_axis_stays_elementwise(self):
+        months = mo.Variable(['Jan', 'Feb'])
+        a = mo.Variable([1.0, 2.0], indexed_by=[months])
+        b = mo.Variable([10.0, 20.0], indexed_by=[months])
+        assert (a + b)._value == [11.0, 22.0]
+
+    def test_transposed_operands_align_by_axis_identity(self):
+        # c is (months, scenarios); d is (scenarios, months). Same set,
+        # different declared order — the values must align by identity,
+        # not by position, or c + d is silently scrambled.
+        months = mo.Variable(['Jan', 'Feb'])
+        scenarios = mo.Variable(['Bear', 'Bull'])
+        c = mo.Variable([1.0, 2.0, 3.0, 4.0], indexed_by=[months, scenarios])
+        d = mo.Variable([10.0, 30.0, 20.0, 40.0], indexed_by=[scenarios, months])
+        # d in (months, scenarios) order is [10, 20, 30, 40].
+        total = c + d
+        assert total._indexed_by == (months, scenarios)
+        assert total._value == [11.0, 22.0, 33.0, 44.0]
+
+    def test_axised_times_bigger_axised(self):
+        months = mo.Variable(['Jan', 'Feb', 'Mar'])
+        scenarios = mo.Variable(['Bear', 'Bull'])
+        m = mo.Variable([1.0, 2.0, 3.0], indexed_by=[months])
+        s = mo.Variable([10.0, 100.0], indexed_by=[scenarios])
+        r = m * s
+        assert r._indexed_by == (months, scenarios)
+        assert r._value == [10.0, 100.0, 20.0, 200.0, 30.0, 300.0]
+
+    def test_comparison_crosses_axes_too(self):
+        months = mo.Variable(['Jan', 'Feb'])
+        scenarios = mo.Variable(['Bear', 'Bull'])
+        m = mo.Variable([1.0, 3.0], indexed_by=[months])
+        s = mo.Variable([2.0, 2.0], indexed_by=[scenarios])
+        r = m > s
+        assert r._indexed_by == (months, scenarios)
+        assert r._value == [False, False, True, True]
+
+
+class TestRank1Guards:
+    """§17 rank-1 guard — the ONLY v1 shape slipped the rank≥2 checks.
+
+    Reproduced on the shipped engine before this guard: the grain lens
+    summed coordinates into quarters with no error; lag shifted across
+    coordinates and dropped indexed_by. Every time-coupled surface now
+    refuses axised operands until the track layer lifts them."""
+
+    def _axised(self, display_name='Сценарии'):
+        scenarios = mo.Variable(['Bear', 'Bull'])
+        return mo.Variable([10.0, 20.0], indexed_by=[scenarios],
+                           display_name=display_name)
+
+    def test_time_is_none_for_axised(self):
+        # In a windowed model an axised variable must NOT inherit the
+        # ambient (start, grain) — its cells are coordinates, not months.
+        m = mo.Model('m', default_grain='month', default_start='2025-01',
+                     default_periods=2)
+        with m:
+            m.x = self._axised()
+        assert m.x.time is None
+
+    def test_at_grain_refuses(self):
+        with pytest.raises(ValueError, match="finite axis"):
+            self._axised().at('quarter')
+
+    def test_projection_refuses_rank1(self):
+        from modeleon.core.projection import project_variable
+        with pytest.raises(ValueError, match="axised"):
+            project_variable(self._axised(), 'quarter', {})
+
+    def test_lag_refuses(self):
+        from modeleon.functions.lag import lag
+        with pytest.raises(ValueError, match="finite axis"):
+            lag(self._axised())
+
+    def test_cumsum_refuses(self):
+        with pytest.raises(ValueError, match="finite axis"):
+            mo.cumsum(self._axised())
+
+    def test_recurrence_refuses_axised_driver(self):
+        with pytest.raises(ValueError, match="finite axis"):
+            mo.recurrence(
+                start=0.0, formula="{prev} + {доход}",
+                variables={"доход": self._axised()}, periods=4,
+            )
+
+    def test_sum_refuses(self):
+        with pytest.raises(ValueError, match="finite axis"):
+            mo.SUM(self._axised())
+
+    def test_if_refuses(self):
+        with pytest.raises(ValueError, match="finite axis"):
+            mo.IF(self._axised() > 15, 1.0, 0.0)
+
+    def test_plain_series_all_still_work(self):
+        # The guard must not touch ordinary time series.
+        m = mo.Model('m', default_grain='month', default_start='2025-01',
+                     default_periods=4)
+        with m:
+            m.x = mo.Variable([1.0, 2.0, 3.0, 4.0], regrain=mo.up('sum'))
+            m.s = mo.SUM(m.x)
+            m.c = mo.cumsum(m.x)
+        assert m.s._value == 10.0
+        assert m.c._value == [1.0, 3.0, 6.0, 10.0]
+        # Календарные кварталы: Q1 = янв+фев+мар, Q2 = апр.
+        assert m.x.at('quarter')._value == [6.0, 4.0]
+
+
+class TestRank2EmissionGate:
+    """§14.4 (3): a multi-axis Variable refuses one-row emission and
+    grain projection with teaching errors instead of painting its
+    cells as consecutive periods."""
+
+    def _cube(self):
+        months = mo.Variable(['Jan', 'Feb'])
+        scenarios = mo.Variable(['Bear', 'Bull'])
+        return mo.Variable(
+            [1.0, 2.0, 3.0, 4.0], indexed_by=[months, scenarios],
+            display_name='Cube',
+        )
+
+    def test_layout_refuses(self):
+        from modeleon.compile.excel.layout import _reject_rank2_emission
+        with pytest.raises(ValueError, match="2 axes"):
+            _reject_rank2_emission(self._cube())
+
+    def test_projection_refuses(self):
+        from modeleon.core.projection import project_variable
+        with pytest.raises(ValueError, match="axised"):
+            project_variable(self._cube(), 'quarter', {})
+
+    def test_rank1_untouched(self):
+        from modeleon.compile.excel.layout import _reject_rank2_emission
+        months = mo.Variable(['Jan', 'Feb'])
+        _reject_rank2_emission(
+            mo.Variable([1.0, 2.0], indexed_by=[months])
+        )  # no raise

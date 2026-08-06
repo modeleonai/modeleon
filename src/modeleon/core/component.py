@@ -37,8 +37,9 @@ class Component(Base):
         self,
         display_name: Optional[str] = None,
         excel_props: Optional[Dict[str, Any]] = None,
+        description: Optional[str] = None,
     ):
-        super().__init__(display_name=display_name)
+        super().__init__(display_name=display_name, description=description)
         self._excel_props: Dict[str, Any] = self._validate_excel_props(excel_props)
 
     @classmethod
@@ -83,6 +84,14 @@ class Component(Base):
     def set_display_name(self, display_name: str) -> Self:
         """Set the display label and return ``self`` for chaining."""
         self._display_name = display_name
+        return self
+
+    def set_description(self, description: Optional[str]) -> Self:
+        """Set the free-form description and return ``self`` for
+        chaining. Pass ``None`` to clear."""
+        self._description = (
+            None if description is None else str(description)
+        )
         return self
 
     @property

@@ -27,7 +27,11 @@ class Base:
     composition surface.
     """
 
-    def __init__(self, display_name: Optional[str] = None):
+    def __init__(
+        self,
+        display_name: Optional[str] = None,
+        description: Optional[str] = None,
+    ):
         # Qualified-path identity. Starts as ``None``; the ``.path``
         # property on the concrete subclass synthesizes a
         # floating-namespace path from ``id(self)`` until adoption
@@ -44,6 +48,15 @@ class Base:
         # humanized identifier when this is None.
         self._display_name: Optional[str] = (
             None if display_name is None else str(display_name)
+        )
+        # Free-form prose description of this node — what it represents,
+        # how it's computed, source of truth notes. Mirrors
+        # ``display_name`` as a structured field on the engine; readers
+        # (Excel writer, IDE inspector, AI assistant) surface it as a
+        # tooltip / cell note / context. Returned by the ``.description``
+        # property below. Default ``None`` — no fallback derivation.
+        self._description: Optional[str] = (
+            None if description is None else str(description)
         )
 
     @property
@@ -71,6 +84,18 @@ class Base:
         raise NotImplementedError(
             f"{type(self).__name__} must implement the .path property."
         )
+
+    @property
+    def description(self) -> Optional[str]:
+        """Free-form prose attached to this node by the author.
+
+        Set via the ``description=`` constructor kwarg (or
+        :meth:`~modeleon.core.component.Component.set_description`).
+        Surfaces in Excel exports (as a cell note), in the IDE
+        inspector, and as context for AI assistance. ``None`` when not
+        set — there is no fallback derivation.
+        """
+        return self._description
 
     @property
     def id(self) -> str:

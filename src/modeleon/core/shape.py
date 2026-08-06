@@ -25,6 +25,29 @@ if TYPE_CHECKING:
     from .variable import Variable
 
 
+def reject_axised(value, where: str) -> None:
+    """§17 rank-1 guard — refuse an axised operand where the value would
+    be read as a TIME series.
+
+    Time-coupled functions (lag, recurrence, cumsum), aggregates and IF
+    treat ``_value`` as periods; an axised Variable's flat value
+    enumerates COORDINATES. Mixing the two is the silent-wrong-numbers
+    class the §17 pass reproduced on the shipped engine. Loud refusal
+    until the track lift protocol (P1) maps these operations per
+    coordinate. No-op for plain values.
+    """
+    axes = getattr(value, '_indexed_by', ()) or ()
+    if axes:
+        label = (getattr(value, '_display_name', None)
+                 or getattr(value, '_python_name', None) or 'variable')
+        raise ValueError(
+            f"{where}: {label!r} is laid out along a finite axis — this "
+            f"operation reads its value as a TIME series and would mix "
+            f"coordinates with periods. Axised support lands with the "
+            f"track layer; slice one coordinate first."
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class Shape:
     """Tuple of axes a Variable is laid out along.

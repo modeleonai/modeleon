@@ -94,6 +94,86 @@ class TestCrossSheetReferences:
         }
 
 
+class TestDuplicateSheetNameQualification:
+    """Two sibling tabs that derive the SAME sheet name must still qualify
+    cross-tab references.
+
+    A model and its ``.at(grain=…)`` projection both carry the same
+    ``display_name`` (``'Saas'``), so both derive sheet name ``'Saas'``.
+    openpyxl de-duplicates the physical tab titles (``'Saas'`` /
+    ``'Saas1'``); the writer must use those post-dedup names everywhere so
+    the quarterly tab's re-grain formulas keep the ``'Saas'!`` prefix when
+    they reference the monthly tab's cells. Without it the prefix is
+    silently dropped and the formula points at the wrong cells on its own
+    tab. Regression for the projection cross-tab qualification bug.
+    """
+
+    def test_regrained_tab_qualifies_cross_tab_refs(self, tmp_path):
+        m = mo.Model("SaaS")
+        m.default_start = "2024-01"
+        m.default_grain = "month"
+        m.seats = mo.Variable([10, 20, 30, 40, 50, 60], regrain=mo.up("last"))
+        m.price = mo.Variable([5, 5, 5, 5, 5, 5], regrain=mo.up("mean"))
+        # A multiplicative flow: Σ(seats·price) ≠ aggSeats·aggPrice, so it
+        # carries its own up('sum') rule and re-grains by aggregating itself.
+        m.revenue = (m.seats * m.price).set_regrain(mo.up("sum"))
+
+        compare = mo.Model("Compare")
+        compare.m = m
+        compare.m_q = m.at(grain="quarter")
+
+        # The projection actually aggregates (6 monthly -> 2 quarterly points),
+        # not just relabels: Q1 = 50+100+150, Q2 = 200+250+300.
+        assert compare.m_q.revenue.value == [300, 750]
+
+        path = tmp_path / "x.xlsx"
+        compare.to_excel(path)
+
+        # Two physically distinct tabs despite the shared display_name.
+        assert load_workbook(path).sheetnames == ["Saas", "Saas1"]
+
+        # The model declares a window, so row 1 is the timeline header and data
+        # starts at row 2. Monthly tab: header + same-sheet arithmetic.
+        mo_cells = _cells(path, "Saas")
+        assert mo_cells["B1"] == "Jan 2024"            # finance header (default)
+        assert mo_cells["B4"] == "=B2 * B3"            # revenue = seats * price
+
+        # Quarterly tab: header in row 1; every re-grain formula references the
+        # monthly tab's (shifted) cells AND aggregates over the quarter's months
+        # — a SUM/AVERAGE over a range, or a period-end cell — never a single
+        # mis-pointed monthly cell.
+        q = _cells(path, "Saas1")
+        assert q["B1"] == "Q1 2024"
+        assert q["C1"] == "Q2 2024"
+        assert q["B2"] == "=Saas!D2"               # seats, up('last') -> Q-end
+        assert q["B3"] == "=AVERAGE(Saas!B3:D3)"   # price, up('mean')
+        assert q["B4"] == "=SUM(Saas!B4:D4)"       # revenue, up('sum') -> Q1
+        assert q["C4"] == "=SUM(Saas!E4:G4)"       # revenue, up('sum') -> Q2
+
+
+class TestLongNameDedupTerminates:
+    """Two sibling tabs whose names collide *at the 31-char Excel cap* must still
+    emit and de-duplicate without spinning. Regression for an infinite loop in
+    the old hand-rolled sheet-name dedup, which re-truncated ``'X'*31 + suffix``
+    back to ``'X'*31`` forever; openpyxl now owns the dedup, so this terminates.
+    """
+
+    def test_thirtyone_char_collision_emits(self, tmp_path):
+        long_name = "X" * 40  # both truncate to 'X'*31 and collide at the cap
+        parent = mo.Model("Book")
+        a = mo.MultiVariable(long_name, excel_props={"tab": True})
+        a.rev = mo.Variable([1, 2, 3], display_name="Rev")
+        b = mo.MultiVariable(long_name, excel_props={"tab": True})
+        b.cost = mo.Variable([4, 5, 6], display_name="Cost")
+        parent.a = a
+        parent.b = b
+
+        parent.to_excel(tmp_path / "x.xlsx")  # must return, not hang
+        names = load_workbook(tmp_path / "x.xlsx").sheetnames
+        assert len(names) == 2 and names[0] != names[1]  # distinct tabs
+        assert all(len(n) <= 31 for n in names)          # Excel-legal
+
+
 class TestFuncCallRendering:
     """Named-function call — ``SUM(a, b, c)`` renders as ``=SUM(B1, B2, B3)``.
 
@@ -238,3 +318,20 @@ class TestBinOpPrecedenceParens:
 
         cells = _cells(tmp_path / "p.xlsx", "S")
         assert cells["B4"] == "=B1 * B2 * B3"
+
+    def test_comparison_inside_multiplication_keeps_parens(self, tmp_path):
+        # ``a * (b == c)`` — comparison is the lowest precedence, so it
+        # MUST be parenthesized: without parens Excel re-reads
+        # ``a * b = c`` as ``(a * b) = c`` (a boolean), silently changing
+        # the result. Common in flag arithmetic (``prev * (flag = 0)``).
+        model = mo.MultiVariable("M")
+        model.s = mo.MultiVariable("S", excel_props={'tab': True})
+        with model.s as s:
+            s.a = mo.Variable(1.0, display_name='A')
+            s.b = mo.Variable(0.0, display_name='B')
+            s.x = (s.a * (s.b == 0)).set_display_name('X')
+
+        model.to_excel(tmp_path / "p.xlsx")
+
+        cells = _cells(tmp_path / "p.xlsx", "S")
+        assert cells["B3"] == "=B1 * (B2 = 0)"

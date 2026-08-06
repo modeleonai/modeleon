@@ -5,8 +5,8 @@ Organized by topic:
 
 - :mod:`aggregate`    — ``SUM``, ``MAX``, ``MIN``, ``AVERAGE``
 - :mod:`mathfn`       — ``ABS``, ``ROUND``, ``INT``, ``MOD``
-- :mod:`conditional`  — ``IF``
-- :mod:`dates`        — ``YEAR``, ``MONTH``, ``DAY``, ``EDATE``, ``EOMONTH``, ``TODAY``
+- :mod:`conditional`  — ``IF``, ``AND``, ``OR``, ``NOT``, ``CHOOSE``
+- :mod:`dates`        — ``YEAR``, ``MONTH``, ``DAY``, ``DATE``, ``EDATE``, ``EOMONTH``, ``DAYS360``, ``TODAY``
 - :mod:`text`         — ``LEN``, ``UPPER``, ``LOWER``, ``CONCAT``
 - :mod:`recurrence`   — ``recurrence``, ``recurrence_sum``, ``cumsum``
 - :mod:`cohort`       — ``cohort_retention``
@@ -31,10 +31,12 @@ Inspect compat for a given target with :func:`modeleon.check_compat`.
 from ._helpers import pyformula, val
 from .aggregate import AVERAGE, MAX, MIN, SUM
 from .cohort import cohort_retention
-from .conditional import IF
-from .dates import DAY, EDATE, EOMONTH, MONTH, TODAY, YEAR
+from .conditional import AND, CHOOSE, IF, NOT, OR
+from .dates import DATE, DAY, DAYS360, EDATE, EOMONTH, MONTH, TODAY, YEAR
 from .financial import FV, IRR, NPV, PMT, PV, XIRR
 from .mathfn import ABS, INT, MOD, ROUND
+from .lag import lag
+from .schedule import schedule
 from .recurrence import cumsum, recurrence, recurrence_sum
 from .text import CONCAT, LEN, LOWER, UPPER
 
@@ -44,15 +46,16 @@ __all__ = [
     "SUM", "MAX", "MIN", "AVERAGE",
     # Math
     "ABS", "ROUND", "INT", "MOD",
-    # Conditional
-    "IF",
+    # Conditional / logical
+    "IF", "AND", "OR", "NOT", "CHOOSE",
     # Dates
-    "YEAR", "MONTH", "DAY", "EDATE", "EOMONTH", "TODAY",
+    "YEAR", "MONTH", "DAY", "DATE", "EDATE", "EOMONTH", "DAYS360", "TODAY",
     # Text
     "LEN", "UPPER", "LOWER", "CONCAT",
     # Financial
     "IRR", "NPV", "XIRR", "PMT", "FV", "PV",
     # Domain helpers (no Excel equivalent — stay lowercase)
-    "cumsum", "recurrence", "recurrence_sum", "cohort_retention", "val",
-    "pyformula",
+    "cumsum", "lag",
+    "schedule", "recurrence", "recurrence_sum", "cohort_retention",
+    "val", "pyformula",
 ]

@@ -29,6 +29,7 @@ if TYPE_CHECKING:
         Literal,
         MethodCall,
         Paren,
+        Regrain,
         RollingAggregate,
         SelfRef,
         Subscript,
@@ -105,6 +106,9 @@ class Renderer(Protocol):
     def render_selfref(self, node: "SelfRef", ctx: RenderCtx) -> Any: ...
     def render_rollingaggregate(
         self, node: "RollingAggregate", ctx: RenderCtx
+    ) -> Any: ...
+    def render_regrain(
+        self, node: "Regrain", ctx: RenderCtx
     ) -> Any: ...
 
 

@@ -20,6 +20,7 @@ import inspect
 import math
 import operator
 import re
+from datetime import date
 from typing import Any, Callable, Dict, Optional, Tuple
 
 from ..core.expr import Expr, Literal, SelfRef, VarRef
@@ -188,7 +189,11 @@ def _safe_eval(node: ast.AST, names: Dict[str, Any]) -> Any:
 # Converts ``"{name}"`` placeholders to bare identifiers so the template
 # becomes parseable Python. ``"{prev} * (1 - {churn})"`` →
 # ``"prev * (1 - churn)"``.
-_PLACEHOLDER_RE = re.compile(r'\{([A-Za-z_][A-Za-z0-9_]*)\}')
+#: ``\w`` with re.UNICODE covers Cyrillic (and any other script) — the
+#: product's models are written in Russian; an ASCII-only placeholder
+#: silently left ``{п}`` unsubstituted and the parser then read the
+#: braces as a Python set literal ("Expression not allowed: Set").
+_PLACEHOLDER_RE = re.compile(r'\{([^\W\d]\w*)\}', re.UNICODE)
 
 
 def _resolve_periods(periods, variables: Dict[str, Any]) -> Tuple[int, Optional[Variable]]:
@@ -286,9 +291,30 @@ def _eval_template(formula: str, start_value, periods: int,
         for key, per_period in var_values_per_period.items():
             v = per_period[t]
             names[key] = v._value if isinstance(v, Variable) else v
+        # Excel-error markers ABSORB before evaluation (string '+'
+        # would silently concatenate them); ``None`` holes (§16.9 —
+        # un-entered fact months) absorb through the TypeError below,
+        # AFTER the structural validation inside ``_safe_eval`` has had
+        # its say — a malformed template still teaches, but one missing
+        # month must not kill the whole chain (the January case).
+        if any(isinstance(v, str) and v.startswith('#')
+               for v in names.values()):
+            result.append('#VALUE!')
+            prev = '#VALUE!'
+            continue
         try:
             current = _safe_eval(tree, names)
-        except (ValueError, NameError, TypeError, ZeroDivisionError) as e:
+        except TypeError as e:
+            if any(v is None for v in names.values()):
+                # A hole is absence, not failure — the chain goes
+                # quiet (blank) from here rather than red (§16.9).
+                result.append(None)
+                prev = None
+                continue
+            raise ValueError(
+                f"Error evaluating formula {formula!r} at period {t}: {e}"
+            ) from e
+        except (ValueError, NameError, ZeroDivisionError) as e:
             raise ValueError(
                 f"Error evaluating formula {formula!r} at period {t}: {e}"
             ) from e
@@ -391,9 +417,111 @@ def recurrence(
     values. String templates build a :class:`SelfRef` AST that translates
     to Excel formulas referencing the previous period's cell.
     """
+
+    from ..core.shape import reject_axised
+    from ..core.tracks import TrackValues as _Tracks
+    reject_axised(start, "recurrence(start=)")
+    for _k, _v in (variables or {}).items():
+        reject_axised(_v, f"recurrence(variables[{_k!r}])")
+
     # Remaining kwargs are template variables (``{name}`` substitutions).
     if variables is None:
         variables = kwargs or {}
+
+    # ─── track lift: N independent chains, one per coordinate ───
+    # A roll-forward over a track-carrying driver rolls SEPARATELY in
+    # each coordinate — the plan balance rolls from plan flows, the
+    # actual balance from actual flows (§15.3.5; the live re-anchored
+    # chain is the blend
+    # law's third universe, §16.9 — P2, not this function).
+    def _tracks_of(v: Any) -> Optional[_Tracks]:
+        val = getattr(v, '_value', None) if isinstance(v, Variable) else None
+        return val if isinstance(val, _Tracks) else None
+
+    tracked = {k: t for k, t in
+               ((k, _tracks_of(v)) for k, v in variables.items()) if t}
+    start_tracks = _tracks_of(start)
+    if tracked or start_tracks is not None:
+        role_sets = [set(t.roles) for t in tracked.values()]
+        if start_tracks is not None:
+            role_sets.append(set(start_tracks.roles))
+        if any(rs != role_sets[0] for rs in role_sets[1:]):
+            raise ValueError(
+                f"coordinate sets differ across recurrence operands: "
+                f"{sorted(map(sorted, role_sets))} — slice or align "
+                f"before the roll."
+            )
+        roles = (next(iter(tracked.values())).roles
+                 if tracked else start_tracks.roles)  # type: ignore[union-attr]
+
+        def _slice_operand(v: Any, role: str) -> Any:
+            t = _tracks_of(v)
+            if t is None:
+                return v
+            fiber = t[role]
+            sliced = Variable()
+            sliced._value = (list(fiber) if isinstance(fiber, list)
+                             else fiber)
+            sliced.var_type = ('list' if isinstance(fiber, list)
+                               else 'scalar')
+            return sliced
+
+        # Period count: explicit wins; else the tracks' shared time
+        # length (``_resolve_periods`` can't measure a Tracks value).
+        periods_var: Optional[Variable] = None
+        if periods is None:
+            tl = next(
+                (t.time_length for t in
+                 ([*tracked.values()]
+                  + ([start_tracks] if start_tracks else []))
+                 if t.time_length is not None),
+                None,
+            )
+            if tl is None:
+                raise ValueError(
+                    "recurrence() couldn't determine `periods` from "
+                    "all-scalar tracks — pass periods=N explicitly."
+                )
+            periods_resolved = tl
+        else:
+            periods_resolved, periods_var = _resolve_periods(periods, {})
+
+        per_role_values: Dict[str, list] = {}
+        for role in roles:
+            role_vars = {k: _slice_operand(v, role)
+                         for k, v in variables.items()}
+            role_start = _slice_operand(start, role)
+            per_role_values[role] = recurrence(
+                role_start, formula, role_vars, periods=periods_resolved,
+            )._value
+
+        is_lambda_ = callable(formula) and (
+            inspect.isfunction(formula) or inspect.ismethod(formula)
+        )
+        if is_lambda_:
+            result = Variable()
+        else:
+            result = Variable(formula=_build_selfref_expr(
+                start, formula, variables, periods_var, periods_resolved,
+            ))
+        result._value = _Tracks(per_role_values)
+        result.var_type = 'list'
+        sample = next((f for f in per_role_values.values()
+                       if isinstance(f, list)), [])
+        result.value_type = ('float' if any(isinstance(v, float)
+                                            for v in sample) else 'int')
+        if is_lambda_:
+            deps = [v for v in variables.values() if isinstance(v, Variable)]
+            if isinstance(start, Variable):
+                deps.append(start)
+            result._dependency_refs = deps
+        result._source_code = _render_source_code(
+            formula, start, variables, periods_resolved, periods_var,
+            is_lambda_,
+        )
+        if display_name:
+            result._display_name = display_name
+        return result
 
     is_lambda = callable(formula) and (inspect.isfunction(formula) or inspect.ismethod(formula))
     periods_resolved, periods_var = _resolve_periods(periods, variables)
@@ -422,7 +550,12 @@ def recurrence(
 
     result._value = values
     result.var_type = 'list'
-    result.value_type = 'float' if any(isinstance(v, float) for v in values) else 'int'
+    if any(isinstance(v, date) for v in values):
+        result.value_type = 'datetime'  # e.g. recurrence(start, "EDATE(prev, 3)")
+    elif any(isinstance(v, float) for v in values):
+        result.value_type = 'float'
+    else:
+        result.value_type = 'int'
 
     # Lambda mode has no AST → dependency refs must be wired manually so the
     # dependency graph stays complete.
@@ -474,6 +607,35 @@ def cumsum(iterable: Variable) -> Variable:
     formulas (each cell ``= prev + input``) instead of expanding the full
     sum range per cell.
     """
+    from ..core.shape import reject_axised
+    from ..core.tracks import TrackValues
+    if isinstance(iterable, Variable) and isinstance(iterable._value, TrackValues):
+        # Rank lifting: running total per coordinate.
+        def _acc(track):
+            if not isinstance(track, list):
+                return track
+            out, run = [], 0.0
+            for v in track:
+                # Holes and error markers stop the running total —
+                # absence is quiet (None from here on), failure loud.
+                if run is None or v is None:
+                    run = None
+                elif isinstance(v, str) or isinstance(run, str):
+                    run = v if isinstance(v, str) else run
+                else:
+                    run += v
+                out.append(run)
+            return out
+        result = Variable(formula=__import__(
+            'modeleon.core.expr', fromlist=['MethodCall', 'VarRef']
+        ).MethodCall(__import__(
+            'modeleon.core.expr', fromlist=['VarRef']
+        ).VarRef(iterable), 'cumsum', [], {}))
+        result._value = TrackValues.lift(_acc, iterable._value)
+        result.var_type = 'list'
+        result._cumsum_source = iterable
+        return result
+    reject_axised(iterable, "cumsum")
     if not isinstance(iterable, Variable):
         raise TypeError(
             f"cumsum() expects a Variable, got {type(iterable).__name__}. "
@@ -504,4 +666,9 @@ def cumsum(iterable: Variable) -> Variable:
     else:
         label = iterable.python_name or iterable.path.leaf
     result._source_code = f"cumsum({label})"
+    # Projection marker: a running total re-grains EXACTLY as the
+    # cumsum of its re-grained (summed) input — cumsum(monthly)[q-end]
+    # == cumsum(quarterly sums)[q]. Generic SelfRef recompute is
+    # forbidden; this identity lets core.projection rebuild the row.
+    result._cumsum_source = iterable
     return result

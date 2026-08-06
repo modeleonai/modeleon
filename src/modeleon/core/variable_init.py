@@ -127,6 +127,13 @@ class _VariableInit:
     def _init_from_value(self, value, var_type: str, value_type: str) -> tuple[str, str]:
         """Handle the ``value=`` argument. Returns (var_type, value_type)."""
         from .variable import Variable
+        from .tracks import TrackValues
+        if isinstance(value, TrackValues):
+            # A tracked value (role → series) stores as-is; var_type
+            # follows the tracks' shape (list tracks → a series row).
+            self._value = value
+            return ('list' if value.time_length is not None else 'scalar',
+                    value_type)
         if isinstance(value, Variable):
             # A passed-in Variable is a reference, not a copy of the inputs
             self._value = value._value
@@ -216,32 +223,28 @@ class _VariableInit:
             value_type = 'string'
         return var_type, value_type
 
-    def _process_kwargs(self, kwargs: Dict[str, Any]) -> None:
-        """Sort extra kwargs into plugin attributes, or raise TypeError
-        for typos.
+    def _process_kwargs(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Sort extra kwargs into plugin attributes; return the rest.
 
         Known kwargs that ``Variable.__init__`` accepts directly (value,
         formula, display_name, unit, keys, excel_props, …) are already
         consumed by ``__init__``'s signature. What lands in ``kwargs``
         is whatever else the user passed — plugin-registered extensions
-        (``control=``, ``access=``) or typos.
+        (``control=``, ``access=``), TRACK kwargs (§16.2: track names
+        are user content, so they cannot be literal parameters), or
+        typos. The remainder is returned for ``__init__`` to stash as
+        track candidates; validation against the ambient ``mo.Tracks``
+        declaration happens at adoption, where a name that is neither
+        a declared track nor a known kwarg dies with a teaching error.
         """
-        unknown_kwargs: list[str] = []
+        remainder: Dict[str, Any] = {}
         plugin_kwargs = _plugin_variable_kwargs()
         for k, v in kwargs.items():
             if k in plugin_kwargs:
                 setattr(self, f"_{k}", v)
             else:
-                unknown_kwargs.append(k)
-        if unknown_kwargs:
-            raise TypeError(
-                f"Variable() got unexpected keyword argument(s): "
-                f"{', '.join(sorted(unknown_kwargs))}. "
-                f"Known kwargs: value, value_type, var_type, "
-                f"display_name, formula, pyformula, unit, keys, "
-                f"excel_props. For styling, pass "
-                f"``excel_props={{'bold': True, 'bg': '#eef', ...}}``."
-            )
+                remainder[k] = v
+        return remainder
 
     # ``_process_excel_props`` consolidated into
     # ``Component._validate_excel_props`` and called via

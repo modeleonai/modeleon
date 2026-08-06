@@ -26,6 +26,7 @@ construct results).
 
 from __future__ import annotations
 
+from datetime import date, datetime
 from typing import Any, List, Optional, Tuple, TYPE_CHECKING
 
 from .expr import BinOp, Compare, Expr, Literal, UnaryOp, VarRef
@@ -33,6 +34,41 @@ from .expr import BinOp, Compare, Expr, Literal, UnaryOp, VarRef
 if TYPE_CHECKING:
     from .unit import Unit
     from .variable import Variable
+
+
+def _date_serial_op(a: Any, b: Any, op: Any, a_is_date: bool, b_is_date: bool) -> Any:
+    """Excel-style date arithmetic on serial day numbers.
+
+    Excel stores dates as serial day counts, so the ``+``/``-`` operators
+    work on them directly. This mirrors that on Python ``date`` values:
+
+    - ``date - date`` → integer days between them.
+    - ``date ± number`` (or ``number + date``) → the shifted ``date``.
+    - anything that lands on a non-integer / out-of-range serial → ``#VALUE!``.
+
+    The Excel formula side already renders as plain ``=B2 - C2`` (which
+    Excel evaluates correctly); this only fixes the Python-side ``_value``.
+    """
+    def to_serial(x: Any) -> Any:
+        if isinstance(x, datetime):
+            return x.date().toordinal()
+        if isinstance(x, date):
+            return x.toordinal()
+        return x
+
+    sa, sb = to_serial(a), to_serial(b)
+    if not isinstance(sa, (int, float)) or not isinstance(sb, (int, float)):
+        return '#VALUE!'
+    try:
+        result = op(sa, sb)
+    except Exception:
+        return '#VALUE!'
+    if a_is_date and b_is_date:
+        return int(result)  # a span of days, not a date
+    try:
+        return date.fromordinal(int(round(result)))
+    except (ValueError, OverflowError, TypeError):
+        return '#VALUE!'
 
 
 class _VariableArithmetic:
@@ -64,6 +100,25 @@ class _VariableArithmetic:
     # paths — keep all value arithmetic routed through here.
 
     @staticmethod
+    def _reject_pending_roles(*operands) -> None:
+        """Refuse eager compute on a role-kwarg Variable that has not
+        materialized (§16.2). Values compute at operator time (ADR-010);
+        an unmaterialized operand is ``None`` and would bake a permanent
+        ``#VALUE!`` into every dependent — loud beats silently wrong.
+        """
+        for v in operands:
+            if (getattr(v, '_role_kwargs', None) is not None
+                    and not getattr(v, '_roles_materialized', False)):
+                label = (getattr(v, '_display_name', None)
+                         or getattr(v, '_python_name', None) or 'variable')
+                raise ValueError(
+                    f"{label!r} authors track coordinates that have not "
+                    f"materialized yet — attach it to the model (values "
+                    f"compute at operator time, so the attach must come "
+                    f"BEFORE the formulas that read it)."
+                )
+
+    @staticmethod
     def _broadcast_operation(left, right, op, safe_divide: bool = False):
         """Element-wise op with NumPy-style broadcasting.
 
@@ -83,8 +138,19 @@ class _VariableArithmetic:
                 return a
             if _is_excel_error(b):
                 return b
+            # A HOLE is absence, not failure (§16.9): an un-entered
+            # fact month propagates as a hole, so a formula over it
+            # reads "not known yet" — a blank cell — instead of
+            # painting the whole future red with #VALUE!. Genuine
+            # failures still absorb into an error token below.
+            if a is None or b is None:
+                return None
             if safe_divide and b == 0:
                 return '#DIV/0!'
+            a_is_date = isinstance(a, (date, datetime))
+            b_is_date = isinstance(b, (date, datetime))
+            if a_is_date or b_is_date:
+                return _date_serial_op(a, b, op, a_is_date, b_is_date)
             try:
                 return op(a, b)
             except Exception:
@@ -249,6 +315,7 @@ class _VariableArithmetic:
         from .variable import Variable
 
         self_u = self._get_unit()
+        self._reject_pending_roles(self, other)
 
         if isinstance(other, Variable):
             left, right = (other, self) if reversed else (self, other)
@@ -257,16 +324,52 @@ class _VariableArithmetic:
             result = Variable()
             result._set_expr(expr_node)
             lv, rv = self._align_keyed_values(left, right)
-            result._value = self._broadcast_operation(lv, rv, op_func, safe_divide=safe_divide)
+            expanded = self._expand_axised_operands(left, right, lv, rv)
+            if expanded is not None:
+                lv, rv = expanded
+            aligned = self._align_by_date(left, right, lv, rv)
+            if aligned is not None:
+                lv, rv, _union_start, _union_grain = aligned
+                # The result is located at the union window explicitly —
+                # downstream alignment then knows where it starts.
+                result._start = _union_start
+                result._grain = _union_grain
+            from .tracks import TrackValues
+            if isinstance(lv, TrackValues) or isinstance(rv, TrackValues):
+                # The tracks broadcast law (§15.3.4): zip per role;
+                # a plain operand broadcasts into every track;
+                # differing role sets die loudly inside ``combine``.
+                result._value = TrackValues.combine(
+                    lv, rv,
+                    lambda a, b: self._broadcast_operation(
+                        a, b, op_func, safe_divide=safe_divide
+                    ),
+                )
+            else:
+                result._value = self._broadcast_operation(lv, rv, op_func, safe_divide=safe_divide)
             if unit_fn is not None:
                 result._unit = unit_fn(left._get_unit(), right._get_unit())
         else:
+            from .tracks import TrackValues
+
+            def _combine(a, b):
+                if isinstance(a, TrackValues) or isinstance(b, TrackValues):
+                    return TrackValues.combine(
+                        a, b,
+                        lambda x, y: self._broadcast_operation(
+                            x, y, op_func, safe_divide=safe_divide
+                        ),
+                    )
+                return self._broadcast_operation(
+                    a, b, op_func, safe_divide=safe_divide
+                )
+
             if reversed:
                 expr_node = BinOp(op_symbol, Literal(other), self._as_operand(parenthesize))
-                val = self._broadcast_operation(other, self._value, op_func, safe_divide=safe_divide)
+                val = _combine(other, self._value)
             else:
                 expr_node = BinOp(op_symbol, self._as_operand(parenthesize), Literal(other))
-                val = self._broadcast_operation(self._value, other, op_func, safe_divide=safe_divide)
+                val = _combine(self._value, other)
             result = Variable()
             result._set_expr(expr_node)
             result._value = val
@@ -276,10 +379,155 @@ class _VariableArithmetic:
 
         if isinstance(result._value, list) and len(result._value) > 1:
             result.var_type = "list"
+        elif type(result._value).__name__ == 'TrackValues' and result._value.time_length:
+            result.var_type = "list"
+        # A date-valued result (e.g. ``start + 90``, ``end - 1``) must carry
+        # the datetime value type so the writer formats the cell as a date.
+        sample = (result._value[0] if isinstance(result._value, list) and result._value
+                  else result._value)
+        if isinstance(sample, (date, datetime)):
+            result.value_type = "datetime"
         k_left, k_right = (other, self) if reversed else (self, other)
         result._keys = self._propagate_keys(k_left, k_right)
         result._indexed_by = self._propagate_indexed_by(k_left, k_right)
         return result
+
+    @staticmethod
+    def _align_by_date(left: Any, right: Any, lv: Any, rv: Any):
+        """Date-aligned zip (§16.5) — P1's calendar alignment.
+
+        Engages ONLY when both operands are list-valued Variables with
+        resolvable time locations that disagree (different starts or
+        different lengths at one grain). Same-window operands keep the
+        byte-identical positional path. Different GRAINS refuse — that
+        is re-grain territory, not alignment.
+
+        Each side materializes onto the union window; cells outside an
+        operand's own extent follow its DECLARED ``extend=`` rule —
+        zero (a flow is absent), hold (a rate stays in force; held
+        backward from the first value when extended into the past),
+        or none/undeclared → a teaching error naming both extents.
+        Returns ``(lv', rv', union_start, grain)`` or ``None`` when
+        not applicable.
+        """
+        from .tracks import TrackValues
+        from .variable import Variable
+        if not isinstance(left, Variable) or not isinstance(right, Variable):
+            return None
+        if isinstance(lv, TrackValues) or isinstance(rv, TrackValues):
+            return None  # tracks share the ambient window by the extent law
+        if not isinstance(lv, list) or not isinstance(rv, list):
+            return None
+        lt, rt = left.time, right.time
+        if lt is None or rt is None or lt.start is None or rt.start is None:
+            return None
+        if lt.start == rt.start and len(lv) == len(rv):
+            return None
+        if lt.grain != rt.grain:
+            raise ValueError(
+                f"operands live at different grains ({lt.grain} vs "
+                f"{rt.grain}) — re-grain one side first (.at(grain=...)); "
+                f"date alignment only aligns within one grain."
+            )
+        from .time import _count, _parse, _step, _format
+        grain = lt.grain
+        la, ra = _parse(lt.start, grain), _parse(rt.start, grain)
+        # Union window in period indices relative to the earlier start.
+        # ``_count`` is INCLUSIVE (Jan→Apr = 4 labels); the offset is
+        # one less.
+        off_l = 0 if lt.start <= rt.start else _count(ra, la, grain) - 1
+        off_r = 0 if rt.start <= lt.start else _count(la, ra, grain) - 1
+        total = max(off_l + len(lv), off_r + len(rv))
+        union_start = min(lt.start, rt.start)
+
+        def project(var: "Variable", vals: list, off: int, other: str) -> list:
+            out = []
+            rule = getattr(var, '_extend', None)
+            for i in range(total):
+                j = i - off
+                if 0 <= j < len(vals):
+                    out.append(vals[j])
+                elif rule == 'zero':
+                    out.append(0.0)
+                elif rule == 'hold':
+                    out.append(vals[0] if j < 0 else vals[-1])
+                else:
+                    label = (var._display_name
+                             or getattr(var, '_python_name', None)
+                             or 'variable')
+                    raise ValueError(
+                        f"{label!r} does not cover the combined window "
+                        f"(it spans {len(vals)} period(s) from "
+                        f"{var.time.start}; the other side spans "
+                        f"{other}). Say what continues it: "
+                        f"extend=mo.zero() (a flow) or extend=mo.hold() "
+                        f"(a rate) — never a silent guess."
+                    )
+            return out
+
+        l_span = f"{len(rv)} period(s) from {rt.start}"
+        r_span = f"{len(lv)} period(s) from {lt.start}"
+        return (project(left, lv, off_l, l_span),
+                project(right, rv, off_r, r_span),
+                union_start, grain)
+
+    @staticmethod
+    def _expand_axised_operands(left: Any, right: Any, lv: Any, rv: Any):
+        """Identity-aligned expansion of two AXISED operands (§14.4).
+
+        Engages only when BOTH operands declare ``_indexed_by`` and the
+        axis tuples differ (different sets → cross-product; same set in
+        a different order → transpose). Each flat row-major value is
+        expanded to the union shape (left-first axis order — the same
+        order ``_propagate_indexed_by`` emits) by replication, so the
+        subsequent element-wise zip computes the true cross-product
+        instead of the historical 2-cell diagonal that used to hide
+        under a 4-cell label.
+
+        Returns ``(lv', rv')`` or ``None`` when not applicable (either
+        side lacks declared axes — scalars broadcast fine and plain
+        time-lists keep today's semantics until the track layer — or
+        the axis tuples are identical, where the plain zip is already
+        correct and cheaper).
+        """
+        la = getattr(left, '_indexed_by', ()) or ()
+        ra = getattr(right, '_indexed_by', ()) or ()
+        if not la or not ra:
+            return None
+        if tuple(id(a) for a in la) == tuple(id(a) for a in ra):
+            return None
+        if lv is None or rv is None:
+            return None
+
+        union = _VariableArithmetic._propagate_indexed_by(left, right)
+        dims = [
+            len(a._value) if isinstance(getattr(a, '_value', None), list) else 1
+            for a in union
+        ]
+        total = 1
+        for d in dims:
+            total *= d
+        pos_by_id = {id(a): i for i, a in enumerate(union)}
+
+        def expand(axes: Tuple[Any, ...], flat: Any) -> list:
+            vals = flat if isinstance(flat, list) else [flat]
+            pos = [pos_by_id[id(a)] for a in axes]
+            own_dims = [dims[p] for p in pos]
+            out = []
+            for cell in range(total):
+                # Union coordinates, row-major (last axis fastest).
+                rem, coords = cell, [0] * len(dims)
+                for i in range(len(dims) - 1, -1, -1):
+                    coords[i] = rem % dims[i]
+                    rem //= dims[i]
+                # Row-major index into the operand's own axis order.
+                idx = 0
+                for p, d in zip(pos, own_dims):
+                    idx = idx * d + coords[p]
+                out.append(vals[idx])
+            return out
+
+        return expand(la, lv), expand(ra, rv)
 
     @staticmethod
     def _propagate_indexed_by(left: Any, right: Any) -> Tuple[Any, ...]:
@@ -375,6 +623,8 @@ class _VariableArithmetic:
         result._indexed_by = getattr(self, '_indexed_by', ())
         if isinstance(result._value, list) and len(result._value) > 1:
             result.var_type = 'list'
+        elif type(result._value).__name__ == 'TrackValues' and result._value.time_length:
+            result.var_type = 'list'
         return result
 
     def __pos__(self) -> "Variable":
@@ -394,17 +644,32 @@ class _VariableArithmetic:
         # ``self`` is always a :class:`Variable` at runtime — the mixin is
         # only mounted on Variable. The casts below tell mypy that.
         self_var: "Variable" = self  # type: ignore[assignment]
+        self._reject_pending_roles(self, other)
+        from .tracks import TrackValues
+
+        def _combine(a, b):
+            if isinstance(a, TrackValues) or isinstance(b, TrackValues):
+                return TrackValues.combine(
+                    a, b, lambda x, y: self._broadcast_operation(x, y, op_func)
+                )
+            return self._broadcast_operation(a, b, op_func)
+
         if isinstance(other, Variable):
             result = Variable()
             result._set_expr(Compare(op_symbol, VarRef(self_var), VarRef(other)))
             lv, rv = self._align_keyed_values(self, other)
-            result._value = self._broadcast_operation(lv, rv, op_func)
+            expanded = self._expand_axised_operands(self, other, lv, rv)
+            if expanded is not None:
+                lv, rv = expanded
+            result._value = _combine(lv, rv)
         else:
             result = Variable()
             result._set_expr(Compare(op_symbol, VarRef(self_var), Literal(other)))
-            result._value = self._broadcast_operation(self._value, other, op_func)
+            result._value = _combine(self._value, other)
 
         if isinstance(result._value, list) and len(result._value) > 1:
+            result.var_type = 'list'
+        elif type(result._value).__name__ == 'TrackValues' and result._value.time_length:
             result.var_type = 'list'
         result._keys = self._propagate_keys(self, other)
         result._indexed_by = self._propagate_indexed_by(self, other)

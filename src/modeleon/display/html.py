@@ -118,6 +118,16 @@ _TH_ROW = (
     "font-family:'JetBrains Mono','SF Mono',Menlo,monospace; "
     "font-size:10px; color:#7a8080; font-weight:500;"
 )
+# Timeline header (the ExcelView period-label row) — bold with the teal accent
+# so the notebook preview matches the Excel output's header.
+_TH_PERIOD = (
+    "padding:4px 12px; background:#eef5f5; border-bottom:1px solid #d4e4e3; "
+    "border-right:1px solid #d4e4e3; text-align:center; "
+    "font-family:'JetBrains Mono','SF Mono',Menlo,monospace; "
+    "font-size:10px; color:#07464a; font-weight:700;"
+)
+
+
 
 
 # Running ID counter so multiple renders in one notebook don't collide
@@ -257,16 +267,15 @@ def _make_overview_sheet(root, direct_var_names: list[str]):
     virt._display_name = (
         root.display_name or getattr(root, 'python_name', None) or "Sheet1"
     )
-    virt._components = {}
-    virt._component_order = []
     virt._parent = None
     virt._name_in_parent = None
     virt._qualified_id = None
     virt._python_name = None
     virt._excel_props = {'tab': True}
-    for name in direct_var_names:
-        virt._components[name] = root._components[name]
-        virt._component_order.append(name)
+    # Bulk-assign — the property setter installs the dict into the
+    # underlying storage in one shot. Per-key writes through the
+    # property getter would write into a snapshot, not the storage.
+    virt._components = {name: root._components[name] for name in direct_var_names}
     return virt
 
 
@@ -785,6 +794,65 @@ def variable_html(var) -> str:
     return _toggle_wrapper(_next_uid(), table, has_any_formula=has_formula)
 
 
+def _css_color(c) -> str:
+    """An Excel colour (``'#1c9499'`` / ``'1c9499'`` / ``'FF1c9499'`` ARGB) as
+    a CSS hex string."""
+    if not isinstance(c, str) or not c:
+        return ""
+    h = c.lstrip("#")
+    if len(h) == 8:  # ARGB → drop the alpha byte
+        h = h[2:]
+    return f"#{h}" if len(h) in (3, 6) else c
+
+
+def _props_css(props: dict) -> str:
+    """``bold`` / ``italic`` / ``bg`` / ``font_color`` from an excel_props-style
+    dict as a CSS fragment — the same styling vocabulary the Excel writer uses."""
+    pieces = []
+    if props.get("bold"):
+        pieces.append("font-weight:600")
+    if props.get("italic"):
+        pieces.append("font-style:italic")
+    bg = _css_color(props.get("bg"))
+    if bg:
+        pieces.append(f"background:{bg}")
+    fc = _css_color(props.get("font_color"))
+    if fc:
+        pieces.append(f"color:{fc}")
+    return ";".join(pieces)
+
+
+def _view_cell_css(var, current_sheet, ctx) -> str:
+    """Extra CSS for a value cell so the repr mirrors the Excel view: the
+    cascaded ``base_font`` family, the variable's own ``excel_props``, and the
+    ``format_by_type`` cell-type colour. Reuses the writer's ``_type_color_for``
+    so the type→colour decision has ONE source of truth — the repr only maps the
+    result to CSS. Empty when nothing applies, so a plain model stays
+    byte-identical."""
+    pieces = []
+    try:
+        from ..compile.excel.view import resolve_excel_view
+        name = (resolve_excel_view(var).base_font or {}).get("name")
+        if name:
+            pieces.append(f"font-family:'{name}',monospace")
+    except Exception:
+        pass
+    props = dict(getattr(var, "_excel_props", None) or {})
+    # format_by_type tints value cells by type; an explicit font_color wins.
+    if not props.get("font_color") and ctx is not None and current_sheet is not None:
+        try:
+            from ..compile.excel.writer import _type_color_for
+            tc = _type_color_for(var, current_sheet, ctx.var_to_sheet)
+            if tc:
+                props["font_color"] = tc
+        except Exception:
+            pass
+    own = _props_css(props)
+    if own:
+        pieces.append(own)
+    return (";" + ";".join(pieces)) if pieces else ""
+
+
 def _render_var_cell(
     var, value, period_idx: int, ctx: Optional[_Ctx]
 ) -> tuple[str, bool]:
@@ -819,6 +887,9 @@ def _render_var_cell(
         if addr_obj is not None and current_sheet is not None and period_idx < len(addr_obj.values):
             self_addr = f"{current_sheet}!{addr_obj.values[period_idx]}"
             cell_attrs = f' data-cell="{html.escape(self_addr)}"'
+
+    # Honor the ExcelView: base_font / own props / format_by_type cell colour.
+    td_style = f"{td_style}{_view_cell_css(var, current_sheet, ctx)}"
 
     if formula is not None:
         deps = (
@@ -893,6 +964,38 @@ def _collect_rows(mv, direct_only: bool = False) -> tuple[list, int]:
     return rows, max_cols
 
 
+def _timeline_header_labels(mv, rows, max_cols: int) -> list:
+    """Period-label header for this MV's sheet — mirrors the Excel writer's
+    window-gated, view-configurable timeline header so the notebook preview
+    matches ``to_excel``. Returns ``[]`` when the MV declares no time window
+    or the resolved view suppresses the header.
+    """
+    try:
+        from ..compile.excel.view import resolve_excel_view
+        from ..core.time import (
+            DEFAULT_TIME_LABEL_STYLE,
+            TIME_LABEL_STYLES,
+            _period_labels,
+            resolve_default_window,
+        )
+
+        anchor = next((var for kind, _, var, _ in rows if kind == 'var'), None)
+        if anchor is None:
+            return []
+        window = resolve_default_window(anchor)
+        if window is None or window.grain is None or window.start is None:
+            return []
+        view = resolve_excel_view(anchor)
+        if view.time_header is False:
+            return []
+        style = view.time_label_format or DEFAULT_TIME_LABEL_STYLE
+        if style not in TIME_LABEL_STYLES:
+            return []
+        return _period_labels(window.start, None, max_cols, window.grain, style)
+    except Exception:  # presentation only — never break the repr over a header
+        return []
+
+
 def _render_mv_table(
     mv,
     ctx: Optional[_Ctx],
@@ -935,7 +1038,9 @@ def _render_mv_table(
         if kind == 'var' and values is not None and len(values) > wide_len:
             wide_var = var
             wide_len = len(values)
-    value_cols = _value_col_letters(wide_var, ctx) if wide_var else []
+    # ``is not None`` — Variable truthiness is its VALUE (list raises);
+    # this is an existence check, not a value check.
+    value_cols = _value_col_letters(wide_var, ctx) if wide_var is not None else []
     # Fill or trim to ``max_cols`` so empty trailing columns still get
     # *some* letter (placeholder).
     if len(value_cols) < max_cols:
@@ -955,6 +1060,16 @@ def _render_mv_table(
     )
 
     period_row = ""
+    period_labels = _timeline_header_labels(mv, rows, max_cols)
+    if period_labels:
+        period_cells = "".join(
+            f'<th style="{_TH_PERIOD}">{html.escape(p)}</th>' for p in period_labels
+        )
+        period_row = (
+            f'<tr><th style="{_TH_ROW}">1</th>'   # Excel row 1 = the timeline header
+            f'<th style="{_TH_PERIOD}"></th>'     # label column
+            f"{period_cells}</tr>"
+        )
 
     body = ""
     has_formula = False
@@ -974,9 +1089,21 @@ def _render_mv_table(
                 sec_pos = section_header_rows.get(sec_id)
                 if sec_pos:
                     sec_row_label = str(sec_pos[0])
+            # Section band: the resolved view's ``band_styles[role]`` under the
+            # MV's own excel_props (explicit props win) — same role rule the
+            # writer uses (a fill marks a ``section``, else ``subsection``).
+            own = getattr(var, "_excel_props", None) or {}
+            role = "section" if own.get("bg") else "subsection"
+            try:
+                from ..compile.excel.view import resolve_excel_view
+                bands = resolve_excel_view(var).band_styles or {}
+            except Exception:
+                bands = {}
+            band_css = _props_css({**bands.get(role, {}), **own})
+            sec_style = f"{_SECTION};{band_css}" if band_css else _SECTION
             body += (
                 f'<tr><th style="{_TH_ROW}">{sec_row_label}</th>'
-                f'<th style="{_SECTION}" colspan="{max_cols + 1}">'
+                f'<th style="{sec_style}" colspan="{max_cols + 1}">'
                 f"{html.escape(str(label))}</th></tr>"
             )
             continue
@@ -990,10 +1117,14 @@ def _render_mv_table(
                 cells += f'<td style="{_TD_NUM}"></td>'
         row_num = _var_row(var, ctx)
         row_label = str(row_num) if row_num else ""
+        # The label cell carries the Variable's own props (bold / bg / colour),
+        # matching the Excel writer styling the whole row as one unit.
+        label_css = _props_css(getattr(var, "_excel_props", None) or {})
+        label_style = f"{_TH_LABEL};{label_css}" if label_css else _TH_LABEL
         body += (
             f'<tr>'
             f'<th style="{_TH_ROW}">{row_label}</th>'
-            f'<th style="{_TH_LABEL}">{html.escape(str(label))}</th>'
+            f'<th style="{label_style}">{html.escape(str(label))}</th>'
             f"{cells}</tr>"
         )
 

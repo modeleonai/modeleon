@@ -39,10 +39,89 @@ class TestDates:
         dates = mo.Variable([date(2025, 1, 1), date(2026, 1, 1), date(2027, 1, 1)])
         assert mo.YEAR(dates)._value == [2025, 2026, 2027]
 
+    def test_date_construct(self):
+        assert mo.DATE(2025, 4, 15)._value == date(2025, 4, 15)
+
+    def test_date_month_overflow_rolls_year(self):
+        # the common DATE(YEAR, MONTH+3, DAY) quarter-step past December
+        assert mo.DATE(2025, 15, 10)._value == date(2026, 3, 10)
+
+    def test_date_from_variables(self):
+        d = mo.Variable(date(2025, 10, 20))
+        assert mo.DATE(mo.YEAR(d), mo.MONTH(d), mo.DAY(d))._value == date(2025, 10, 20)
+
+    def test_date_list_elementwise(self):
+        years = mo.Variable([2025, 2026])
+        assert mo.DATE(years, 1, 1)._value == [date(2025, 1, 1), date(2026, 1, 1)]
+
+    def test_days360_european_quarter(self):
+        assert mo.DAYS360(date(2025, 1, 1), date(2025, 4, 1), True)._value == 90
+
+    def test_days360_european_full_year(self):
+        assert mo.DAYS360(date(2025, 1, 1), date(2026, 1, 1), True)._value == 360
+
+    def test_days360_european_day31_becomes_30(self):
+        # 31 Jan -> 30 Apr on the European basis: both day-31s clamp to 30
+        assert mo.DAYS360(date(2025, 1, 31), date(2025, 3, 31), True)._value == 60
+
+    def test_days360_us_default_method(self):
+        assert mo.DAYS360(date(2025, 1, 31), date(2025, 2, 28))._value == 28
+
+    def test_days360_list_elementwise(self):
+        starts = mo.Variable([date(2025, 1, 1), date(2025, 4, 1)])
+        ends = mo.Variable([date(2025, 4, 1), date(2025, 7, 1)])
+        assert mo.DAYS360(starts, ends, True)._value == [90, 90]
+
+
+class TestLogical:
+    def test_and_scalar(self):
+        assert mo.AND(mo.Variable(5) > 3, mo.Variable(2) < 10)._value is True
+        assert mo.AND(mo.Variable(1) > 3, mo.Variable(2) < 10)._value is False
+
+    def test_or_scalar(self):
+        assert mo.OR(mo.Variable(1) > 3, mo.Variable(2) < 10)._value is True
+
+    def test_not_scalar(self):
+        assert mo.NOT(mo.Variable(5) > 3)._value is False
+
+    def test_and_elementwise(self):
+        x = mo.Variable([1, 5, 9, 12])
+        assert mo.AND(x > 3, x < 11)._value == [False, True, True, False]
+
+    def test_choose_scalar(self):
+        assert mo.CHOOSE(2, 'base', 'bull', 'bear')._value == 'bull'
+
+    def test_choose_out_of_range(self):
+        assert mo.CHOOSE(9, 'a', 'b')._value == '#VALUE!'
+
+    def test_choose_elementwise_phase_switch(self):
+        flag = mo.Variable([0, 0, 1, 1])
+        assert mo.CHOOSE(flag + 1, 'Ф', 'П')._value == ['Ф', 'Ф', 'П', 'П']
+
+    def test_logical_render_to_excel(self, tmp_path):
+        import openpyxl
+        model = mo.Model('Logic')
+        model.x = mo.Variable([1, 5, 9], display_name='X')
+        model.ok = mo.AND(model.x > 3, model.x < 11)
+        model.ok._display_name = 'Ok'
+        out = tmp_path / 'logic.xlsx'
+        model.to_excel(str(out))
+        ws = openpyxl.load_workbook(str(out)).active
+        formulas = [c.value for row in ws.iter_rows() for c in row
+                    if isinstance(c.value, str) and c.value.startswith('=')]
+        assert any(f.startswith('=AND(') for f in formulas), formulas
+
 
 class TestText:
     def test_len(self):
         assert mo.LEN(mo.Variable('hello'))._value == 5
+
+    def test_concat_elementwise_period_label(self):
+        quarter = mo.Variable([1, 2, 3])
+        year = mo.Variable([2022, 2022, 2022])
+        phase = mo.Variable(['Ф', 'Ф', 'П'])
+        label = mo.CONCAT(quarter, 'Q ', year, ' ', phase)
+        assert label._value == ['1Q 2022 Ф', '2Q 2022 Ф', '3Q 2022 П']
 
     def test_upper(self):
         assert mo.UPPER(mo.Variable('hello'))._value == 'HELLO'
@@ -108,3 +187,64 @@ class TestExcelOutput:
 
         model.to_excel(str(tmp_path / 'demo.xlsx'))
         assert (tmp_path / 'demo.xlsx').exists()
+
+    def test_concat_renders_as_ampersand_not_concat_function(self, tmp_path):
+        """CONCAT must emit the ``&`` operator, never the ``CONCAT()``
+        function — CONCAT is an Excel-2016 future function that needs an
+        ``_xlfn.`` prefix and otherwise shows as ``@CONCAT`` / ``#NAME?``."""
+        import openpyxl
+
+        model = mo.Model('Label')
+        model.q = mo.Variable([1, 2], display_name='Q')
+        model.y = mo.Variable([2022, 2022], display_name='Y')
+        model.label = mo.CONCAT(model.q, 'Q ', model.y)
+        model.label._display_name = 'Label'
+        out = tmp_path / 'label.xlsx'
+        model.to_excel(str(out))
+
+        ws = openpyxl.load_workbook(str(out)).active
+        formulas = [c.value for row in ws.iter_rows() for c in row
+                    if isinstance(c.value, str) and c.value.startswith('=')]
+        label_formulas = [f for f in formulas if '&' in f]
+        assert label_formulas, formulas
+        assert not any('CONCAT' in f for f in formulas), formulas
+
+    def test_date_literal_in_formula_renders_as_date_function(self, tmp_path):
+        """A date literal embedded in a formula must emit ``=DATE(y, m, d)``
+        — a bare ``2025-01-01`` would be read by Excel as ``2025 - 1 - 1``.
+        The recurrence start at period 0 is such an embedded literal."""
+        import openpyxl
+
+        model = mo.Model('Dates')
+        model.date = mo.recurrence(date(2025, 1, 1), 'EDATE(prev, 3)', periods=3,
+                                   display_name='Date')
+        out = tmp_path / 'dates.xlsx'
+        model.to_excel(str(out))
+
+        ws = openpyxl.load_workbook(str(out)).active
+        formulas = [c.value for row in ws.iter_rows() for c in row
+                    if isinstance(c.value, str) and c.value.startswith('=')]
+        assert any('DATE(2025, 1, 1)' in f for f in formulas), formulas
+
+    def test_days360_schedule_renders_back_references(self, tmp_path):
+        """DAYS360 over a shifted date axis emits previous-cell references,
+        and the shift fill value keeps its date type (=DATE(...), not text)."""
+        import openpyxl
+
+        model = mo.Model('Sched')
+        model.date = mo.recurrence(date(2025, 1, 1), 'EDATE(prev, 3)', periods=4,
+                                   display_name='Date')
+        model.days = mo.DAYS360(model.date.shift(1, fill_value=date(2025, 1, 1)),
+                                model.date, True)
+        model.days._display_name = 'Days'
+        out = tmp_path / 'sched.xlsx'
+        model.to_excel(str(out))
+
+        ws = openpyxl.load_workbook(str(out)).active
+        formulas = [c.value for row in ws.iter_rows() for c in row
+                    if isinstance(c.value, str) and c.value.startswith('=')]
+        # day-count formulas reference prior period cells, never textual junk
+        days_cells = [f for f in formulas if 'DAYS360' in f]
+        assert days_cells
+        assert all('"' not in f for f in days_cells), days_cells  # no quoted-text dates
+        assert any('DATE(2025, 1, 1)' in f for f in days_cells)   # fill kept its type

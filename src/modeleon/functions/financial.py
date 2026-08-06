@@ -71,8 +71,13 @@ def _formula_arg(value) -> "Literal | VarRef":
 
 
 def _npv(rate: float, cash_flows: np.ndarray) -> float:
-    """NPV of a cash-flow series at a flat per-period rate."""
-    periods = np.arange(len(cash_flows))
+    """NPV of a cash-flow series at a flat per-period rate.
+
+    Matches Excel's ``NPV`` convention: the first cash flow is at the
+    *end of period 1*, not at time 0. To value a time-0 cash flow,
+    keep it outside the call: ``cf0 + NPV(rate, future_flows)``.
+    """
+    periods = np.arange(1, len(cash_flows) + 1)
     return float(np.sum(cash_flows / ((1 + rate) ** periods)))
 
 
@@ -155,11 +160,17 @@ def NPV(
 ) -> Variable:
     """Net Present Value — renders ``=NPV(rate, cash_flows_range)``.
 
+    Follows Excel's convention: the first value in ``cash_flows`` is
+    discounted as if it occurs at the *end of period 1*. The initial
+    (time-0) outlay must stay outside the call.
+
     Example::
 
-        r = mo.Variable(0.10)
-        cf = mo.Variable([-100_000, 30_000, 40_000, 50_000])
-        project_npv = mo.NPV(r, cf)    # Excel: =NPV(B1, B2:E2)
+        r        = mo.Variable(0.10)
+        initial  = mo.Variable(-100_000)                   # at t=0
+        future   = mo.Variable([30_000, 40_000, 50_000])   # t=1, 2, 3
+        project_npv = initial + mo.NPV(r, future)
+        # Excel: =B1 + NPV(B2, C3:E3)
     """
     rate_value = val(rate)
     cf_values = _extract_cashflow_values(cash_flows)

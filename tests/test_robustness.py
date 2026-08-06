@@ -74,16 +74,22 @@ class TestCycleDetection:
 
 
 class TestVariableInputValidation:
-    def test_typo_in_kwarg_raises(self):
-        with pytest.raises(TypeError, match="nme"):
-            mo.Variable(100, nme="Revenue")  # 'nme' is a typo for 'name'
+    def test_typo_in_kwarg_raises_at_adoption(self):
+        """Track names are user content (§16.2), so an unknown kwarg is
+        stashed as a potential track and dies at ADOPTION — the first
+        moment the model's declaration is reachable — naming the kwarg."""
+        m = mo.Model('m')
+        with pytest.raises(ValueError, match="nme"):
+            m.x = mo.Variable(100, nme="Revenue")  # typo for 'display_name'
 
-    def test_error_message_lists_known_kwargs(self):
-        with pytest.raises(TypeError) as excinfo:
-            mo.Variable(100, typo_here=True)
+    def test_error_message_covers_track_and_typo(self):
+        m = mo.Model('m')
+        with pytest.raises(ValueError) as excinfo:
+            m.x = mo.Variable(100, typo_here=True)
         msg = str(excinfo.value)
         assert "typo_here" in msg
-        assert "name" in msg or "value_type" in msg  # Lists known kwargs
+        assert "mo.Tracks" in msg   # the declare-it-as-a-track fix-it
+        assert "value" in msg       # the known-kwargs fix-it
 
     def test_excel_props_accepted(self):
         v = mo.Variable(100, excel_props={'bold': True, 'number_format': '#,##0'})

@@ -50,7 +50,9 @@ class Model(MultiVariable):
         self,
         name: str,
         display_name: Optional[str] = None,
+        description: Optional[str] = None,
         excel_props: Optional[Dict[str, Any]] = None,
+        excel_layout: Optional[Any] = None,
         **components: Any,
     ):
         if not isinstance(name, str) or not name:
@@ -60,9 +62,17 @@ class Model(MultiVariable):
             )
         super().__init__(
             display_name=display_name or humanize_identifier(name),
+            description=description,
             excel_props=excel_props,
+            excel_layout=excel_layout,
             **components,
         )
         # Crystallize the root path. Adoption then derives every
         # descendant's path from this rooted prefix.
         self._python_name = name
+
+    @classmethod
+    def to_new_source(cls, name: str) -> str:
+        """A new Model takes its name positionally — see
+        :meth:`MultiVariableBase.to_new_source`."""
+        return f"mo.Model({name!r})"

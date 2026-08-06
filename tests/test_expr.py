@@ -83,6 +83,31 @@ class TestVarRef:
             return VarRef(vs[0]).to_string()
         assert build() == "revenue"
 
+    def test_anonymous_intermediate_inlines_expression(self):
+        """When a VarRef points at an operator-built intermediate
+        Variable (one that has its own ``_expr`` but was never adopted
+        into a tree), the renderer should inline the inner expression
+        rather than emit the intermediate's floating ``path.leaf``.
+
+        Without this, chains like ``(a * b) / c`` show up as
+        ``vffff7ab483b0 / c`` in the rendered formula — opaque and
+        debug-hostile.
+        """
+        a = mo.Variable(10)
+        a._python_name = "a"
+        b = mo.Variable(20)
+        b._python_name = "b"
+        # ``a * b`` builds an anonymous intermediate with its own
+        # ``_expr``. Wrapping that in another op (``/ 30``) creates
+        # the outer Variable whose ``_expr`` is ``BinOp(div, VarRef(intermediate), Literal(30))``.
+        chained = (a * b) / 30
+        rendered = chained._expr.to_string()
+        assert "a * b" in rendered
+        assert "/ 30" in rendered
+        # No floating ``vXXX`` leakage.
+        assert "__floating__" not in rendered
+        assert "v" + "0" not in rendered  # rough sanity
+
 
 # ─── Arithmetic ────────────────────────────────────────────────
 

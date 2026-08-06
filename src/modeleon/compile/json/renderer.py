@@ -31,6 +31,7 @@ from ...core.expr import (
     Literal,
     MethodCall,
     Paren,
+    Regrain,
     RollingAggregate,
     SelfRef,
     Subscript,
@@ -163,6 +164,14 @@ class JsonRenderer:
             "func": node.func,
             "window": node.window,
             "fill": node.fill,
+        }
+
+    def render_regrain(self, node: Regrain, ctx: RenderCtx) -> Dict[str, Any]:
+        return {
+            "kind": "regrain",
+            "source": self.walker.render(node.source, ctx),
+            "recipe": node.recipe,
+            "buckets": list(node.buckets),
         }
 
 

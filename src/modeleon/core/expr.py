@@ -88,14 +88,24 @@ class VarRef(Expr):
     def to_string(self) -> str:
         # Prefer python_name (set by ``parent.child = ...``). For unattached
         # Variables with an explicit display_name, snake-case the label so
-        # formulas read ``revenue * 0.6`` instead of ``v3 * 0.6``. Last
-        # resort: the auto id from ``path.leaf``.
+        # formulas read ``revenue * 0.6`` instead of ``v3 * 0.6``.
         if self.var.python_name:
             return self.var.python_name
         explicit_label = getattr(self.var, '_display_name', None)
         if explicit_label:
             from .humanize import identifier_from_label
             return identifier_from_label(explicit_label)
+        # Anonymous intermediate (Variable produced by operator overloading
+        # — ``a * b`` between adopted Variables creates one that has its own
+        # ``_expr`` but never gets a ``python_name``). Emitting its floating
+        # ``path.leaf`` here would surface as ``vffff7ab483b0`` in rendered
+        # formulas. Inline the expression instead so chains like
+        # ``(revenue * cogs_pct) * units`` render as their composite
+        # algebra rather than an opaque floating id. Wrap in parens for
+        # precedence safety — the inlined expression may itself be a BinOp.
+        inner_expr = getattr(self.var, '_expr', None)
+        if inner_expr is not None:
+            return f"({inner_expr.to_string()})"
         return self.var.path.leaf
 
     def iter_refs(self) -> Iterator["Variable"]:
@@ -351,6 +361,56 @@ class RollingAggregate(Expr):
     def to_string(self) -> str:
         label = self.source.python_name or self.source.path.leaf
         return f"{label}.rolling_{self.func.lower()}({self.window})"
+
+    def iter_refs(self) -> Iterator["Variable"]:
+        yield self.source
+
+
+# ─── Re-grain (coarser-grain projection of a source) ───────────────
+
+
+@dataclass
+class Restrict(Expr):
+    """Drop-one-axis coordinate restrict — ``var.at(track='actual')``.
+
+    The canonical slice of a Variable with tracks (§17.2): one coordinate of
+    one quantity, as its own auditable node. ``axis`` is the axis name
+    ('tracks' — v1's only finite axis); ``label`` is the ROLE (the
+    machine key). Renderers without a native lowering fall back to the inlined
+    track value; the Excel lowering (a reference into the coordinate's
+    laid-out row) arrives with the P3 surface work.
+    """
+
+    base: Expr
+    label: str
+    axis: str = 'tracks'
+
+    def to_string(self) -> str:
+        return f"{self.base.to_string()}.at({self.axis}={self.label!r})"
+
+    def iter_refs(self) -> Iterator["Variable"]:
+        yield from self.base.iter_refs()
+
+
+@dataclass
+class Regrain(Expr):
+    """Per-bucket re-grain of a source Variable onto a coarser grain.
+
+    At target period ``i``, emits a reducer over the source's native cells in
+    bucket ``i`` — ``=SUM(source[lo]:source[hi-1])`` for a flow, the period-end
+    cell for a stock, etc. The source's native cells must be laid out for the
+    reference to resolve; if the source has no address in the workbook the
+    renderer falls back to the inlined value (``fill_values[i]``).
+    """
+
+    source: "Variable"
+    buckets: List[Any]      # list of (lo, hi) half-open native-index ranges
+    recipe: str             # 'sum' | 'mean' | 'first' | 'last' | 'min' | 'max' | ...
+    fill_values: List[Any]  # eager re-grained values, used when source has no address
+
+    def to_string(self) -> str:
+        label = self.source.python_name or self.source.path.leaf
+        return f"{label}.regrain({self.recipe})"
 
     def iter_refs(self) -> Iterator["Variable"]:
         yield self.source

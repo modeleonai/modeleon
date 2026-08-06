@@ -234,3 +234,44 @@ class TestDependenciesAsProperty:
         b = Variable(2)
         a._dependency_refs.append(b)
         assert a.dependencies == {b.id}
+
+
+class TestToNewSource:
+    """``to_new_source`` — the class describes how a NEW, empty instance
+    is spelled in source (the source sibling of ``__repr__``)."""
+
+    def test_variable_spelling_ignores_name(self):
+        # The name binds on the LHS; a fresh variable is the zero scalar.
+        assert Variable.to_new_source("growth") == "mo.Variable(0)"
+
+    def test_spelling_parses_back_to_a_variable(self):
+        import modeleon as mo
+        v = eval(Variable.to_new_source("x"), {"mo": mo})
+        assert isinstance(v, Variable)
+        assert v.value == 0
+
+
+class TestVariableTruthiness:
+    """Python-mode branching works on the eager value; list truthiness
+    refuses (pandas-style). The pre-__bool__ behavior fell back to
+    __len__ == 1 — every ``if var:`` branch ran regardless of value."""
+
+    def test_comparison_branches_on_value(self):
+        v = Variable(200)
+        assert bool(v > 300) is False   # was silently True (the bug)
+        assert bool(v > 100) is True
+
+    def test_scalar_truthiness_from_value(self):
+        assert bool(Variable(0)) is False
+        assert bool(Variable(5)) is True
+        assert bool(Variable("")) is False
+
+    def test_list_variable_raises_ambiguous(self):
+        years = Variable([2025, 2026, 2027], var_type="list")
+        with pytest.raises(ValueError, match="ambiguous"):
+            bool(years)
+
+    def test_len_still_works(self):
+        years = Variable([2025, 2026, 2027], var_type="list")
+        assert len(years) == 3
+        assert len(Variable(5)) == 1

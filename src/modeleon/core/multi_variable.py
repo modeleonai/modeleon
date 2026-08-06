@@ -53,6 +53,7 @@ Split across three mixin modules:
 """
 
 from typing import Dict, List, Optional, Any, TYPE_CHECKING
+import contextvars
 import inspect
 
 # Re-exported so code that imports these from modeleon.multi_variable keeps working.
@@ -63,6 +64,14 @@ from .qpath import QPath
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+# Scopes ``MultiVariableClass.__shell__`` construction: while set, a
+# subclass ``compute()`` is not invoked by ``__init__``. A ContextVar
+# (not a plain module flag) so suppression can't leak across threads
+# or into constructors evaluated in argument position.
+_SUPPRESS_COMPUTE: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "mvclass_suppress_compute", default=False
+)
 
 
 
@@ -92,12 +101,17 @@ class MultiVariableBase(_MVLifecycle, _MVInspect, Component):
         'bg', 'border_top', 'border_bottom', 'border_left', 'border_right',
         # Data formatting
         'number_format',
+        # Cell-type colouring — cascades to descendants. ``True`` for the
+        # default palette, or a dict ``{'input'|'formula'|'reference': hex}``.
+        'format_by_type',
     })
 
     def __init__(
         self,
         display_name: Optional[str] = None,
         excel_props: Optional[Dict[str, Any]] = None,
+        excel_layout: Optional[Any] = None,
+        description: Optional[str] = None,
         **kwargs: Any,
     ):
         """
@@ -111,19 +125,29 @@ class MultiVariableBase(_MVLifecycle, _MVInspect, Component):
                    ``'row'`` / ``'col'`` (explicit placement), plus
                    styling (``'bold'``, ``'bg'``, ``'number_format'``, …
                    see :attr:`_EXCEL_PROP_KEYS`). Unknown keys raise.
+            excel_layout: Optional opaque layout-config object. The
+                   engine stores it as ``self._excel_layout`` and does
+                   nothing else with it; the writer / pro layer reads
+                   it back. Designed for pro's ``ExcelLayout`` dataclass
+                   (template name + sheet/address/format overrides) but
+                   engine stays duck-typed — anything that round-trips
+                   through ``repr()`` is fine. ``None`` means inherit
+                   from parent at render time. See
+                   ``modeleon_pro.excel_layout`` for the dataclass shape.
 
-        ``MultiVariableBase`` itself accepts only ``display_name`` and
-        ``excel_props``. The :class:`MultiVariable` subclass is what
-        users instantiate; it absorbs Variable / MV-typed kwargs as
-        components and forwards the rest here. Anything that lands in
-        ``kwargs`` at this layer is a typo and raises ``TypeError`` —
-        mirrors :class:`Variable`'s strict-kwarg discipline.
+        ``MultiVariableBase`` itself accepts only ``display_name``,
+        ``excel_props``, and ``excel_layout``. The :class:`MultiVariable`
+        subclass is what users instantiate; it absorbs Variable / MV-
+        typed kwargs as components and forwards the rest here. Anything
+        that lands in ``kwargs`` at this layer is a typo and raises
+        ``TypeError`` — mirrors :class:`Variable`'s strict-kwarg
+        discipline.
         """
         if kwargs:
             raise TypeError(
                 f"{type(self).__name__}() got unexpected keyword argument(s): "
                 f"{', '.join(sorted(kwargs))}. "
-                f"Known kwargs: display_name, excel_props. "
+                f"Known kwargs: display_name, description, excel_props, excel_layout. "
                 f"For component children, assign attributes "
                 f"(``mv.revenue = mo.Variable(...)``) or use the factory form "
                 f"(``MultiVariable(revenue=mo.Variable(...))``). "
@@ -137,11 +161,27 @@ class MultiVariableBase(_MVLifecycle, _MVInspect, Component):
         # excel_props dict is validated against ``_EXCEL_PROP_KEYS`` there.
         # Adoption (``parent.child = mv`` → ``_register_component``) is
         # what later sets ``_python_name``.
-        super().__init__(display_name=display_name, excel_props=excel_props)
+        super().__init__(
+            display_name=display_name,
+            excel_props=excel_props,
+            description=description,
+        )
 
-        # Component storage (Variables and nested MultiVariables)
-        self._components: Dict[str, Any] = {}
-        self._component_order: List[str] = []
+        # Opaque layout-config attribute. Pro reads this back via the
+        # writer; engine never inspects its shape. ``None`` is the
+        # inherit-from-parent signal in pro's resolution walker.
+        self._excel_layout = excel_layout
+
+        # Component name registry. Components themselves (Variables and
+        # nested MultiVariables) live in ``self.__dict__`` directly so
+        # they're accessible via normal Python attribute lookup AND
+        # via ``self.__dict__`` (which a future synthetic-module
+        # rendering path can exec into). ``_component_names`` is an
+        # explicit list of which ``__dict__`` keys are components —
+        # disambiguating from private state attrs (``_parent``,
+        # ``_qualified_id``, etc.) and from Variable IDs whose binding
+        # names start with underscore (floating qpaths).
+        self._component_names: List[str] = []
 
         # Layout role is a derived internal marker. Users set
         # ``excel_props={'tab': True}`` to mark an Excel tab; the writer
@@ -155,6 +195,83 @@ class MultiVariableBase(_MVLifecycle, _MVInspect, Component):
         self._parent: Optional['MultiVariableBase'] = None
         self._name_in_parent: Optional[str] = None
 
+    def _set_default_window(
+        self,
+        default_grain: Optional[str] = None,
+        default_start: Optional[str] = None,
+        default_periods: Optional[Any] = None,
+    ) -> None:
+        """Validate and set the ambient time window (``default_grain`` /
+        ``default_start`` / ``default_periods``) declared in a constructor.
+
+        The window is where a model's time lives: list-valued lines inherit
+        their native ``(start, grain)`` from the nearest ancestor window
+        (``Variable.time``), and the Excel/spreadsheet timeline header is
+        derived from it (``resolve_default_window``). Plain attribute
+        assignment (``m.default_grain = 'month'``) remains valid and
+        unvalidated; this constructor path fails loudly on a bad window.
+        """
+        from .time import GRAINS, _parse
+        if default_grain is None:
+            given = 'default_start' if default_start is not None else 'default_periods'
+            raise ValueError(
+                f"{given}= needs default_grain= beside it — the window's grain "
+                f"is what anchors the start label and the period count "
+                f"(e.g. default_grain='month', default_start='2026-01', "
+                f"default_periods=24)."
+            )
+        if default_grain not in GRAINS:
+            raise ValueError(
+                f"Unknown default_grain {default_grain!r}; supported: "
+                f"{', '.join(GRAINS)}."
+            )
+        if default_start is not None:
+            _parse(default_start, default_grain)     # raises with the format hint
+        if default_periods is not None:
+            if isinstance(default_periods, bool) or not isinstance(default_periods, int):
+                raise TypeError(
+                    f"default_periods must be an int; got "
+                    f"{type(default_periods).__name__}."
+                )
+            if default_periods <= 0:
+                raise ValueError(
+                    f"default_periods must be positive; got {default_periods}."
+                )
+        self.default_grain = default_grain
+        if default_start is not None:
+            self.default_start = default_start
+        if default_periods is not None:
+            self.default_periods = default_periods
+
+    @property
+    def _components(self) -> Dict[str, Any]:
+        """Dict view of components — derived from ``__dict__`` indexed
+        by ``_component_names``. Read returns a fresh dict snapshot."""
+        return {k: self.__dict__[k] for k in self._component_names if k in self.__dict__}
+
+    @_components.setter
+    def _components(self, mapping: Dict[str, Any]) -> None:
+        """Bulk-replace components. Used by virtual-MV rendering paths.
+        Wipes the old set (removes from ``__dict__`` and clears
+        ``_component_names``), installs the new ones."""
+        current = list(self.__dict__.get('_component_names', []))
+        for name in current:
+            self.__dict__.pop(name, None)
+        self.__dict__['_component_names'] = list(mapping.keys())
+        for name, value in mapping.items():
+            self.__dict__[name] = value
+
+    @property
+    def _component_order(self) -> List[str]:
+        """Insertion-ordered component names."""
+        return list(self._component_names)
+
+    @_component_order.setter
+    def _component_order(self, order: List[str]) -> None:
+        """Replace the component name order. Components themselves stay
+        in ``__dict__``; only the order list is updated."""
+        self.__dict__['_component_names'] = list(order)
+
     @property
     def _is_sheet(self) -> bool:
         """Whether this MultiVariable is an Excel tab.
@@ -163,7 +280,7 @@ class MultiVariableBase(_MVLifecycle, _MVInspect, Component):
         :class:`MultiVariable` to create a tab.
         """
         return self._role == 'sheet'
-    
+
     # Context-manager lifecycle (start, end, __enter__, __exit__) and
     # component adoption (_register_component, _clone) live on
     # :class:`_MVLifecycle` in ``mv_context.py``. MultiVariableBase
@@ -179,14 +296,25 @@ class MultiVariableBase(_MVLifecycle, _MVInspect, Component):
         from ..compile.excel.writer import to_excel as _to_excel
         _to_excel(path, root=self)
 
+    def at(self, grain: str) -> 'MultiVariableBase':
+        """The model re-grained (projected) onto a coarser ``grain``. Every line
+        re-grains by its own rule (apply-own-rule), and **formulas without a rule
+        recompute over their re-grained inputs** (correct for additive / ratio
+        formulas — only multiplicative flows need an explicit ``sum``). Returns a
+        new ``MultiVariable`` of re-grained values, ready to inspect or
+        ``.to_excel``.
+        """
+        from .projection import project_model
+        return project_model(self, grain)
+
     def __getattr__(self, name: str):
-        """Access component (Variable or nested MultiVariable) by attribute name."""
+        """Component access fallback.
+
+        Components live in ``self.__dict__``, so normal Python attribute
+        lookup finds them. ``__getattr__`` only runs for missing names.
+        """
         if name.startswith('_'):
             raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
-
-        if '_components' in self.__dict__ and name in self._components:
-            return self._components[name]
-
         raise AttributeError(f"'{type(self).__name__}' has no component '{name}'")
 
     def __setattr__(self, name: str, value: Any) -> None:
@@ -203,15 +331,19 @@ class MultiVariableBase(_MVLifecycle, _MVInspect, Component):
         from .variable import Variable
         if (
             not name.startswith('_')
-            and '_components' in self.__dict__
+            # ``default_excel_view`` is a presentation POINTER slot, not content.
+            # Its value is an ``ExcelView`` (itself a MultiVariable), but it must
+            # never join ``_components`` or it would render as a spurious tab.
+            and name != 'default_excel_view'
+            and '_component_names' in self.__dict__
             and (isinstance(value, Variable) or isinstance(value, MultiVariableBase))
         ):
             self._register_component(name, value)
             # ``_register_component`` may have substituted ``value`` with
             # a clone (cross-parent adoption). Use the registered version
             # so the attribute slot holds the same instance as
-            # ``self._components[name]``.
-            value = self._components.get(name, value)
+            # ``self.__dict__[name]``.
+            value = self.__dict__.get(name, value)
         super().__setattr__(name, value)
     
     # ``python_name`` property + setter are inherited from :class:`Base`.
@@ -273,6 +405,57 @@ class MultiVariableBase(_MVLifecycle, _MVInspect, Component):
         # the property + setter pair sits on the concrete class with the
         # custom getter above.
         self._display_name = value
+
+    @classmethod
+    def to_new_source(cls, name: str) -> str:
+        """Source form of a NEW, empty instance bound to ``name`` —
+        the class describes its own constructor spelling (the source
+        sibling of ``__repr__``). Subclasses whose constructor takes
+        the name positionally override (e.g. :class:`Model`).
+        """
+        return "mo.MultiVariable()"
+
+    def add(self, name: str, component: "Component") -> "Component":
+        """Adopt ``component`` as a named child under a runtime string
+        ``name`` — the dynamic-name form of ``mv.<name> = component``.
+
+        Equivalent to attribute assignment (routes through the same
+        ``__setattr__`` → ``_register_component`` adoption), but lets the
+        child name be computed at runtime — the one thing ``mv.attr =``
+        can't express. Returns the adopted instance, which may be a
+        clone when ``component`` was already parented elsewhere
+        (clone-on-ownership-change). Re-using an existing ``name``
+        orphans the previous child (with a ``ModelStructureWarning``),
+        so callers adding in a loop must compute unique names.
+        """
+        if not isinstance(name, str) or not name or name.startswith("_"):
+            raise ValueError(
+                "mv.add(name, ...) requires a non-empty public identifier "
+                f"(no leading underscore). Got {name!r}."
+            )
+        from .variable import Variable
+        if not isinstance(component, (Variable, MultiVariableBase)):
+            raise TypeError(
+                "mv.add adopts Variables / MultiVariables only. Got "
+                f"{type(component).__name__}."
+            )
+        setattr(self, name, component)
+        return self.__dict__.get(name, component)
+
+    def remove(self, name: str) -> "Component":
+        """Detach and unregister the child component named ``name`` — the
+        inverse of :meth:`add` / attribute assignment.
+
+        Clears the child's parent/owner links and drops it from this
+        MV's components, returning the detached instance. Raises
+        :class:`KeyError` if there is no such component.
+        """
+        if not isinstance(name, str) or name not in self._components:
+            raise KeyError(
+                f"{name!r} is not a component of this "
+                f"{type(self).__name__}."
+            )
+        return self._detach_component(name)
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}({self.id}, components={len(self._components)})"
@@ -345,8 +528,13 @@ class MultiVariableClass(MultiVariableBase):
         # ``churn_rate=0.05``) for ``compute()`` or attribute storage.
         display_name = kwargs.pop('display_name', None)
         excel_props = kwargs.pop('excel_props', None)
+        excel_layout = kwargs.pop('excel_layout', None)
 
-        super().__init__(display_name=display_name, excel_props=excel_props)
+        super().__init__(
+            display_name=display_name,
+            excel_props=excel_props,
+            excel_layout=excel_layout,
+        )
 
         self._input_variables: Dict[str, 'Variable'] = {}
 
@@ -356,22 +544,67 @@ class MultiVariableClass(MultiVariableBase):
             if isinstance(value, Variable):
                 self._input_variables[key] = value
 
-        # If compute() is overridden by subclass, call it with resolved params
-        if type(self).compute is not MultiVariableClass.compute:
+        # If compute() is overridden by subclass, call it with resolved
+        # params — unless a ``__shell__`` construction asked for the
+        # container empty (children to be populated explicitly).
+        self._compute_suppressed = _SUPPRESS_COMPUTE.get()
+        if (
+            type(self).compute is not MultiVariableClass.compute
+            and not self._compute_suppressed
+        ):
             self._call_compute()
+
+    @classmethod
+    def __shell__(cls, **kwargs):
+        """Construct an instance WITHOUT invoking ``compute()``.
+
+        Returns a real instance of ``cls`` — ``isinstance`` checks,
+        methods, properties, and the MRO all behave normally — but the
+        container starts empty: constructor kwargs are stored exactly
+        as in normal construction (attributes + ``_input_variables``),
+        and children are expected to be assigned explicitly afterwards.
+
+        For tooling that re-creates a previously computed container
+        from its recorded statements (deserialization, code
+        generation) without running the template body a second time::
+
+            u = CohortUnit.__shell__(start_users=500)
+            u.users = ...      # children populated by the caller
+
+        Suppression is scoped by a :class:`~contextvars.ContextVar`,
+        so classes constructed in argument position (``__shell__(sub=
+        Other(...))``) still compute normally.
+        """
+        token = _SUPPRESS_COMPUTE.set(True)
+        try:
+            return cls(**kwargs)
+        finally:
+            _SUPPRESS_COMPUTE.reset(token)
     
     def _call_compute(self) -> None:
         """Introspect compute() signature and call with resolved params.
         For parameters that were originally Variable objects, pass the Variable
-        (not the extracted scalar) so that formula tracking is preserved."""
+        (not the extracted scalar) so that formula tracking is preserved.
+
+        Required parameters (no default) resolve from the constructor
+        kwargs stored by ``__init__`` — ``Unit(seats=100)`` must reach
+        ``compute(self, seats)``. A required parameter with no stored
+        value is left out so ``compute()`` raises its natural TypeError
+        naming the missing argument."""
         sig = inspect.signature(self.compute)
         params = {}
         for k, v in sig.parameters.items():
-            if v.default is not inspect.Parameter.empty:
-                if k in self._input_variables:
-                    params[k] = self._input_variables[k]
-                else:
-                    params[k] = getattr(self, k, v.default)
+            if v.kind in (
+                inspect.Parameter.VAR_POSITIONAL,
+                inspect.Parameter.VAR_KEYWORD,
+            ):
+                continue
+            if k in self._input_variables:
+                params[k] = self._input_variables[k]
+            elif hasattr(self, k):
+                params[k] = getattr(self, k)
+            elif v.default is not inspect.Parameter.empty:
+                params[k] = v.default
         self.compute(**params)
     
     def _extract_value(self, value: Any) -> Any:
@@ -447,6 +680,32 @@ class MultiVariable(MultiVariableBase):
         base_kwargs: Dict[str, Any] = {}
         if "excel_props" in components:
             base_kwargs["excel_props"] = components.pop("excel_props")
+        if "excel_layout" in components:
+            base_kwargs["excel_layout"] = components.pop("excel_layout")
+        if "description" in components:
+            base_kwargs["description"] = components.pop("description")
+
+        # The ambient time window — declared once on a container, inherited
+        # by every list-valued line under it (``Variable.time``) and by the
+        # Excel timeline header (``resolve_default_window``).
+        window_kwargs: Dict[str, Any] = {}
+        for window_key in ("default_grain", "default_start", "default_periods"):
+            if window_key in components:
+                window_kwargs[window_key] = components.pop(window_key)
+
+        # The tracks axis (§16.2) — declared once, inherited ambiently
+        # exactly like the window (``resolve_tracks_decl``). Role-kwarg
+        # Variables (``actual=``/``plan=``) materialize against it at
+        # adoption.
+        tracks_decl = components.pop("tracks", None)
+        if tracks_decl is not None:
+            from .tracks_decl import Tracks
+            if not isinstance(tracks_decl, Tracks):
+                raise TypeError(
+                    f"tracks= takes a mo.Tracks declaration, e.g. "
+                    f"tracks=mo.Tracks('факт', 'бюджет'); got "
+                    f"{type(tracks_decl).__name__}."
+                )
 
         registerable = {}
         other_kwargs = {}
@@ -457,6 +716,27 @@ class MultiVariable(MultiVariableBase):
                 other_kwargs[comp_name] = value
 
         super().__init__(display_name=display_name, **base_kwargs, **other_kwargs)
+
+        if window_kwargs:
+            self._set_default_window(**window_kwargs)
+
+        if tracks_decl is not None:
+            # Plain attribute (Tracks is neither Variable nor MV, so no
+            # component registration) — ``resolve_tracks_decl`` reads it
+            # via getattr on the ancestor walk.
+            self.tracks = tracks_decl
+            if tracks_decl.blend is not None:
+                from .time import resolve_default_window
+                w = resolve_default_window(self)
+                if w is None or w.grain is None or w.start is None \
+                        or w.periods is None:
+                    raise ValueError(
+                        "mo.blend needs the fully declared window beside "
+                        "it — the boundary is a date, so the declaration "
+                        "needs default_grain, default_start and "
+                        "default_periods (otherwise the synthesized "
+                        "track would silently never appear)."
+                    )
 
         for name, comp in registerable.items():
             self._register_component(name, comp)

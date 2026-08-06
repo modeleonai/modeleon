@@ -35,8 +35,18 @@ def _flatten_args(args: tuple, func_name: str) -> tuple[List[Any], list]:
 
     flat: List[Any] = []
     ast_args: list = []
+    from ..core.shape import reject_axised
+    from ..core.tracks import TrackValues
     for a in args:
+        if isinstance(a, Variable) and isinstance(a._value, TrackValues):
+            raise ValueError(
+                f"{func_name}() over a Variable with tracks reduces per "
+                f"coordinate — use the lifted form on ONE operand "
+                f"(handled by the caller), or slice a coordinate first "
+                f"(.at(track='...'))."
+            )
         if isinstance(a, Variable):
+            reject_axised(a, func_name)
             flat.extend(a._value if isinstance(a._value, list) else [a._value])
             ast_args.append(VarRef(a))
         elif isinstance(a, list):
@@ -64,6 +74,24 @@ def _aggregate(func_name: str, args: tuple, value: Any, value_type: str) -> Vari
     )
 
 
+def _lifted_reduce(func_name: str, var: Variable, reducer) -> Variable:
+    """Per-coordinate reduction of ONE Variable with tracks (§15.3.5):
+    ``SUM(выручка)`` → Tracks of per-role totals. The AST stays the
+    ordinary FuncCall; the value lifts."""
+    from ..core.expr import VarRef
+    from ..core.tracks import TrackValues
+    from ._helpers import make_func_var
+    lifted = TrackValues.lift(
+        lambda track: reducer(track) if isinstance(track, list) else track,
+        var._value,
+    )
+    label = getattr(var, "python_name", None) or var.path.leaf
+    return make_func_var(
+        func_name, [VarRef(var)], lifted, 'float', 'scalar',
+        source_code=f"{func_name}({label})",
+    )
+
+
 def SUM(*args: AggOperand) -> Variable:
     """Sum of Variables, scalars, or lists (renders ``=SUM(...)``).
 
@@ -77,6 +105,10 @@ def SUM(*args: AggOperand) -> Variable:
         total = mo.SUM(q1, q2, q3, q4)   # =SUM(q1, q2, q3, q4)
         total = mo.SUM(1, 2, 3)          # =SUM(1, 2, 3), value = 6
     """
+    from ..core.tracks import TrackValues
+    if (len(args) == 1 and isinstance(args[0], Variable)
+            and isinstance(args[0]._value, TrackValues)):
+        return _lifted_reduce("SUM", args[0], builtins.sum)
     flat, _ = _flatten_args(args, "SUM")
     return _aggregate("SUM", args, builtins.sum(flat),
                       _first_variable_value_type(args, 'float'))
@@ -84,6 +116,10 @@ def SUM(*args: AggOperand) -> Variable:
 
 def MAX(*args: AggOperand) -> Variable:
     """Maximum across Variables, scalars, or lists (renders ``=MAX(...)``)."""
+    from ..core.tracks import TrackValues
+    if (len(args) == 1 and isinstance(args[0], Variable)
+            and isinstance(args[0]._value, TrackValues)):
+        return _lifted_reduce("MAX", args[0], builtins.max)
     flat, _ = _flatten_args(args, "MAX")
     return _aggregate("MAX", args, builtins.max(flat),
                       _first_variable_value_type(args, 'float'))
@@ -91,6 +127,10 @@ def MAX(*args: AggOperand) -> Variable:
 
 def MIN(*args: AggOperand) -> Variable:
     """Minimum across Variables, scalars, or lists (renders ``=MIN(...)``)."""
+    from ..core.tracks import TrackValues
+    if (len(args) == 1 and isinstance(args[0], Variable)
+            and isinstance(args[0]._value, TrackValues)):
+        return _lifted_reduce("MIN", args[0], builtins.min)
     flat, _ = _flatten_args(args, "MIN")
     return _aggregate("MIN", args, builtins.min(flat),
                       _first_variable_value_type(args, 'float'))
@@ -98,6 +138,10 @@ def MIN(*args: AggOperand) -> Variable:
 
 def AVERAGE(*args: AggOperand) -> Variable:
     """Mean across Variables, scalars, or lists (renders ``=AVERAGE(...)``)."""
+    from ..core.tracks import TrackValues
+    if (len(args) == 1 and isinstance(args[0], Variable)
+            and isinstance(args[0]._value, TrackValues)):
+        return _lifted_reduce("AVERAGE", args[0], lambda f: builtins.sum(f) / len(f) if f else 0)
     flat, _ = _flatten_args(args, "AVERAGE")
     value = builtins.sum(flat) / len(flat) if flat else 0
     return _aggregate("AVERAGE", args, value, 'float')
