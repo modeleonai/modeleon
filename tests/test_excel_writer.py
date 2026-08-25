@@ -5,6 +5,8 @@ Every test builds an explicit root MultiVariable and calls ``.to_excel()``
 on it. Components attach via ``parent.child = ...`` only.
 """
 
+from pathlib import Path
+
 import pytest
 from openpyxl import load_workbook
 
@@ -883,3 +885,59 @@ class TestSliceEmission:
         grid = self._grid(wb["IS"])
         assert grid["B2"] == "=SUM(Input!B1:M1)"
         assert m.income_statement.h1._value == sum(range(12))
+
+
+class TestChildrenAreSections:
+    """A container can say its children are sections, not tabs.
+
+    The writer's default is one tab per first-depth sub-MV. That is
+    right for a model's chapters and wrong for a list of like records:
+    focusing a roster of twenty-nine people opened twenty-nine tabs.
+
+    ``excel_props={'tab': True}`` cannot express the fix — it says "I am
+    a tab" and leaves every child a tab of its own. The statement needed
+    is about the CHILDREN, so it has its own marker.
+    """
+
+    @staticmethod
+    def _roster(mark: bool) -> mo.MultiVariable:
+        roster = mo.MultiVariable(display_name="Roster")
+        with roster:
+            for i in (1, 2, 3):
+                rec = mo.MultiVariable(display_name=f"Rec{i}")
+                with rec:
+                    rec.pay = mo.Variable(100 * i)
+                setattr(roster, f"r{i}", rec)
+        if mark:
+            roster._children_are_sections = True
+        return roster
+
+    def test_unmarked_container_still_gets_a_tab_per_child(
+        self, tmp_path: Path
+    ) -> None:
+        """The default is untouched — this is what most models want."""
+        out = tmp_path / "plain.xlsx"
+        self._roster(mark=False).to_excel(out)
+        assert load_workbook(out).sheetnames == ["Rec1", "Rec2", "Rec3"]
+
+    def test_marked_container_collapses_to_one_sheet(
+        self, tmp_path: Path
+    ) -> None:
+        out = tmp_path / "flat.xlsx"
+        self._roster(mark=True).to_excel(out)
+        assert load_workbook(out).sheetnames == ["Roster"]
+
+    def test_a_child_that_claims_a_tab_still_gets_one(
+        self, tmp_path: Path
+    ) -> None:
+        """The marker sets the children's DEFAULT; it does not overrule
+        a child that declared otherwise. One landmark record can stand
+        apart while the rest stay a list."""
+        roster = self._roster(mark=True)
+        roster.r2._role = "sheet"
+        out = tmp_path / "mixed.xlsx"
+        roster.to_excel(out)
+        names = load_workbook(out).sheetnames
+        assert "Rec2" in names, names
+        assert "Roster" in names, names
+        assert len(names) == 2, names

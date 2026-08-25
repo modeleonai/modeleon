@@ -32,7 +32,7 @@ from ...core.variable import Variable
 
 #: The authoring groups — the sub-views of an ExcelView.
 _GROUPS = ("orient", "font", "bands", "cell_types", "timeline",
-           "tracks", "grain")
+           "tracks", "grain", "formats", "nesting", "meta")
 
 
 @dataclass(frozen=True)
@@ -52,9 +52,69 @@ class ResolvedView:
     grain: Optional[str] = None
     base_font: Optional[Dict[str, Any]] = None
     band_styles: Optional[Dict[str, Dict[str, Any]]] = None
+    #: Lead metadata columns: ``meta={'article': True, 'unit': True}``
+    #: — the financial-book form where the article number («1.1») and
+    #: the unit («₸») are COLUMNS of their own before the values, not
+    #: text baked into the row label. Article numbers come from each
+    #: row's ``excel_props={'article': '1.1'}``.
+    #: Lead metadata columns. ``True`` = the column renders with no
+    #: header (historical); a STRING renders it and heads it with that
+    #: text — the flag is its own caption, so the wording stays in the
+    #: model and the engine stays language-neutral.
+    meta_article_col: Optional[bool | str] = None
+    meta_unit_col: Optional[bool | str] = None
+    #: The LABEL column's header. Unlike the two above this is not a
+    #: flag — the label column always exists — so only a string means
+    #: anything: it heads the column that carries the row names.
+    meta_label_col: Optional[str] = None
+    #: The CONSTANTS column's header («Значение»). The column itself is
+    #: content-driven — it exists whenever a period-headed sheet also
+    #: carries non-periodic lines — so like the label column this is
+    #: caption-only: a string heads it, absence keeps it headerless.
+    meta_constants_col: Optional[str] = None
+    #: EXTRA lead columns, one per projected field:
+    #: ``meta={'fields': [('description', 'Комментарий')]}`` prints
+    #: each row's ``description`` in a column of its own, headed
+    #: «Комментарий». Same flag-IS-caption rule as the columns above —
+    #: ``True`` instead of a string gives the column no header.
+    #: Declaration order is column order; they sit after the unit
+    #: column and before the values.
+    #:
+    #: A list of PAIRS, not free-standing keys, because a view is a
+    #: real MV tree and a field named ``description`` would collide
+    #: with ``MultiVariable.description`` the moment it became an
+    #: attribute of the meta node.
+    meta_fields: tuple = ()
+    #: Nested-section layout: ``nesting={'gap_rows': 0, 'indent': 2}``
+    #: — blank rows between sections (None = today's single gap) and
+    #: label indent per nesting level (None = no indent). The dense
+    #: financial-book form: children directly under their header,
+    #: hierarchy read from the indent, not from whitespace rows.
+    nesting_gap_rows: Optional[int] = None
+    nesting_indent: Optional[int] = None
+    #: Default number formats by value shape: ``{'number': '#,##0'}``
+    #: applies to numeric value cells that declare no explicit
+    #: ``number_format`` of their own — the financial-book convention
+    #: (thousands separators, red parenthesised negatives) declared
+    #: ONCE and cascaded, never repeated per line.
+    number_formats: Optional[Dict[str, str]] = None
     format_by_type: Any = None
     time_header: Optional[bool] = None
     time_label_format: Optional[str] = None
+    #: Subtotal columns interleaved with the native periods — the book
+    #: form «янв фев мар (1 кв) … (год)». ``timeline={'totals':
+    #: ['quarter', 'year']}``: after each quarter's last month a
+    #: quarter-total column, after each year a year-total column, each
+    #: carrying a LIVE formula per line (SUM/AVERAGE/last from the
+    #: line's regrain rule; a formula line gets its own formula over
+    #: the operands' total cells — exactly what a hand-built book
+    #: does).
+    time_totals: tuple = ()
+    #: The word the total columns wear on the month row — «Итого Q1»,
+    #: «Итого 2026». The model declares its own language
+    #: (``timeline={'totals_word': 'Итого'}``); the engine's default
+    #: stays English like the month labels beside it.
+    time_totals_word: Optional[str] = None
     type_colors: Optional[Dict[str, str]] = None
 
 
@@ -90,12 +150,20 @@ class ExcelView(MultiVariable):
     ``timeline``) plus the ``orient`` scalar; each set group is a child sub-model
     (dict literals are authoring sugar — they become sub-models). Read by
     renderers through :func:`resolve_excel_view`, which flattens the groups.
+
+    The first positional is a display name — a NAMED view
+    (``mo.ExcelView('Квартальный', grain='quarter')``) declared on a model
+    is an inert, selectable recipe: it changes nothing until a surface
+    applies it. Only the ``default_excel_view`` attribute slot enters the
+    resolve cascade.
     """
 
     _TRACK_MODES = ("blend", "rows", "compare")
 
     def __init__(
         self,
+        display_name: Optional[str] = None,
+        *,
         orient: Optional[str] = None,
         font: Any = None,
         bands: Any = None,
@@ -103,8 +171,11 @@ class ExcelView(MultiVariable):
         timeline: Any = None,
         tracks: Optional[str] = None,
         grain: Optional[str] = None,
+        formats: Any = None,
+        nesting: Any = None,
+        meta: Any = None,
     ) -> None:
-        super().__init__("ExcelView")
+        super().__init__(display_name or "ExcelView")
         if tracks is not None and tracks not in self._TRACK_MODES:
             raise ValueError(
                 f"ExcelView tracks= must be one of "
@@ -125,6 +196,9 @@ class ExcelView(MultiVariable):
             ("timeline", timeline),
             ("tracks", tracks),
             ("grain", grain),
+            ("formats", formats),
+            ("nesting", nesting),
+            ("meta", meta),
         ):
             if value is not None:
                 setattr(self, name, _to_node(name, value))
@@ -132,22 +206,60 @@ class ExcelView(MultiVariable):
     def _grouped(self) -> Dict[str, Any]:
         return {f: _node_value(self._components.get(f)) for f in _GROUPS}
 
+    def __setattr__(self, name: str, value: Any) -> None:
+        # Any mutation (field set, sub-view adoption) invalidates the
+        # cached snapshot below — the cache must never outlive an edit.
+        self.__dict__.pop("_snapshot_cache", None)
+        super().__setattr__(name, value)
+
     def snapshot(self) -> ResolvedView:
-        """Compile this grouped view into the flat :class:`ResolvedView`."""
+        """Compile this grouped view into the flat :class:`ResolvedView`.
+
+        CACHED on the instance: renderers resolve the view cascade for
+        every Variable (three times each, in fact), and every resolve
+        re-walked this view's whole sub-tree — 16 527 snapshot builds
+        per run on a 36-month model, ~60% of the warm run. Views don't
+        mutate during a run (runtime is built after exec), so the first
+        build serves them all; ``__setattr__`` drops the cache on any
+        real edit.
+        """
+        cached = self.__dict__.get("_snapshot_cache")
+        if cached is not None:
+            return cached
         g = self._grouped()
         timeline = g.get("timeline") or {}
         cell_types = g.get("cell_types") or {}
-        return ResolvedView(
+        nesting = g.get("nesting") or {}
+        meta = g.get("meta") or {}
+        resolved = ResolvedView(
             orient=g.get("orient"),
             tracks=g.get("tracks"),
             grain=g.get("grain"),
             base_font=g.get("font"),
             band_styles=g.get("bands"),
+            number_formats=g.get("formats"),
+            nesting_gap_rows=nesting.get("gap_rows"),
+            nesting_indent=nesting.get("indent"),
+            meta_article_col=meta.get("article"),
+            meta_unit_col=meta.get("unit"),
+            meta_label_col=meta.get("label"),
+            meta_constants_col=meta.get("constants"),
+            meta_fields=tuple(
+                (str(f[0]), f[1]) for f in (meta.get("fields") or ())
+                if isinstance(f, (tuple, list)) and len(f) == 2 and f[1]
+            ),
             format_by_type=cell_types.get("on"),
             type_colors=cell_types.get("colors"),
             time_header=timeline.get("header"),
             time_label_format=timeline.get("label_format"),
+            time_totals=tuple(
+                k for k in (timeline.get("totals") or ())
+                if k in ("quarter", "year")
+            ),
+            time_totals_word=timeline.get("totals_word"),
         )
+        self.__dict__["_snapshot_cache"] = resolved
+        return resolved
 
     def _repr_html_(self) -> str:
         """A flat one-panel summary of the effective settings (no per-group tabs)."""

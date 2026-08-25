@@ -63,6 +63,13 @@ class RenderCtx:
     # be rendered natively. Callers set this at the top-level
     # ``translate()`` / ``render()`` call; deeper recursion inherits.
     self_var: Optional[Any] = None
+    # Set by a renderer when it had to inline a LIST-valued,
+    # address-less Variable into a SCALAR cell — the positional
+    # collapse makes the formula meaningless (a SUM over a foreign
+    # list becomes SUM(first_element)). The emission entry checks this
+    # and falls back to the computed VALUE literal instead (ADR-010:
+    # degrade to the truth, never to a wrong formula).
+    lossy_inline: bool = False
 
 
 class Renderer(Protocol):

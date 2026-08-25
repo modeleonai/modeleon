@@ -65,13 +65,33 @@ def _first_variable_value_type(args: tuple, fallback: str = 'float') -> str:
     return fallback
 
 
+def _common_unit(args: tuple):
+    """The single unit shared by every unit-bearing Variable operand —
+    an aggregation of ₸ is ₸. Mixed or absent units → None (never
+    guess)."""
+    units = {
+        str(a._unit) for a in args
+        if isinstance(a, Variable) and getattr(a, '_unit', None) is not None
+    }
+    if len(units) != 1:
+        return None
+    for a in args:
+        if isinstance(a, Variable) and getattr(a, '_unit', None) is not None:
+            return a._unit
+    return None
+
+
 def _aggregate(func_name: str, args: tuple, value: Any, value_type: str) -> Variable:
     _, ast_args = _flatten_args(args, func_name)
     source_code = f"{func_name}({', '.join(src(a) for a in args)})"
-    return make_func_var(
+    out = make_func_var(
         func_name, ast_args, value, value_type, 'scalar',
         source_code=source_code,
     )
+    unit = _common_unit(args)
+    if unit is not None:
+        out._unit = unit
+    return out
 
 
 def _lifted_reduce(func_name: str, var: Variable, reducer) -> Variable:
@@ -86,10 +106,13 @@ def _lifted_reduce(func_name: str, var: Variable, reducer) -> Variable:
         var._value,
     )
     label = getattr(var, "python_name", None) or var.path.leaf
-    return make_func_var(
+    out = make_func_var(
         func_name, [VarRef(var)], lifted, 'float', 'scalar',
         source_code=f"{func_name}({label})",
     )
+    if getattr(var, '_unit', None) is not None:
+        out._unit = var._unit
+    return out
 
 
 def SUM(*args: AggOperand) -> Variable:

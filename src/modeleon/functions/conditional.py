@@ -159,6 +159,27 @@ def NOT(value: Any) -> Variable:
     return result
 
 
+def ISBLANK(value: Any) -> Variable:
+    """TRUE when the operand is empty (renders ``=ISBLANK(...)``).
+
+    The Excel-native way to ask "was this ever filled in?", and the only
+    way to write an OPTIONAL date without lying about it. A leaving date
+    that has not happened yet has to read as an empty cell — filling it
+    with the end of the window says "dismissed on 31 December", which an
+    accountant will act on. Element-wise over a list operand.
+    """
+    raw, expr = text_operand(value)
+    if isinstance(raw, list):
+        calc: Any = [v is None or v == '' for v in raw]
+        var_type = 'list'
+    else:
+        calc = raw is None or raw == ''
+        var_type = 'scalar'
+    result = make_func_var("ISBLANK", [expr], calc, 'bool', var_type)
+    result._source_code = result.formula
+    return result
+
+
 def CHOOSE(index: Any, *choices: Any) -> Variable:
     """Pick the ``index``-th value, 1-based (renders ``=CHOOSE(...)``).
 

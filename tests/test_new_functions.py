@@ -248,3 +248,53 @@ class TestExcelOutput:
         assert days_cells
         assert all('"' not in f for f in days_cells), days_cells  # no quoted-text dates
         assert any('DATE(2025, 1, 1)' in f for f in days_cells)   # fill kept its type
+
+
+class TestISBLANK:
+    """``ISBLANK`` — the only honest way to write an OPTIONAL value.
+
+    A leaving date that has not happened yet must read as an EMPTY cell.
+    Filling it with the end of the window says "dismissed on 31
+    December", which an accountant will act on. But comparing against an
+    empty operand answers all-False, so "no upper bound" cannot be said
+    without a blank test — and Excel's own answer to that is ISBLANK.
+    """
+
+    def test_empty_is_blank_and_a_value_is_not(self) -> None:
+        assert mo.ISBLANK(mo.Variable(None)).value is True
+        assert mo.ISBLANK(mo.Variable("")).value is True
+        assert mo.ISBLANK(mo.Variable(0)).value is False
+        assert mo.ISBLANK(mo.Variable("Иванов")).value is False
+
+    def test_zero_is_not_blank(self) -> None:
+        """The distinction the whole thing rests on: a rate of 0 % is a
+        stated value, an unset rate is not."""
+        assert mo.ISBLANK(mo.Variable(0)).value is False
+        assert mo.ISBLANK(mo.Variable(0.0)).value is False
+
+    def test_element_wise_over_a_list(self) -> None:
+        got = mo.ISBLANK(mo.Variable([1, None, "", 3])).value
+        assert got == [False, True, True, False]
+
+    def test_renders_the_excel_function(self) -> None:
+        assert mo.ISBLANK(mo.Variable(None)).formula.startswith("ISBLANK(")
+
+    def test_an_open_ended_window_counts_to_the_end(self) -> None:
+        """The case it was added for: an employee with no leaving date
+        stays in staff through the window; one with a date stops."""
+        start = mo.Variable([mo.DATE(2026, m, 1) for m in range(1, 13)])
+        end = mo.Variable(mo.EOMONTH(start))
+        hired = mo.DATE(2026, 4, 10)
+
+        def months(left: mo.Variable) -> int:
+            on = mo.IF(
+                end >= hired,
+                mo.IF(mo.OR(mo.ISBLANK(left), start <= left), 1, 0),
+                0,
+            )
+            return sum(on.value)
+
+        # Hired 10 April, still employed → April through December.
+        assert months(mo.Variable(None)) == 9
+        # Hired 10 April, left 15 August → April through August.
+        assert months(mo.DATE(2026, 8, 15)) == 5

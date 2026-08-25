@@ -67,6 +67,30 @@ def src(value) -> str:
     return (value.python_name or value.path.leaf) if isinstance(value, Variable) else repr(value)
 
 
+#: Functions whose result is NOT in the operands' unit — counts,
+#: rates, calendar spans.
+_UNITLESS_RESULTS = frozenset({
+    'COUNT', 'COUNTA', 'COUNTIF', 'COUNTIFS',
+    'IRR', 'XIRR', 'RATE', 'YEARFRAC', 'DAYS', 'DAY', 'MONTH', 'YEAR',
+})
+
+
+def _shared_arg_unit(ast_args: list):
+    """The single unit shared by every unit-bearing Variable operand
+    (top-level VarRef args), else None — never guess."""
+    from ..core.expr import VarRef
+
+    units = []
+    seen = set()
+    for node in ast_args:
+        var = getattr(node, 'var', None) if isinstance(node, VarRef) else None
+        u = getattr(var, '_unit', None) if var is not None else None
+        if u is not None and str(u) not in seen:
+            seen.add(str(u))
+            units.append(u)
+    return units[0] if len(units) == 1 else None
+
+
 def make_func_var(
     func_name: str,
     ast_args: list,
@@ -106,6 +130,15 @@ def make_func_var(
     result._value = value
     result.var_type = var_type
     result.value_type = value_type
+    # Unit preservation, the generic law: a numeric function over
+    # operands that share ONE unit keeps it — IF-capped taxes stay ₸,
+    # ROUND(₸) is ₸. Functions whose RESULT is a different kind of
+    # number (counts, rates, day-spans) are excluded; mixed or absent
+    # units stamp nothing.
+    if value_type in ('int', 'float') and func_name not in _UNITLESS_RESULTS:
+        unit = _shared_arg_unit(ast_args)
+        if unit is not None:
+            result._unit = unit
     if source_code is not None:
         result._source_code = source_code
     return result

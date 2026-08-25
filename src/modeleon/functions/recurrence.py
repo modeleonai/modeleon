@@ -634,6 +634,8 @@ def cumsum(iterable: Variable) -> Variable:
         result._value = TrackValues.lift(_acc, iterable._value)
         result.var_type = 'list'
         result._cumsum_source = iterable
+        if getattr(iterable, '_unit', None) is not None:
+            result._unit = iterable._unit  # a running total of ₸ is ₸
         return result
     reject_axised(iterable, "cumsum")
     if not isinstance(iterable, Variable):
@@ -671,4 +673,6 @@ def cumsum(iterable: Variable) -> Variable:
     # == cumsum(quarterly sums)[q]. Generic SelfRef recompute is
     # forbidden; this identity lets core.projection rebuild the row.
     result._cumsum_source = iterable
+    if getattr(iterable, '_unit', None) is not None:
+        result._unit = iterable._unit  # a running total of ₸ is ₸
     return result

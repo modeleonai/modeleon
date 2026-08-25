@@ -955,6 +955,11 @@ def _collect_rows(mv, direct_only: bool = False) -> tuple[list, int]:
         elif isinstance(comp, MultiVariableBase):
             if direct_only:
                 continue
+            from ..compile.excel.view import ExcelView
+            if isinstance(comp, ExcelView):
+                # A named view is presentation metadata, not content —
+                # same law as the xlsx layout: no rows, no sections.
+                continue
             # Carry the sub-MV through so the renderer can look up the
             # section's flat-layout row from ``section_rows``.
             rows.append(('section', comp.display_name, comp, None))
@@ -1204,6 +1209,11 @@ def model_html(root) -> str:
         if isinstance(comp, Variable):
             direct_var_names.append(name)
         elif isinstance(comp, MultiVariableBase):
+            from ..compile.excel.view import ExcelView
+            if isinstance(comp, ExcelView):
+                # A named view never becomes a tab — presentation
+                # metadata, mirrored from the workbook writer's law.
+                continue
             sub_mvs.append((name, comp))
 
     if not direct_var_names and not sub_mvs:

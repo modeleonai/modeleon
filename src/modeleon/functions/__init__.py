@@ -5,7 +5,8 @@ Organized by topic:
 
 - :mod:`aggregate`    — ``SUM``, ``MAX``, ``MIN``, ``AVERAGE``
 - :mod:`mathfn`       — ``ABS``, ``ROUND``, ``INT``, ``MOD``
-- :mod:`conditional`  — ``IF``, ``AND``, ``OR``, ``NOT``, ``CHOOSE``
+- :mod:`conditional`  — ``IF``, ``AND``, ``OR``, ``NOT``, ``CHOOSE``,
+  ``ISBLANK``
 - :mod:`dates`        — ``YEAR``, ``MONTH``, ``DAY``, ``DATE``, ``EDATE``, ``EOMONTH``, ``DAYS360``, ``TODAY``
 - :mod:`text`         — ``LEN``, ``UPPER``, ``LOWER``, ``CONCAT``
 - :mod:`recurrence`   — ``recurrence``, ``recurrence_sum``, ``cumsum``
@@ -31,7 +32,7 @@ Inspect compat for a given target with :func:`modeleon.check_compat`.
 from ._helpers import pyformula, val
 from .aggregate import AVERAGE, MAX, MIN, SUM
 from .cohort import cohort_retention
-from .conditional import AND, CHOOSE, IF, NOT, OR
+from .conditional import AND, CHOOSE, IF, ISBLANK, NOT, OR
 from .dates import DATE, DAY, DAYS360, EDATE, EOMONTH, MONTH, TODAY, YEAR
 from .financial import FV, IRR, NPV, PMT, PV, XIRR
 from .mathfn import ABS, INT, MOD, ROUND
@@ -47,7 +48,7 @@ __all__ = [
     # Math
     "ABS", "ROUND", "INT", "MOD",
     # Conditional / logical
-    "IF", "AND", "OR", "NOT", "CHOOSE",
+    "IF", "AND", "OR", "NOT", "CHOOSE", "ISBLANK",
     # Dates
     "YEAR", "MONTH", "DAY", "DATE", "EDATE", "EOMONTH", "DAYS360", "TODAY",
     # Text

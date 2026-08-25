@@ -44,8 +44,43 @@ first finite value axis.
 - **Excel emission of tracked lines** — the display-default (live) row
   keeps the line's name so formulas reference it; other tracks emit as
   labeled value rows.
+- **The financial book** — a declarative style cascade on
+  `ExcelView`: `bands` (masthead header, section bands painted by
+  nesting depth), number formats, a units column declared once
+  (`ед.изм.`), № and name column headers, a header for the constants
+  column. One declaration styles the whole workbook.
+- **Hierarchical totals columns** — subtotal columns woven into the
+  time axis (`янв фев мар (Q1) … (год)`) as live formulas; the totals
+  header stacks year over quarters over months; native Excel column
+  groups fold the coarser tiers away; a view's `grain` accepts a
+  multi-select (finest grain = columns, coarser = «Итого» columns).
+- **`tracks='compare'`** — per-track column groups side by side in
+  the printed file, mirroring the comparison lens.
+- **`mo.blend` without `until`** — an open-ended splice.
+- **`ISBLANK`** — an optional value can say it is empty.
+- **Presentation `excel_props`** — `hidden` (service rows hidden, not
+  skipped), `row_sum` («Итого» lead column), `bg_nonzero`
+  (value-driven fill).
+- **Collections print as one sheet** — repeating children share one
+  table instead of a tab per record; `orient='columns'` turns them
+  into a board; dense nesting derives hierarchy from indentation; a
+  section's subtotal sits on its own header row.
+- **Formulas tell the truth** — the chain law: a printed formula
+  references the rows it actually depends on; when a chain can't be
+  expressed losslessly the cell falls back to its value explicitly
+  instead of printing a wrong formula. Loop-built intermediates
+  reference their rows rather than unrolling into consumers.
+- **Per-line time windows** — the time axis belongs to the line, not
+  only the model; lines with differing windows align by date.
 
 ### Fixed
+
+- A regrain-ruled line now projects its stored tracks, not just the
+  live row.
+- A data hole inside an aggregation bucket makes the bucket a hole
+  instead of a silent partial sum.
+- A range formula never swallows an adjacent totals column; a
+  bucket's total names itself on the bucket's own tier.
 
 - Recurrence template placeholders and the Excel SelfRef renderer were
   ASCII-only — Cyrillic placeholders (`{доход}`) silently failed to

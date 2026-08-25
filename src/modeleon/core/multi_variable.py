@@ -54,6 +54,7 @@ Split across three mixin modules:
 
 from typing import Dict, List, Optional, Any, TYPE_CHECKING
 import contextvars
+import functools
 import inspect
 
 # Re-exported so code that imports these from modeleon.multi_variable keeps working.
@@ -75,6 +76,12 @@ _SUPPRESS_COMPUTE: contextvars.ContextVar[bool] = contextvars.ContextVar(
 
 
 
+@functools.lru_cache(maxsize=256)
+def _signature_of(compute_func: Any) -> "inspect.Signature":
+    """``inspect.signature`` keyed by the class's compute function."""
+    return inspect.signature(compute_func)
+
+
 class MultiVariableBase(_MVLifecycle, _MVInspect, Component):
     """
     Base class with internal machinery for grouped Variables and nested MultiVariables.
@@ -92,8 +99,14 @@ class MultiVariableBase(_MVLifecycle, _MVInspect, Component):
 
     # Valid keys inside ``excel_props``. Passing any other key raises.
     _EXCEL_PROP_KEYS = frozenset({
+        'hidden',   # служебное поддерево — скрыто во всех вьюхах
         # Structural
-        'tab', 'row', 'col',
+        'tab',
+        # Section orientation: 'columns' spreads repeating children
+        # ACROSS (instances as columns, scalar fields as rows).
+        'orient',
+        # The section's article number («1.2») — see Variable.
+        'article', 'row', 'col',
         # Typography
         'bold', 'italic', 'font_color', 'font_size', 'font_family',
         'text_align', 'indent',
@@ -591,7 +604,11 @@ class MultiVariableClass(MultiVariableBase):
         ``compute(self, seats)``. A required parameter with no stored
         value is left out so ``compute()`` raises its natural TypeError
         naming the missing argument."""
-        sig = inspect.signature(self.compute)
+        # Signature by UNDERBOUND function, cached: a register holds
+        # hundreds of instances of the same four classes, and
+        # ``inspect.signature`` costs ~7 мкс a call — thousands of
+        # identical introspections per run for four distinct answers.
+        sig = _signature_of(type(self).compute)
         params = {}
         for k, v in sig.parameters.items():
             if v.kind in (
@@ -697,6 +714,16 @@ class MultiVariable(MultiVariableBase):
         # exactly like the window (``resolve_tracks_decl``). Role-kwarg
         # Variables (``actual=``/``plan=``) materialize against it at
         # adoption.
+        # The VIEW slot, ctor spelling. ``__setattr__`` exempts
+        # ``default_excel_view`` from component registration — but the
+        # ctor's registerable loop calls ``_register_component``
+        # DIRECTLY, so a view passed as a kwarg was adopted as CONTENT:
+        # its config leaves (``totals=['quarter','year']``) hit the
+        # extent law under a windowed model («'totals' has 2 value(s)
+        # in a 36-period window», live on a focused Бизнес-план) and
+        # the view itself would render as a spurious tab.
+        view_slot = components.pop("default_excel_view", None)
+
         tracks_decl = components.pop("tracks", None)
         if tracks_decl is not None:
             from .tracks_decl import Tracks
@@ -737,6 +764,10 @@ class MultiVariable(MultiVariableBase):
                         "default_periods (otherwise the synthesized "
                         "track would silently never appear)."
                     )
+
+        if view_slot is not None:
+            # Through the exempted slot — a pointer, never content.
+            self.default_excel_view = view_slot
 
         for name, comp in registerable.items():
             self._register_component(name, comp)

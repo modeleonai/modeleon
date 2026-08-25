@@ -88,6 +88,28 @@ _NON_COMMUTATIVE_RIGHT: set[str] = {"-", "/", "//", "%", "**", "^"}
 # scalar VarRefs / literals as normal. Covers classic aggregates (SUM,
 # MAX, MIN, …) and financial-series funcs (IRR, NPV, XIRR) where Excel
 # expects a range for the cash-flow / dates argument.
+def _contiguous_run(refs: list) -> bool:
+    """Do these cell refs sit side by side on one row?
+
+    A range is only honest when they do. The interleave that breaks it
+    is ordinary — a declared quarter total puts a column between March
+    and April — and the resulting ``SUM`` looks perfectly valid while
+    counting the quarter twice.
+    """
+    from openpyxl.utils.cell import coordinate_to_tuple
+
+    try:
+        cells = [coordinate_to_tuple(r.split("!")[-1].replace("$", ""))
+                 for r in refs]
+    except Exception:
+        return True                    # unparseable: keep the old shape
+    rows = {r for r, _c in cells}
+    if len(rows) != 1:
+        return False
+    cols = [c for _r, c in cells]
+    return all(b - a == 1 for a, b in zip(cols, cols[1:]))
+
+
 _RANGE_TAKING_FUNCS = {
     "SUM", "AVERAGE", "MIN", "MAX", "COUNT",
     "IRR", "NPV", "XIRR",
@@ -98,7 +120,8 @@ _RANGE_TAKING_FUNCS = {
 # use Excel casing directly (``IF``, ``ABS``, ``ROUND``, etc.), so the
 # translator just emits them verbatim — no rename map needed.
 _PASSTHROUGH_FUNCS = _RANGE_TAKING_FUNCS | {
-    "IF", "AND", "OR", "NOT", "CHOOSE", "ABS", "ROUND", "INT", "MOD",
+    "IF", "AND", "OR", "NOT", "CHOOSE", "ISBLANK", "ABS", "ROUND", "INT",
+    "MOD",
     "EDATE", "EOMONTH", "YEAR", "MONTH", "DAY", "DATE", "DAYS360", "TODAY",
     "LEN", "UPPER", "LOWER", "TEXT",  # CONCAT renders as the `&` operator
     "PMT", "FV", "PV", "RATE",
@@ -195,9 +218,19 @@ class ExcelRenderer:
         self,
         addresses: Dict[str, VariableAddresses],
         var_to_sheet: Optional[Dict[str, str]] = None,
+        identity_cells: Optional[Dict[int, "tuple[str, int]"]] = None,
     ) -> None:
         self.addresses = addresses
         self.var_to_sheet = var_to_sheet or {}
+        #: ``id(floating Variable) → (owner vid, period)`` — a per-month
+        #: intermediate built in a Python loop is often the SAME object
+        #: that sits in some laid-out row's value list. Without this map
+        #: a formula over such intermediates unrolls them wholesale
+        #: (live: a 1040-char payroll cell repeating the ОПВ cap four
+        #: times, one row under the ОПВ row that holds it); with it the
+        #: reference resolves to the cell that already carries the
+        #: number — the way a human builds the same sheet.
+        self.identity_cells = identity_cells or {}
         self.walker: Any = None  # set by Walker(renderer) constructor
 
     # ─── Dispatch targets ───────────────────────────────────────
@@ -243,17 +276,84 @@ class ExcelRenderer:
         var_id = node.var.id
         if var_id in self.addresses:
             return self._resolve_var_addr(var_id, ctx.period_idx, ctx.current_sheet)
+        # An address-less operand may still LIVE in a laid-out row: a
+        # loop-built per-month intermediate is the same object as that
+        # row's month element. Reference the cell instead of unrolling
+        # the expression — except into the cell being written itself,
+        # where the reference would be circular and the expression is
+        # the honest content.
+        home = self.identity_cells.get(id(node.var))
+        if home is None and node.var._expr is not None:
+            home = self.identity_cells.get(id(node.var._expr))
+        if home is not None:
+            owner_vid, owner_period = home
+            self_var = ctx.self_var
+            if not (self_var is not None and owner_vid == self_var.id
+                    and owner_period == ctx.period_idx):
+                return self._resolve_var_addr(
+                    owner_vid, owner_period, ctx.current_sheet
+                )
         # Variable not in this emission's layout. Two inlining strategies:
         # - if it has its own AST, recurse into it so we reach real cells;
         # - otherwise (plain input referenced from outside the emission
         #   subtree), inline its value as an Excel literal.
+        # Either way, collapsing a LIST into a SCALAR cell positionally
+        # is meaningless (SUM over a foreign list would become
+        # SUM(first_element)) — mark the render lossy so the cell falls
+        # back to the computed value.
+        if isinstance(node.var._value, list):
+            root = ctx.self_var
+            root_is_list = root is not None and (
+                getattr(root, 'var_type', None) == 'list'
+                or isinstance(getattr(root, '_value', None), list)
+            )
+            if not root_is_list:
+                ctx.lossy_inline = True
         if node.var._expr is not None:
             return self.walker.render(node.var._expr, ctx)
         _warn_out_of_scope_ref(node.var, ctx)
         return _value_to_excel_literal(_value_at_period(node.var._value, ctx.period_idx))
 
+    def _inlined_chain_ref(self, node) -> bool:
+        """A VarRef to an address-less cumsum result — its inline
+        render is a self-referencing chain whose ``prev`` resolves to
+        THIS cell's own previous period, which already contains every
+        other term of the enclosing formula."""
+        return (
+            isinstance(node, VarRef)
+            and getattr(node.var, '_cumsum_source', None) is not None
+            and node.var.id not in self.addresses
+        )
+
+    @staticmethod
+    def _period_constant(node) -> bool:
+        """Renders to the same expression at every period — a scalar
+        input or literal; safe to fold into a chain's seed."""
+        if isinstance(node, Literal):
+            return True
+        if isinstance(node, VarRef):
+            return not isinstance(getattr(node.var, '_value', None), list)
+        return False
+
     def render_binop(self, node: BinOp, ctx: RenderCtx) -> str:
         op = node.op
+        # ``scalar + cumsum(x)`` — the linear composition law. The
+        # inlined chain's ``prev`` is THIS row's previous cell, which
+        # already includes the scalar; re-adding it every period
+        # compounds the constant (the double-counted opening balance).
+        # Period 0 keeps both terms (seed); later periods are the
+        # chain alone. Any non-'+' composition can't be folded — the
+        # cell falls back to its computed value.
+        for chain_side, other_side in ((node.left, node.right),
+                                       (node.right, node.left)):
+            if not self._inlined_chain_ref(chain_side):
+                continue
+            if op == '+' and self._period_constant(other_side):
+                if ctx.period_idx == 0:
+                    break  # seed period: render both terms normally
+                return self.walker.render(chain_side, ctx)
+            ctx.lossy_inline = True
+            break
         # // → INT(a/b), % → MOD(a,b). Inside INT/MOD the relevant parent op
         # is ``/`` (precedence 3); the comma in MOD separates and needs no
         # parens-handling on either operand.
@@ -425,7 +525,7 @@ class ExcelRenderer:
             return self._fallback_funccall(node, ctx)
 
         if func in _RANGE_TAKING_FUNCS:
-            parts = [self._render_range_or_cell(a, ctx) for a in node.args]
+            parts = [self._render_range_or_cell(a, ctx, func) for a in node.args]
             return f"{func}({', '.join(parts)})"
 
         parts = [self.walker.render(a, ctx) for a in node.args]
@@ -532,6 +632,12 @@ class ExcelRenderer:
     def render_regrain(self, node: Regrain, ctx: RenderCtx) -> str:
         i = ctx.period_idx
         fill = node.fill_values[i] if i < len(node.fill_values) else 0.0
+        # A hole (un-entered bucket) must stay a hole in the workbook:
+        # ``_value_to_excel_literal`` would spell ``None`` as ``0``, and
+        # a range formula over blank cells would show a partial number
+        # where the value layer says "not known yet". Emit blank.
+        if fill is None:
+            return '""'
         var_id = node.source.id
         addr_obj = self.addresses.get(var_id)
         if (addr_obj is None or not addr_obj.values or i >= len(node.buckets)):
@@ -600,12 +706,16 @@ class ExcelRenderer:
 
         return self._maybe_qualify(addr_obj.values[target_period], var_id, ctx.current_sheet)
 
-    def _render_range_or_cell(self, arg: Expr, ctx: RenderCtx) -> str:
+    def _render_range_or_cell(
+        self, arg: Expr, ctx: RenderCtx, func: Optional[str] = None,
+    ) -> str:
         if isinstance(arg, VarRef):
             var_id = arg.var.id
             addr_obj = self.addresses.get(var_id)
             if addr_obj is not None and len(addr_obj.values) > 1:
-                return self._resolve_var_range(var_id, ctx.current_sheet)
+                return self._resolve_var_range(
+                    var_id, ctx.current_sheet, ctx, func,
+                )
         # A SLICED row inside an aggregate wants the sliced RANGE:
         # ``SUM(x[0:12])`` → ``SUM(B1:M1)``. (Element-wise slice
         # rendering lives in ``render_subscript`` and is period-aware;
@@ -697,12 +807,44 @@ class ExcelRenderer:
                 return self._format_sheet_reference(var_sheet, addr)
         return addr
 
-    def _resolve_var_range(self, var_id: str, current_sheet: Optional[str] = None) -> str:
+    #: Range-taking functions whose Excel signature is VARIADIC, so an
+    #: explicit list of cells reads the same as a range. ``IRR`` and
+    #: ``XIRR`` are not among them: their second argument is a guess /
+    #: a date range, so a comma list would be read as another argument
+    #: entirely.
+    _LIST_SAFE_FUNCS = {"SUM", "AVERAGE", "MIN", "MAX", "COUNT", "NPV"}
+
+    def _resolve_var_range(
+        self,
+        var_id: str,
+        current_sheet: Optional[str] = None,
+        ctx: Optional[RenderCtx] = None,
+        func: Optional[str] = None,
+    ) -> str:
         addr_obj = self.addresses.get(var_id)
         if addr_obj is None:
             return var_id
         if len(addr_obj.values) == 1:
             return self._maybe_qualify(addr_obj.values[0], var_id, current_sheet)
+        # A row's cells are NOT always contiguous: declare quarter
+        # totals and the bucket columns stand between the months, so
+        # ``SUM(C3:I3)`` swallows the Q1 total and double-counts it —
+        # 90 where the model says 60, in a file that looks right.
+        # ``totals.rule_formula`` learned this already; the same rule
+        # belongs here, where every range is built.
+        if not _contiguous_run(addr_obj.values):
+            if func in self._LIST_SAFE_FUNCS:
+                return ", ".join(
+                    self._maybe_qualify(v, var_id, current_sheet)
+                    if i == 0 else v
+                    for i, v in enumerate(addr_obj.values)
+                )
+            # IRR and friends need a real range and would read a list
+            # as further arguments. The truth beats a formula that
+            # computes something else: fall back to the value, which
+            # the parity mark then reports honestly.
+            if ctx is not None:
+                ctx.lossy_inline = True
         first = self._maybe_qualify(addr_obj.values[0], var_id, current_sheet)
         last = addr_obj.values[-1]
         return f"{first}:{last}"

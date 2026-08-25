@@ -321,8 +321,11 @@ def project_variable(var: Variable, grain: str, cache: Dict[int, Any]) -> Any:
         # broadcast re-zips every track, live included); lines with
         # authored data project their STORED tracks — a recompute would
         # silently overwrite pinned facts with formula values.
+        from .regrain import Ratio as _Ratio
+        _spec = var._regrain
+        _ruled = _spec is not None and not isinstance(_spec.default, _Ratio)
         if (var._role_kwargs is None and var.is_formula
-                and var._expr is not None):
+                and var._expr is not None and not _ruled):
             result = _recompute(var._expr, grain, cache)
             if isinstance(result, Variable):
                 result._display_name = var._display_name
@@ -361,6 +364,10 @@ def project_variable(var: Variable, grain: str, cache: Dict[int, Any]) -> Any:
             result._unit = var._unit
             result._grain = grain
             result._start = p_start
+        if (isinstance(result, Variable)
+                and not getattr(result, '_excel_props', None)
+                and var._excel_props):
+            result._excel_props = dict(var._excel_props)
         cache[key] = result
         return result
     if getattr(var, '_indexed_by', ()) or ():
@@ -424,6 +431,16 @@ def project_variable(var: Variable, grain: str, cache: Dict[int, Any]) -> Any:
             f"{label!r} has no re-grain rule and is not a formula; give it a "
             f"rule (regrain=mo.up('sum'/'last'/'mean'))."
         )
+    # Presentation identity survives the lens: the projected row keeps
+    # its unit (a quarterly sum of ₸ is ₸) and its excel_props (the
+    # article number, header-row placement, per-line formats) so the
+    # projected sheet lays out exactly like the native one.
+    if isinstance(result, Variable):
+        if (getattr(result, '_unit', None) is None
+                and getattr(var, '_unit', None) is not None):
+            result._unit = var._unit
+        if not getattr(result, '_excel_props', None) and var._excel_props:
+            result._excel_props = dict(var._excel_props)
     cache[key] = result
     return result
 
@@ -443,6 +460,15 @@ def project_model(mv: Any, grain: str, cache: Optional[Dict[int, Any]] = None,
     result = MultiVariable(mv._display_name, excel_props=dict(mv._excel_props) or None)
     for name, child in mv._components.items():
         if isinstance(child, MultiVariableBase):
+            from ..compile.excel.view import ExcelView
+
+            if isinstance(child, ExcelView):
+                # A named view is presentation metadata — its config
+                # leaves carry no time axis and must not be re-grained
+                # (a 'quarter' string has no regrain rule). Carry the
+                # view over untouched.
+                setattr(result, name, child)
+                continue
             setattr(result, name, project_model(child, grain, cache, on_error))
         else:
             try:
@@ -451,6 +477,16 @@ def project_model(mv: Any, grain: str, cache: Optional[Dict[int, Any]] = None,
                 if on_error != 'absorb':
                     raise
                 projected = Variable('#VALUE!', display_name=child._display_name)
+                from .tracks import TrackValues as _TV
+                src_val = getattr(child, '_value', None)
+                if isinstance(src_val, _TV):
+                    # Keep the tracks SHAPE under the error: the axis
+                    # is structure, the token is the value. Consumers
+                    # keep offering track views while the line teaches
+                    # its re-grain rule.
+                    projected._value = _TV(
+                        {r: '#VALUE!' for r in src_val.roles}
+                    )
                 projected._regrain_error = str(exc)
                 # Keep the row's IDENTITY readable: without the source
                 # text, selecting the red cell shows an empty formula
@@ -470,6 +506,11 @@ def project_model(mv: Any, grain: str, cache: Optional[Dict[int, Any]] = None,
     # so a projected tree keys its lines identically to the native run.
     if mv._python_name is not None:
         result._python_name = mv._python_name
+    _dev = mv.__dict__.get('default_excel_view')
+    if _dev is not None:
+        # The view cascade rides the lens — a projected tree styles
+        # exactly like its source (formats, bands, nesting, meta).
+        result.default_excel_view = _dev
     return result
 
 

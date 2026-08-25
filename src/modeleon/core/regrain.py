@@ -156,7 +156,10 @@ def apply_recipe(bucket: list, recipe: str,
 
     Error cells absorb: a bucket containing an Excel error token (a ``'#'``-
     prefixed string, the same convention the operator chokepoint uses) reduces
-    to that token. Domain failures produce tokens, never raise: ``geometric``
+    to that token. Holes absorb into AGGREGATING recipes the same way: a
+    bucket containing ``None`` (an un-entered period) has no aggregate yet —
+    absence, not failure. Positional recipes (``first`` / ``last``) read only
+    their own period, matching the positional cell reference they emit. Domain failures produce tokens, never raise: ``geometric``
     with any ``1 + x <= 0`` is ``'#NUM!'``; a weighted ``mean`` over zero
     total weight is ``'#DIV/0!'`` — one bad bucket is one error cell, not a
     projection-wide crash.
@@ -171,12 +174,25 @@ def apply_recipe(bucket: list, recipe: str,
     for value in bucket:
         if isinstance(value, str) and value.startswith('#'):
             return value                       # absorbing error token
-    if recipe == 'sum':
-        return sum(bucket)
+    # Positional recipes pick ONE period's value, and the emitted
+    # Excel formula is a positional cell reference — value and formula
+    # must agree, so the coarse cell is a hole only when THAT period
+    # is a hole, never because a sibling is.
     if recipe == 'first':
         return bucket[0]
     if recipe == 'last':
         return bucket[-1]
+    # Aggregating recipes fold the whole bucket, and holes absorb —
+    # absence, not failure. ``None`` is an un-entered period; a bucket
+    # containing one has no aggregate yet (the quarter isn't known
+    # until every month in it is). Mirrors the operator chokepoint's
+    # None law; without this, ``sum`` raises ``int + NoneType`` and
+    # one hole kills the whole projection.
+    for value in bucket:
+        if value is None:
+            return None
+    if recipe == 'sum':
+        return sum(bucket)
     if recipe == 'mean':
         if weights is None:
             return sum(bucket) / len(bucket)

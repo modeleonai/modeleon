@@ -88,7 +88,7 @@ from modeleon.functions import (
     # Math
     ABS, ROUND, INT, MOD,
     # Conditional / logical
-    IF, AND, OR, NOT, CHOOSE,
+    IF, AND, OR, NOT, CHOOSE, ISBLANK,
     # Dates
     YEAR, MONTH, DAY, DATE, EDATE, EOMONTH, DAYS360, TODAY,
     # Text
@@ -150,6 +150,7 @@ __all__ = [
     "AND",
     "OR",
     "NOT",
+    "ISBLANK",
     "CHOOSE",
     "SUM",
     "MAX",

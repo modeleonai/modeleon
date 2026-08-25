@@ -8,6 +8,8 @@ functions lift per track; slices are first-class AST nodes.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 import modeleon as mo
@@ -914,6 +916,135 @@ class TestBlendLiveUniverse:
         assert 'live' not in m.x._value.roles
 
 
+class TestRoleBoundCompoundLists:
+    """A role kwarg bound to a LIST of Variables lowers its elements.
+
+    The positional path lowers compound lists through the formula
+    builder; the role path used to store raw Variable objects inside
+    TrackValues — and from there they leaked onto the wire as
+    serialized reprs. Elements must lower to values with dependency
+    edges, exactly like a whole-Variable operand.
+    """
+
+    def _m(self):
+        return mo.Model('м',
+            tracks=mo.Tracks('план', 'прогноз', 'факт',
+                             blend=mo.blend(given='факт', follow='прогноз')),
+            default_grain='month', default_start='2026-01',
+            default_periods=3)
+
+    def test_variable_elements_lower_to_values(self):
+        m = self._m()
+        with m:
+            m.реестр = mo.MultiVariable('Реестр')
+            with m.реестр as р:
+                р.акт = mo.Variable(10.0)
+            ряд = [mo.Variable(0.0), р.акт, mo.Variable(0.0)]
+            m.x = mo.Variable(план=ряд, прогноз=ряд, факт=[None] * 3)
+        v = m.x._value
+        for role in ('план', 'прогноз'):
+            assert v[role] == [0.0, 10.0, 0.0]
+            assert all(not isinstance(c, mo.Variable) for c in v[role])
+        assert v['факт'] == [None, None, None]
+
+    def test_lowered_elements_keep_dependency_edges(self):
+        m = self._m()
+        with m:
+            m.реестр = mo.MultiVariable('Реестр')
+            with m.реестр as р:
+                р.акт = mo.Variable(10.0)
+            m.x = mo.Variable(план=[р.акт, 0.0, 0.0], факт=[None] * 3)
+        assert any(d is m.реестр.акт for d in m.x._dependency_refs)
+
+    def test_valueless_element_is_loud(self):
+        m = self._m()
+        with m:
+            призрак = mo.Variable(formula='deferred')
+            призрак._value = None
+            with pytest.raises(ValueError):
+                m.x = mo.Variable(план=[призрак, 0.0, 0.0])
+
+
+class TestBlendWithoutBoundary:
+    """``mo.blend`` without ``until`` — the register shape.
+
+    A boundary is a promise that the given track is complete up to a
+    date. A register typed as events arrive makes no such promise:
+    facts land irregularly, out of order, and sometimes not at all.
+    The boundary-less spec says the rule directly — given where it
+    carries a value, follow everywhere else — with no date to keep
+    current.
+    """
+
+    def _m(self, periods=6):
+        return mo.Model('м',
+            tracks=mo.Tracks('план', 'прогноз', 'факт',
+                             blend=mo.blend(given='факт', follow='прогноз')),
+            default_grain='month', default_start='2026-01',
+            default_periods=periods)
+
+    def test_given_wins_wherever_it_has_a_value(self):
+        m = self._m()
+        with m:
+            m.поток = mo.Variable(план=[10.0] * 6, прогноз=[9.0] * 6,
+                                  факт=[7.0, None, 0.0, None, 33.0, None])
+        v = m.поток._value
+        # 0.0 is a FACT ("nothing happened"), not a hole — it must win
+        # over the forecast; only None yields.
+        assert v['live'] == [7.0, 9.0, 0.0, 9.0, 33.0, 9.0]
+        assert v['факт'] == [7.0, None, 0.0, None, 33.0, None]
+        assert v['план'] == [10.0] * 6        # план inviolable
+
+    def test_a_late_period_fact_is_not_overruled(self):
+        """The difference a boundary makes: past it, the bounded form
+        prefers ``follow`` and a typed fact loses. Without a boundary
+        the fact stands wherever the author put it."""
+        bounded = mo.Model('b',
+            tracks=mo.Tracks('прогноз', 'факт',
+                             blend=mo.blend(given='факт', follow='прогноз',
+                                            until='2026-01')),
+            default_grain='month', default_start='2026-01',
+            default_periods=3)
+        with bounded:
+            bounded.x = mo.Variable(прогноз=[9.0] * 3,
+                                    факт=[None, 5.0, None])
+        assert bounded.x._value['live'] == [9.0, 9.0, 9.0]   # fact lost
+
+        free = self._m(periods=3)
+        with free:
+            free.x = mo.Variable(план=[9.0] * 3, прогноз=[9.0] * 3,
+                                 факт=[None, 5.0, None])
+        assert free.x._value['live'] == [9.0, 5.0, 9.0]      # fact stands
+
+    def test_empty_given_leaves_follow_intact(self):
+        m = self._m(periods=3)
+        with m:
+            m.x = mo.Variable(план=[1.0] * 3, прогноз=[2.0] * 3,
+                              факт=[None, None, None])
+        assert m.x._value['live'] == [2.0, 2.0, 2.0]
+
+    def test_formulas_carry_the_boundary_less_live(self):
+        m = self._m(periods=3)
+        with m:
+            m.a = mo.Variable(план=[10.0] * 3, прогноз=[9.0] * 3,
+                              факт=[7.0, None, None])
+            m.b = mo.Variable(план=[1.0] * 3, прогноз=[1.0] * 3,
+                              факт=[2.0, None, None])
+            m.s = mo.Variable(m.a + m.b)
+        assert m.s._value['live'] == [9.0, 10.0, 10.0]
+
+    def test_repr_omits_the_absent_boundary(self):
+        spec = mo.blend(given='факт', follow='прогноз')
+        assert 'until' not in repr(spec)
+        assert repr(mo.blend(given='ф', follow='п', until='2026-01')).count(
+            'until') == 1
+
+    def test_a_blank_boundary_is_still_a_mistake(self):
+        # Omitting the boundary is a choice; spelling it empty is a typo.
+        with pytest.raises(TypeError):
+            mo.blend(given='факт', follow='прогноз', until='')
+
+
 class TestBlendReviewHardening:
     """The 2026-08-06 adversarial-review cluster — 10 confirmed defects
     in the first blend cut, each reproduced before its fix."""
@@ -1075,12 +1206,38 @@ class TestExcelViewTracksParam:
         labels = self._labels(self._m(mo.ExcelView(tracks='blend')))
         assert labels[0] == 'Поток' and labels[1] is None
 
-    def test_compare_refuses_until_built(self):
+    def test_compare_draws_period_major_column_groups(self):
+        # The IDE lens's own drawing, now in the file: each period is
+        # a GROUP of one column per track, the blend column a LIVE
+        # splice over its group neighbours, «откл» a live difference.
         import os
         import tempfile
-        with pytest.raises(ValueError, match="compare"):
-            self._m(mo.ExcelView(tracks='compare')).to_excel(
-                os.path.join(tempfile.mkdtemp(), 'т.xlsx'))
+
+        from openpyxl import load_workbook
+
+        p = os.path.join(tempfile.mkdtemp(), 'т.xlsx')
+        self._m(mo.ExcelView(tracks='compare')).to_excel(p)
+        ws = load_workbook(p).worksheets[0]
+        # One row — the line keeps its name; no «· факт» sub-rows.
+        labels = [ws.cell(r, 1).value for r in range(1, ws.max_row + 1)]
+        assert 'Поток' in labels
+        assert not any('·' in str(x) for x in labels if x)
+        row = labels.index('Поток') + 1
+        # Track words under the period labels, one group per month:
+        # given, follow, blend (declared order — no selection given).
+        assert [ws.cell(2, c).value for c in range(2, 6)] == [
+            'факт', 'бюджет', 'live', 'откл',
+        ]
+        assert ws.cell(1, 2).value is not None      # period label
+        # The blend column splices its own GROUP NEIGHBOURS, live.
+        assert ws.cell(row, 4).value == '=IF(B3="",C3,B3)'
+        # «откл» is a live difference, not a baked number.
+        assert ws.cell(row, 5).value == '=B3 - C3'
+        # Numbers land per track: факт 8, бюджет 10.
+        assert ws.cell(row, 2).value == 8
+        assert ws.cell(row, 3).value == 10
+        # The next month's group starts one stride (4) over.
+        assert ws.cell(row, 6).value == 7
 
     def test_vocabularies(self):
         with pytest.raises(ValueError, match="blend"):
@@ -1225,3 +1382,308 @@ class TestTracksInsideInstances:
             m.n = Накопитель(поток_план=[10.0] * 4,
                              поток_факт=[9.0, 11.0, None, None])
         assert 'live' not in m.n.остаток._value.roles
+
+
+class TestScalarBlend:
+    """Non-temporal lines carry the axis too — without a timeline."""
+
+    def _model(self):
+        m = mo.Model(
+            'm', display_name='M', default_grain='month',
+            default_start='2026-01', default_periods=6,
+            tracks=mo.Tracks(
+                'план', 'факт',
+                blend=mo.blend(given='факт', follow='план',
+                               until='2026-03', name='прогноз')))
+        return m
+
+    def test_a_scalar_line_blends_to_a_scalar(self):
+        # «Сумма договора»: план 50 000, факт (доп.соглашение) 52 000.
+        # The time splice used to spread the constant into a full
+        # 6-period series — a record field quietly turned temporal.
+        m = self._model()
+        with m:
+            m.p = mo.MultiVariable('P', excel_props={'tab': True})
+            m.p._records_container = True  # the Collection contract
+            with m.p as p:
+                p.сумма = mo.Variable(план=50000, факт=52000,
+                                      display_name='Сумма')
+        tv = m.p.сумма._value
+        assert tv['прогноз'] == 52000
+        assert not isinstance(tv['прогноз'], list)
+
+    def test_fact_absent_the_scalar_forecast_is_the_plan(self):
+        m = self._model()
+        with m:
+            m.p = mo.MultiVariable('P', excel_props={'tab': True})
+            m.p._records_container = True
+            with m.p as p:
+                p.срок = mo.Variable(план=12, display_name='Срок')
+        assert m.p.срок._value['прогноз'] == 12
+
+    def test_temporal_lines_still_splice_per_period(self):
+        m = self._model()
+        with m:
+            m.p = mo.MultiVariable('P', excel_props={'tab': True})
+            with m.p as p:
+                p.ряд = mo.Variable(план=[1.0] * 6, display_name='Ряд')
+        assert len(m.p.ряд._value['прогноз']) == 6
+
+
+class TestBlendRowIsAlive:
+    """The blended row references its subrows — the file stays live."""
+
+    def _book(self, model):
+        import os
+        import tempfile
+
+        import openpyxl
+
+        path = os.path.join(tempfile.mkdtemp(), "b.xlsx")
+        model.to_excel(path)
+        return openpyxl.load_workbook(path)
+
+    def _model(self, **view_kw):
+        m = mo.Model(
+            'm', display_name='M', default_grain='month',
+            default_start='2026-01', default_periods=4,
+            tracks=mo.Tracks(
+                'план', 'факт',
+                blend=mo.blend(given='факт', follow='план',
+                               until='2026-02')),
+            **view_kw)
+        with m:
+            m.p = mo.MultiVariable('P', excel_props={'tab': True})
+            with m.p as p:
+                p.выручка = mo.Variable(
+                    план=[10.0] * 4, факт=[12.0, 11.0, None, None],
+                    display_name='Выручка')
+                p.налог = p.выручка * 0.1
+        return m
+
+    def test_the_splice_is_a_formula_over_its_subrows(self):
+        ws = self._book(self._model())['P']
+        # Blend row 2; план row 3; факт row 4. Before the boundary the
+        # FACT wins with a fallback; after it the PLAN does.
+        assert ws['B2'].value == '=IF(B4="",B3,B4)'
+        assert ws['C2'].value == '=IF(C4="",C3,C4)'
+        assert ws['D2'].value == '=IF(D3="",D4,D3)'
+        assert ws['E2'].value == '=IF(E3="",E4,E3)'
+
+    def test_a_derived_line_keeps_its_own_formula(self):
+        # налог = выручка × 0.1 — it references the BLEND row (the live
+        # universe). Replaying the splice on an output would be wrong.
+        ws = self._book(self._model())['P']
+        assert ws['B5'].value == '=B2 * 0.1'
+
+    def test_a_computed_plan_with_authored_facts_still_splices(self):
+        # The customer shape: план is a FORMULA (a sum over a dated
+        # register), факт and прогноз are authored series. The line has
+        # both an expression and role kwargs — the engine calls it a
+        # DATA line and splices it, so the workbook must splice it too.
+        # Left with its base expression the file showed ПЛАН where the
+        # app showed the blend (акт перенесён с сентября на октябрь).
+        m = mo.Model(
+            'm', display_name='M', default_grain='month',
+            default_start='2026-01', default_periods=4,
+            tracks=mo.Tracks(
+                'план', 'прогноз', 'факт',
+                blend=mo.blend(given='факт', follow='прогноз')),
+        )
+        with m:
+            m.p = mo.MultiVariable('P', excel_props={'tab': True})
+            with m.p as p:
+                p.акты = mo.Variable([0.0, 20.0, 0.0, 0.0],
+                                     display_name='Акты')
+                p.выручка = mo.Variable(
+                    p.акты * 1.0,
+                    прогноз=[0.0, 0.0, 20.0, 0.0],
+                    факт=[None, None, None, None],
+                    display_name='Выручка')
+        ws = self._book(m)['P']
+        rows = {ws.cell(r, 1).value: r for r in range(1, ws.max_row + 1)}
+        blend = rows['Выручка']
+        given = rows['Выручка · факт']
+        follow = rows['Выручка · прогноз']
+        # Boundary-less: given wins wherever it carries a value.
+        assert ws.cell(blend, 2).value == (
+            f'=IF(B{given}="",B{follow},B{given})')
+        # …and the splice, not the план formula: september is the
+        # прогноз row's zero, october its 20.
+        assert ws.cell(blend, 4).value == (
+            f'=IF(D{given}="",D{follow},D{given})')
+
+    def test_the_settled_ink_is_a_rule_not_a_stamp(self):
+        # The blended cell goes blue WHILE a fact stands behind it —
+        # as a conditional rule over the fact cell, so typing a fact
+        # into the downloaded file colours its own month. A stamped
+        # font would freeze provenance at download time, the same
+        # dead-values habit the splice formulas exist to kill.
+        ws = self._book(self._model())['P']
+        rules = ws.conditional_formatting
+        by_range = {}
+        for rng in rules:
+            for rule in rng.rules:
+                by_range[str(rng.sqref)] = rule
+        # Blend row 2, fact row 4: each month keys off ITS fact cell.
+        assert by_range['B2'].formula == ['B4<>""']
+        assert by_range['C2'].formula == ['C4<>""']
+        # Font only — a fill would cut holes in the house style's
+        # section bands.
+        assert by_range['B2'].dxf.font is not None
+        assert by_range['B2'].dxf.fill is None
+
+    def test_the_blend_only_book_bakes_nothing_extra(self):
+        # tracks='blend' emits the default row ALONE — no subrows to
+        # reference, so the row keeps its computed values.
+        m = self._model(
+            default_excel_view=mo.ExcelView(tracks='blend'))
+        ws = self._book(m)['P']
+        assert ws['B2'].value == 12.0
+        labels = [ws.cell(r, 1).value for r in range(1, ws.max_row + 1)]
+        assert not any('·' in str(x) for x in labels if x)  # no subrows
+
+
+class TestTrackSubrowsCarryTheirOwnFormula:
+    """A DERIVED track explains itself in ITS OWN coordinates.
+
+    The blend row has always carried the line's formula over its
+    operands' blend rows. The other subrows got numbers, so «Итого ·
+    план» sat frozen under a row that recomputed — change January's
+    план in the downloaded file and the план total did not move. The
+    engine already knows the answer (a derived track's value IS the
+    line's expression over the operands' same-track values), so the
+    same expression through a per-track address book is the honest
+    formula.
+    """
+
+    def _book(self, tmp_path, **kw):
+        import openpyxl
+
+        m = mo.Model(
+            "m", display_name="M",
+            tracks=mo.Tracks("план", "факт",
+                             blend=mo.blend(given="факт", follow="план")),
+            default_grain="month", default_start="2026-01",
+            default_periods=2,
+            default_excel_view=mo.ExcelView(tracks="rows"),
+        )
+        with m:
+            m.s = mo.MultiVariable("S", excel_props={"tab": True})
+            with m.s as s:
+                s.a = mo.Variable([10.0, 20.0], display_name="А",
+                                  факт=[11.0, None])
+                s.ставка = mo.Variable(0.5, display_name="Ставка")
+                s.derived = mo.Variable(s.a * s.ставка, display_name="Д")
+                s.mixed = mo.Variable(s.a + s.a, display_name="М",
+                                      факт=[99.0, 98.0])
+        path = tmp_path / "b.xlsx"
+        m.to_excel(str(path))
+        ws = openpyxl.load_workbook(str(path))["S"]
+        return {
+            (ws.cell(row=r, column=1).value
+             or ws.cell(row=r, column=2).value): [
+                ws.cell(row=r, column=c).value for c in (3, 4)
+            ]
+            for r in range(1, 40)
+            if (ws.cell(row=r, column=1).value
+                or ws.cell(row=r, column=2).value)
+        }
+
+    def test_a_derived_track_reads_its_own_track(self, tmp_path):
+        rows = self._book(tmp_path)
+        план = rows["Д · план"][0]
+        факт = rows["Д · факт"][0]
+        assert isinstance(план, str) and план.startswith("=")
+        assert isinstance(факт, str) and факт.startswith("=")
+        # …and they point at DIFFERENT rows — each its own track's.
+        assert план != факт
+
+    def test_an_untracked_operand_keeps_its_single_cell(self, tmp_path):
+        rows = self._book(tmp_path)
+        # «Ставка» has no tracks, so every track's formula multiplies by
+        # the same cell — a constant reads the same from anywhere.
+        план, факт = rows["Д · план"][0], rows["Д · факт"][0]
+        общий = set(re.findall(r"B\d+", план)) & set(re.findall(r"B\d+", факт))
+        assert общий, (план, факт)
+
+    def test_an_authored_track_stays_data(self, tmp_path):
+        rows = self._book(tmp_path)
+        # «А» typed both tracks; «М» typed only факт. Typed series are
+        # data — a formula there would overwrite what the user entered.
+        assert rows["А · план"][0] == 10.0
+        assert rows["А · факт"][0] == 11.0
+        assert rows["М · факт"][0] == 99.0
+        # …while М's план is derived and does get one.
+        assert str(rows["М · план"][0]).startswith("=")
+
+    def test_the_blend_row_is_left_to_its_own_writer(self, tmp_path):
+        rows = self._book(tmp_path)
+        # A spliced line's blend still asks its subrows; a derived
+        # line's blend still carries the shared formula.
+        assert str(rows["А"][0]).startswith("=IF(")
+        assert str(rows["Д"][0]).startswith("=")
+
+
+class TestLoopBuiltIntermediatesReferenceTheirRows:
+    """A loop-built model computes intermediates as per-month
+    expressions in local Python lists, then materializes the same
+    lists as rows. The row's wrapper shares the ORIGINAL expression
+    tree with every downstream consumer — identity is the only join —
+    and without it each consumer unrolled the intermediates wholesale:
+    a 1040-char payroll cell repeating the ОПВ cap four times, one row
+    under the ОПВ row that holds it.
+    """
+
+    def _book(self, tmp_path):
+        import openpyxl
+
+        m = mo.Model(
+            "m", display_name="M",
+            tracks=mo.Tracks("план", "факт",
+                             blend=mo.blend(given="факт", follow="план")),
+            default_grain="month", default_start="2026-01",
+            default_periods=2,
+        )
+        with m:
+            m.s = mo.MultiVariable("S", excel_props={"tab": True})
+            with m.s as s:
+                s.ставка = mo.Variable(0.1, display_name="Ставка")
+                оклады = [mo.Variable(100.0), mo.Variable(200.0)]
+                налог = [о * s.ставка for о in оклады]
+                чистыми = [о - н for о, н in zip(оклады, налог)]
+                s.оклад = mo.Variable(оклады, display_name="Оклад",
+                                      факт=[None, None])
+                s.налог = mo.Variable(налог, display_name="Налог",
+                                      факт=[None, None])
+                s.чистыми = mo.Variable(чистыми, display_name="Чистыми",
+                                        факт=[None, None])
+        path = tmp_path / "b.xlsx"
+        m.to_excel(str(path))
+        ws = openpyxl.load_workbook(str(path))["S"]
+        return {
+            (ws.cell(row=r, column=1).value
+             or ws.cell(row=r, column=2).value): [
+                ws.cell(row=r, column=c).value for c in (3, 4)
+            ]
+            for r in range(1, 30)
+            if (ws.cell(row=r, column=1).value
+                or ws.cell(row=r, column=2).value)
+        }
+
+    def test_the_consumer_references_the_intermediate_rows(self, tmp_path):
+        rows = self._book(tmp_path)
+        налог = str(rows["Налог · план"][0])
+        чистыми = str(rows["Чистыми · план"][0])
+        # Налог references the оклад subrow's cell, not an unrolled
+        # copy of its expression…
+        assert налог.startswith("=") and "*" in налог
+        # …and Чистыми references BOTH rows by cell: it must contain
+        # cell refs and no second copy of the multiplication.
+        assert чистыми.startswith("=")
+        assert "*" not in чистыми, чистыми
+    def test_lengths_stay_flat(self, tmp_path):
+        rows = self._book(tmp_path)
+        # The unrolled form grew with every hop; the referenced form
+        # stays a handful of cells.
+        assert len(str(rows["Чистыми · план"][0])) < 30

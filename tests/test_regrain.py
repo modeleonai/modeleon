@@ -673,3 +673,38 @@ class TestAliasProjection:
 
         q = project_model(m, 'quarter')
         assert q.board.total._value == [9.0, 9.0]
+
+
+class TestHoleAbsorption:
+    """A ``None`` in a bucket is an un-entered period — absence, not
+    failure. The coarse cell is a hole until every native period in it
+    is known; no recipe may crash on one."""
+
+    def test_any_hole_makes_an_aggregate_a_hole(self):
+        from modeleon.core.regrain import apply_recipe
+        for recipe in ('sum', 'mean', 'min', 'max', 'geometric'):
+            assert apply_recipe([1.0, None, 3.0], recipe) is None
+
+    def test_positional_recipes_read_only_their_own_period(self):
+        # first/last emit a positional cell reference in Excel — value
+        # and formula must agree, so only THAT period's hole matters.
+        from modeleon.core.regrain import apply_recipe
+        assert apply_recipe([None, None, 130.0], 'last') == 130.0
+        assert apply_recipe([1.0, 2.0, None], 'last') is None
+        assert apply_recipe([1.0, None, None], 'first') == 1.0
+        assert apply_recipe([None, 2.0, 3.0], 'first') is None
+
+    def test_all_known_bucket_still_reduces(self):
+        from modeleon.core.regrain import apply_recipe
+        assert apply_recipe([1.0, 2.0, 3.0], 'sum') == 6.0
+
+    def test_error_token_outranks_the_hole(self):
+        from modeleon.core.regrain import apply_recipe
+        assert apply_recipe(['#VALUE!', None, 3.0], 'sum') == '#VALUE!'
+
+    def test_series_with_hole_tail_projects_quietly(self):
+        from modeleon.core.time import regrain_series
+        _, vals = regrain_series(
+            [10.0, 20.0, 30.0, None, None, None], 'month', 'quarter',
+            '2026-01', 'sum')
+        assert vals == [60.0, None]

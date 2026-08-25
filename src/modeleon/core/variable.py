@@ -84,8 +84,30 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
         'text_align', 'indent',
         # Fill / borders
         'bg', 'border_top', 'border_bottom', 'border_left', 'border_right',
+        # Value-driven fill: paint a value cell's background this color
+        # wherever the cell holds a nonzero number — a Gantt band / active
+        # mask reads as a continuous bar. Emitted as a LIVE conditional
+        # rule in the workbook, so edited values repaint themselves.
+        'bg_nonzero',
+        # Row-total opt-in: when the sheet's view projects a
+        # ``('row_sum', caption)`` lead column, this row prints its
+        # periods' total there — a LIVE ``=SUM(...)`` in the workbook,
+        # the computed number in the grid. Rows without the flag leave
+        # the column empty (a ratio row's sum is nonsense).
+        'row_sum',
+        # Служебная строка: размечается и считается как обычно
+        # (значения, формулы, подписи), но НЕ ПОКАЗЫВАЕТСЯ —
+        # нативно скрытая строка в .xlsx, пропуск в гриде,
+        # фильтр в графе. Наследуется вниз по дереву MV.
+        'hidden',
         # Data formatting
         'number_format',
+        # Layout: this row's VALUES print on its parent section's
+        # header row — the financial-book subtotal-on-header form.
+        'header_row',
+        # The row's article number («1.1») — data, not label text; the
+        # view decides whether it renders as a lead column or inline.
+        'article',
         # Cell-type colouring — cascades to descendants. ``True`` for the
         # default palette, or a dict ``{'input'|'formula'|'reference': hex}``.
         'format_by_type',
@@ -382,6 +404,11 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
                 self._schedule = dict(value._schedule)
             if self._extend is None:
                 self._extend = getattr(value, '_extend', None)
+            # Wrapping never strips units: ``mo.Variable(a + b,
+            # display_name=…)`` keeps the sum's ₸ unless the wrapper
+            # declares its own.
+            if self._unit is None and getattr(value, '_unit', None) is not None:
+                self._unit = value._unit
         if (start is None) != (grain is None):
             raise ValueError(
                 "A located Variable needs both `start` and `grain` (or neither, "
@@ -774,7 +801,7 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
                 self._dependency_refs.append(v)
             v = list(ov) if isinstance(ov, list) else ov
         elif isinstance(v, list):
-            v = list(v)
+            v = self._lower_role_cells(list(v), name, label)
         window = resolve_default_window(owner)
         if (isinstance(v, list) and len(v) > 1 and window is not None
                 and window.periods is not None
@@ -833,6 +860,44 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
             f"track to mo.Tracks(...), or fix the kwarg name if "
             f"it is a typo."
         )
+
+    def _lower_role_cells(self, items: list, role: str, label: str) -> list:
+        """Unwrap Variable ELEMENTS of a role-bound list.
+
+        The positional path lowers a compound list through
+        ``_build_compound_formula``; the role path used to store the
+        raw objects, and Variable instances leaked into
+        :class:`TrackValues` — and from there onto the wire. Elements
+        lower by the same rules as a whole-Variable operand: value
+        pull, role-coordinate alignment for tracked elements, loud on
+        valueless ones, identity dependency edge.
+        """
+        from .tracks import TrackValues
+        out: list = []
+        for x in items:
+            if not isinstance(x, Variable):
+                out.append(x)
+                continue
+            xv = x._value
+            if xv is None:
+                raise ValueError(
+                    f"{label!r}.{role}: a list element reads a variable "
+                    f"that has no value yet (still floating, or an "
+                    f"unadopted mo.schedule) — attach it to the model "
+                    f"first."
+                )
+            if isinstance(xv, TrackValues):
+                if role not in xv:
+                    raise ValueError(
+                        f"{label!r}.{role}: a list element carries "
+                        f"tracks ({', '.join(xv.roles)}) but no "
+                        f"{role!r} — slice explicitly: .at(track='...')."
+                    )
+                xv = xv[role]
+            out.append(xv)
+            if not any(r is x for r in self._dependency_refs):
+                self._dependency_refs.append(x)
+        return out
 
     def _materialize_roles(self, names, label: str) -> None:
         """Lower the stashed track kwargs onto a :class:`TrackValues`.
@@ -912,8 +977,8 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
                     self._dependency_refs.append(operand)
             else:
                 new_tracks[role] = (
-                    list(operand) if isinstance(operand, list)
-                    else operand
+                    self._lower_role_cells(list(operand), role, label)
+                    if isinstance(operand, list) else operand
                 )
         if not new_tracks:
             return
@@ -1030,23 +1095,31 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
             )
         if window.start is None or window.periods is None:
             return    # declaration-time validation demands a full window
-        try:
-            until_anchor = _parse(b.until, window.grain)
-        except (ValueError, TypeError) as exc:
-            raise ValueError(
-                f"mo.blend until={b.until!r} is not a {window.grain} "
-                f"period label — the boundary must be spelled at the "
-                f"model grain (like the window start {window.start!r})."
-            ) from exc
         labels = _period_labels(
             window.start, None, window.periods, window.grain
         )
-        # Compare PARSED anchors, never raw strings — '2025-2' would
-        # sort after '2025-12' lexicographically and silently misroute
-        # the whole splice.
-        before_boundary = [
-            _parse(lb, window.grain) <= until_anchor for lb in labels
-        ]
+        if b.until is None:
+            # Boundary-less splice: ``given`` wins wherever it carries a
+            # value, ``follow`` fills the rest. Same rule the bounded
+            # form applies BEFORE its boundary — with no date to keep
+            # current, which is what a register typed as events arrive
+            # (irregular, incomplete) actually needs.
+            before_boundary = [True] * len(labels)
+        else:
+            try:
+                until_anchor = _parse(b.until, window.grain)
+            except (ValueError, TypeError) as exc:
+                raise ValueError(
+                    f"mo.blend until={b.until!r} is not a {window.grain} "
+                    f"period label — the boundary must be spelled at the "
+                    f"model grain (like the window start {window.start!r})."
+                ) from exc
+            # Compare PARSED anchors, never raw strings — '2025-2' would
+            # sort after '2025-12' lexicographically and silently misroute
+            # the whole splice.
+            before_boundary = [
+                _parse(lb, window.grain) <= until_anchor for lb in labels
+            ]
         given = tv[b.given] if b.given in tv else None
         # A derived line that acquired pinned data (dotted binding /
         # pin spelling) continues its INHERITED live after the
@@ -1058,6 +1131,33 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
         else:
             follow = tv[b.follow] if b.follow in tv else None
         if given is None and follow is None:
+            return
+
+        # A RECORD's scalar line («Сумма договора», a date, a status)
+        # blends to a SCALAR: given when present, else follow. The time
+        # splice would spread the constant into a full-window series
+        # and quietly turn a record field temporal — план/факт/прогноз
+        # belong to record scalars too, without giving them a timeline.
+        # OUTSIDE records a scalar-per-track line is an ASSUMPTION
+        # whose live value switches at the boundary (факт=100 →
+        # бюджет=90) — that splice stays. The container marks itself:
+        # ``_records_container = True`` (pro's Collection does; any
+        # records-shaped container may).
+        def _in_record() -> bool:
+            node = owner
+            while node is not None:
+                if getattr(node, '_records_container', False):
+                    return True
+                node = (getattr(node, '_parent', None)
+                        or getattr(node, '_owner', None))
+            return False
+        if (not isinstance(given, list) and not isinstance(follow, list)
+                and not any(isinstance(tr, list) for tr in tv.values())
+                and _in_record()):
+            merged = tv.as_dict()
+            merged[b.name] = given if given is not None else follow
+            self._value = TrackValues(merged)
+            self._blend_name = b.name
             return
 
         def _cell(track, t):
