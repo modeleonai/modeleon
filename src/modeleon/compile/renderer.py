@@ -29,6 +29,8 @@ if TYPE_CHECKING:
         Literal,
         MethodCall,
         Paren,
+        Regrain,
+        Restrict,
         RollingAggregate,
         SelfRef,
         Subscript,
@@ -62,6 +64,27 @@ class RenderCtx:
     # be rendered natively. Callers set this at the top-level
     # ``translate()`` / ``render()`` call; deeper recursion inherits.
     self_var: Optional[Any] = None
+    # Set by a renderer when it had to inline a LIST-valued,
+    # address-less Variable into a SCALAR cell — the positional
+    # collapse makes the formula meaningless (a SUM over a foreign
+    # list becomes SUM(first_element)). The emission entry checks this
+    # and falls back to the computed VALUE literal instead (values are
+    # computed in Python, renderers only print them: degrade to the
+    # truth, never to a wrong formula).
+    lossy_inline: bool = False
+    # The track COORDINATE the formula being rendered belongs to (a
+    # per-track subrow, or a head row whose shown track was authored
+    # with an expression). Tracked operands then resolve to THEIR row
+    # of the same track — never to their display-default/blend row,
+    # which would compute a different number than the cell holds —
+    # and degrade to the track's value when no such row is laid out.
+    # None = no coordinate: operands resolve to display-default rows.
+    track_role: Optional[str] = None
+    # Set by a renderer when a tracked operand had no row for the
+    # coordinate and its VALUE was baked into the formula text. Such a
+    # formula is true now but not stable: a caller that caches formula
+    # text must not reuse it across value edits of that operand.
+    inlined_value: bool = False
 
 
 class Renderer(Protocol):
@@ -105,6 +128,12 @@ class Renderer(Protocol):
     def render_selfref(self, node: "SelfRef", ctx: RenderCtx) -> Any: ...
     def render_rollingaggregate(
         self, node: "RollingAggregate", ctx: RenderCtx
+    ) -> Any: ...
+    def render_regrain(
+        self, node: "Regrain", ctx: RenderCtx
+    ) -> Any: ...
+    def render_restrict(
+        self, node: "Restrict", ctx: RenderCtx
     ) -> Any: ...
 
 

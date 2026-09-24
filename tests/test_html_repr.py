@@ -121,7 +121,7 @@ class TestVariableReprAddresses:
 class TestModelHtmlPositional:
     """``model_html`` treats the rendered root as the workbook itself:
     first-depth sub-MVs become tabs, deeper sub-MVs become sections in
-    the panel's flat layout. The test here pins the user's `t.h = acme`
+    the panel's flat layout. The test here pins the `t.h = acme`
     scenario — rendering ``t`` exposes one `Acme` tab where the inner
     sheet-marked `pnl` falls through as a section at row 1."""
 
@@ -136,8 +136,8 @@ class TestModelHtmlPositional:
 
         html = t._repr_html_()
 
-        # The `Pnl` section header lands on row 1 of the Acme tab —
-        # the user's documented expectation. Cell addresses are
+        # The `Pnl` section header lands on row 1 of the Acme tab,
+        # exactly as ``to_excel`` places it. Cell addresses are
         # zero-indexed against this flat layout, so cogs's formula
         # references revenue via ``B2`` (row 2 in the panel).
         assert 'data-cell="Acme!B2"' in html

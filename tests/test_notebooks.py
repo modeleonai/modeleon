@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Notebook smoke tests.
 
-Runs every `.ipynb` under ``packages/engine/notebooks/`` via nbclient and
+Runs every `.ipynb` under ``notebooks/`` (beside ``tests/``) via nbclient and
 asserts no cell raises. Skipped when nbclient isn't installed (nbclient
 is not a core test dep).
 """

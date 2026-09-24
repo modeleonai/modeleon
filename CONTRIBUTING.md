@@ -82,7 +82,6 @@ the realistic pace of a small-team project.
 ## Running tests
 
 ```bash
-cd packages/engine
 pip install -e ".[dev]"
 pytest                              # all tests
 pytest tests/test_variable.py -v    # one file

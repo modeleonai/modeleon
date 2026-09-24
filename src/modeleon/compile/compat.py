@@ -7,9 +7,9 @@ whose ``render_backends`` or ``compute_backends`` hint excludes a given
 target. An empty list means the tree is fully compatible — a renderer
 or compute engine for that target can emit every call natively.
 
-Useful as a pre-flight check before compiling a model to an unfamiliar
-target ("will this translate cleanly to pandas?") and as the backing
-data for diff / graph views that want to flag fallback-bound nodes.
+Useful as a pre-flight check before compiling a model to a target
+("which calls will land in Excel as values rather than formulas?") and
+as data for any tooling that wants to flag fallback-bound nodes.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ class CompatIssue:
 
     Emitted by :func:`check_compat` for each call whose backend hint
     excludes the requested target. The caller can render these into a
-    warning, a UI badge, or a CI assertion.
+    warning, a report, or a CI assertion.
     """
 
     func: str
@@ -121,9 +121,9 @@ def check_compat(
     Args:
         node: An :class:`Expr`, Variable, or MultiVariable. The walker
             descends into all reachable FuncCalls.
-        target: Backend name to check against (``"excel"``, ``"pandas"``,
-            ``"sql"``, etc.). Case-sensitive — match the names used when
-            the FuncCall was built.
+        target: Backend name to check against (``"excel"``, or any other
+            name used in a FuncCall's backend hint). Case-sensitive —
+            match the names used when the FuncCall was built.
         kind: ``"render"`` checks :attr:`FuncCall.render_backends`;
             ``"compute"`` checks :attr:`FuncCall.compute_backends`.
 

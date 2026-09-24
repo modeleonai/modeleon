@@ -16,7 +16,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _registry: dict[str, Any] = {
-    # Extra kwargs accepted by Variable (e.g., control=, access=, style=)
+    # Extra kwargs accepted by Variable (e.g. an extension's tag= or note=)
     "variable_kwargs": {},
     # Additional compiler passes (run after core compilation)
     "compiler_passes": [],

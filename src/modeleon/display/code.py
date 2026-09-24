@@ -28,7 +28,7 @@ every line you might have written.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Iterable
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..core.expr import Expr
@@ -286,7 +286,7 @@ def _render_expr_qualified(
             if e.periods is not None:
                 pstr = go(e.periods) if isinstance(e.periods, Expr) else str(e.periods)
                 parts.append(f"periods={pstr}")
-            return f"recurrence(" + ", ".join(parts) + ")"
+            return "recurrence(" + ", ".join(parts) + ")"
         if isinstance(e, RollingAggregate):
             qual = qualify(e.source) if e.source in in_scope else (
                 e.source.python_name or e.source.path.leaf
@@ -423,12 +423,11 @@ def _render_kwargs(obj: "Variable | MultiVariableBase") -> str:
     Returns a leading-comma form so callers can append after a
     positional first arg. Empty string when nothing to emit.
 
-    v0 covers ``display_name``, ``unit``, and ``keys``. ``indexed_by``
+    Covers ``display_name``, ``unit``, and ``keys``. ``indexed_by``
     is intentionally skipped — it usually references another
     Variable (an axis), and serializing that reference back to a
-    name requires the in-scope analysis we already do for formulas;
-    folding it in earns its own pass when a real consumer demands it.
-    Plugin-routed kwargs and ``excel_props`` are also deferred.
+    name requires the in-scope analysis we already do for formulas.
+    Plugin-routed kwargs and ``excel_props`` are not emitted either.
     """
     from ..core.humanize import humanize_identifier
 

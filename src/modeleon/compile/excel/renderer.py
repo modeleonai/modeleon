@@ -9,8 +9,8 @@ Excel-specific postprocessing (``=`` prefix, outer-paren stripping).
 
 All Excel specifics live here: operator translation, literal
 formatting, cell-reference syntax, range notation, sheet qualification,
-function name casing. Adding a new renderer (Google Sheets, JSON, a web
-grid) means writing a parallel file alongside this one — core,
+function name casing. Another renderer (the JSON renderer in
+``compile/json`` is one) is a parallel file alongside this one — core,
 translator-facade, and walker stay untouched.
 """
 
@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import re
 import warnings
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
 from .addresses import VariableAddresses
@@ -32,6 +33,8 @@ from ...core.expr import (
     Literal,
     MethodCall,
     Paren,
+    Regrain,
+    Restrict,
     RollingAggregate,
     SelfRef,
     Subscript,
@@ -86,6 +89,28 @@ _NON_COMMUTATIVE_RIGHT: set[str] = {"-", "/", "//", "%", "**", "^"}
 # scalar VarRefs / literals as normal. Covers classic aggregates (SUM,
 # MAX, MIN, …) and financial-series funcs (IRR, NPV, XIRR) where Excel
 # expects a range for the cash-flow / dates argument.
+def _contiguous_run(refs: list) -> bool:
+    """Do these cell refs sit side by side on one row?
+
+    A range is only honest when they do. The interleave that breaks it
+    is ordinary — a declared quarter total puts a column between March
+    and April — and the resulting ``SUM`` looks perfectly valid while
+    counting the quarter twice.
+    """
+    from openpyxl.utils.cell import coordinate_to_tuple
+
+    try:
+        cells = [coordinate_to_tuple(r.split("!")[-1].replace("$", ""))
+                 for r in refs]
+    except Exception:
+        return True                    # unparseable: emit the plain range
+    rows = {r for r, _c in cells}
+    if len(rows) != 1:
+        return False
+    cols = [c for _r, c in cells]
+    return all(b - a == 1 for a, b in zip(cols, cols[1:]))
+
+
 _RANGE_TAKING_FUNCS = {
     "SUM", "AVERAGE", "MIN", "MAX", "COUNT",
     "IRR", "NPV", "XIRR",
@@ -96,9 +121,10 @@ _RANGE_TAKING_FUNCS = {
 # use Excel casing directly (``IF``, ``ABS``, ``ROUND``, etc.), so the
 # translator just emits them verbatim — no rename map needed.
 _PASSTHROUGH_FUNCS = _RANGE_TAKING_FUNCS | {
-    "IF", "ABS", "ROUND", "INT", "MOD",
-    "EDATE", "EOMONTH", "YEAR", "MONTH", "DAY", "DATE", "TODAY",
-    "LEN", "UPPER", "LOWER", "CONCAT", "TEXT",
+    "IF", "AND", "OR", "NOT", "CHOOSE", "ISBLANK", "ABS", "ROUND", "INT",
+    "MOD",
+    "EDATE", "EOMONTH", "YEAR", "MONTH", "DAY", "DATE", "DAYS360", "TODAY",
+    "LEN", "UPPER", "LOWER", "TEXT",  # CONCAT renders as the `&` operator
     "PMT", "FV", "PV", "RATE",
 }
 
@@ -119,11 +145,17 @@ def _value_to_excel_literal(value: Any) -> str:
     """Render a Python value as an Excel-literal string fit for embedding
     in a formula. Strings get double-quoted; booleans render as
     ``TRUE``/``FALSE``; None becomes ``0`` (matches how ``Literal(None)``
-    is emitted elsewhere); numbers pass through via ``str()``."""
+    is emitted elsewhere); dates become ``DATE(y, m, d)`` (a bare
+    ``2025-01-01`` would be read by Excel as arithmetic); numbers pass
+    through via ``str()``."""
     if value is None:
         return "0"
     if isinstance(value, bool):
         return "TRUE" if value else "FALSE"
+    if isinstance(value, datetime):
+        value = value.date()
+    if isinstance(value, date):
+        return f"DATE({value.year}, {value.month}, {value.day})"
     if isinstance(value, str):
         escaped = value.replace('"', '""')
         return f'"{escaped}"'
@@ -187,9 +219,19 @@ class ExcelRenderer:
         self,
         addresses: Dict[str, VariableAddresses],
         var_to_sheet: Optional[Dict[str, str]] = None,
+        identity_cells: Optional[Dict[int, "tuple[str, int]"]] = None,
     ) -> None:
         self.addresses = addresses
         self.var_to_sheet = var_to_sheet or {}
+        #: ``id(floating Variable) → (owner vid, period)`` — a per-month
+        #: intermediate built in a Python loop is often the SAME object
+        #: that sits in some laid-out row's value list. Without this map
+        #: a formula over such intermediates unrolls them wholesale
+        #: (e.g. a cell spelling a monthly subtotal out again instead of
+        #: pointing at the row that already holds it);
+        #: with it the reference resolves to the cell that already
+        #: carries the number — the way a human builds the same sheet.
+        self.identity_cells = identity_cells or {}
         self.walker: Any = None  # set by Walker(renderer) constructor
 
     # ─── Dispatch targets ───────────────────────────────────────
@@ -214,26 +256,230 @@ class ExcelRenderer:
         return f"{self.walker.render(node.left, ctx)} {op} {self.walker.render(node.right, ctx)}"
 
     def render_listexpr(self, node: ListExpr, ctx: RenderCtx) -> str:
-        return "[" + ", ".join(self.walker.render(item, ctx) for item in node.items) + "]"
+        """A ListExpr is positional: item *i* is the formula for period *i*.
+
+        Render only the item the current cell asks for — the whole
+        bracketed list is Python syntax, never a valid Excel expression.
+        Out-of-range indices clamp to the last item, matching
+        ``_value_at_period``.
+        """
+        if not node.items:
+            raise ValueError(
+                "ListExpr with no items has no per-period Excel rendering"
+            )
+        idx = ctx.period_idx if 0 <= ctx.period_idx < len(node.items) else len(node.items) - 1
+        return self.walker.render(node.items[idx], ctx)
 
     def render_literal(self, node: Literal, ctx: RenderCtx) -> str:
         return _value_to_excel_literal(node.value)
 
     def render_varref(self, node: VarRef, ctx: RenderCtx) -> str:
         var_id = node.var.id
+        if ctx.track_role is not None:
+            # Inside a track coordinate a TRACKED operand means its
+            # SAME-track series (that is what the value was computed
+            # from) — never its display-default/blend row.
+            coord = self._track_coordinate_ref(node.var, ctx.track_role, ctx)
+            if coord is not None:
+                return coord
         if var_id in self.addresses:
             return self._resolve_var_addr(var_id, ctx.period_idx, ctx.current_sheet)
+        # An address-less operand may still LIVE in a laid-out row: a
+        # loop-built per-month intermediate is the same object as that
+        # row's month element. Reference the cell instead of unrolling
+        # the expression — except into the cell being written itself,
+        # where the reference would be circular and the expression is
+        # the honest content.
+        home = self.identity_cells.get(id(node.var))
+        if home is None and node.var._expr is not None:
+            home = self.identity_cells.get(id(node.var._expr))
+        if home is not None:
+            owner_vid, owner_period = home
+            self_var = ctx.self_var
+            if not (self_var is not None and owner_vid == self_var.id
+                    and owner_period == ctx.period_idx):
+                return self._resolve_var_addr(
+                    owner_vid, owner_period, ctx.current_sheet
+                )
         # Variable not in this emission's layout. Two inlining strategies:
         # - if it has its own AST, recurse into it so we reach real cells;
         # - otherwise (plain input referenced from outside the emission
         #   subtree), inline its value as an Excel literal.
+        # Either way, collapsing a LIST into a SCALAR cell positionally
+        # is meaningless (SUM over a foreign list would become
+        # SUM(first_element)) — mark the render lossy so the cell falls
+        # back to the computed value.
+        if isinstance(node.var._value, list):
+            root = ctx.self_var
+            root_is_list = root is not None and (
+                getattr(root, 'var_type', None) == 'list'
+                or isinstance(getattr(root, '_value', None), list)
+            )
+            if not root_is_list:
+                ctx.lossy_inline = True
         if node.var._expr is not None:
             return self.walker.render(node.var._expr, ctx)
         _warn_out_of_scope_ref(node.var, ctx)
         return _value_to_excel_literal(_value_at_period(node.var._value, ctx.period_idx))
 
+    # ─── The coordinate law ─────────────────────────────────────
+    # Inside a track coordinate (``ctx.track_role``) a TRACKED operand
+    # means its same-track series — never its display-default/blend
+    # row, which computes a different number. Every address lookup in
+    # this renderer goes through ``_coord_var_id`` so the rule holds
+    # for plain references, lags, ranges, subscripts and rolling
+    # windows alike; a coordinate with no laid-out row degrades to the
+    # true value (one operand, or the whole cell), never to a formula
+    # over the wrong row.
+
+    @staticmethod
+    def _is_tracked(var: Any) -> bool:
+        value = getattr(var, '_value', None)
+        return value is not None and hasattr(value, 'roles')
+
+    def _coord_var_id(self, var: Any, ctx: RenderCtx) -> Optional[str]:
+        """The address-book id to read ``var`` through in ``ctx``.
+
+        ``var.id`` outside a coordinate, or for an untracked operand.
+        Inside one: the subrow id when that track is laid out; the head
+        id when the head IS that track (shows it, or shows the blend
+        standing in for it — a follow-only line's live row equals its
+        follow track); else None — nothing in the book carries this
+        coordinate, the caller must degrade to the value.
+        """
+        vid = var.id
+        role = ctx.track_role
+        if role is None or not self._is_tracked(var):
+            return vid
+        sub = f"{vid}__track_{role}"
+        if sub in self.addresses:
+            return sub
+        if vid in self.addresses:
+            shown = getattr(var, 'display_track_role', lambda: None)()
+            if shown == role:
+                return vid
+            shown_track = getattr(var, 'shown_track', None)
+            found = shown_track() if callable(shown_track) else None
+            if found is not None and found[0] == role:
+                return vid
+        return None
+
+    def _coord_value(self, var: Any, role: str, period_idx: int) -> Any:
+        value = getattr(var, '_value', None)
+        if value is None or not hasattr(value, 'roles') or role not in value:
+            return None
+        return _value_at_period(value[role], period_idx)
+
+    def _track_coordinate_ref(self, var: Any, role: str,
+                              ctx: RenderCtx) -> Optional[str]:
+        """A tracked ``var`` read at coordinate ``role``: the cell of its
+        laid-out subrow for that track, its head row when the head IS
+        that track, else the track's value inlined (the one operand
+        degrades, the formula around it stays live). None when ``var``
+        carries no tracks, or is an address-less expression to inline —
+        the caller resolves it the ordinary way."""
+        if not self._is_tracked(var):
+            return None
+        vid = var.id
+        cid = self._coord_var_id(var, ctx) if ctx.track_role == role else None
+        if cid is None and ctx.track_role != role:
+            # An explicit slice (``x.at(track=r)``) asks for coordinate r
+            # regardless of the enclosing one.
+            sub = f"{vid}__track_{role}"
+            if sub in self.addresses:
+                cid = sub
+            elif vid in self.addresses:
+                shown = getattr(var, 'display_track_role', lambda: None)()
+                shown_track = getattr(var, 'shown_track', None)
+                found = shown_track() if callable(shown_track) else None
+                if shown == role or (found is not None and found[0] == role):
+                    cid = vid
+        if cid is not None:
+            return self._resolve_var_addr(cid, ctx.period_idx, ctx.current_sheet)
+        if vid not in self.addresses and getattr(var, '_expr', None) is not None:
+            # An address-less EXPRESSION operand (``driver * 2`` inside
+            # ``plan=driver * 2``) is inlined by the ordinary path — its
+            # own tree keeps rendering inside this coordinate, so the
+            # rows it reads resolve to their same-track cells.
+            return None
+        inlined = self._coord_value(var, role, ctx.period_idx)
+        if inlined is None and role not in getattr(var, '_value', {}):
+            return None
+        ctx.inlined_value = True
+        return _value_to_excel_literal(inlined)
+
+    def render_restrict(self, node: Restrict, ctx: RenderCtx) -> str:
+        """``x.at(track='plan')`` — a reference into the coordinate's
+        laid-out row.
+
+        The expanded emission tree lays a tracked line out as its
+        display-default row (the line's own id) plus one subrow per
+        other track, identified ``<id>__track_<role>``. The restrict
+        resolves to that subrow's cell; to the head row when the
+        restricted role IS the display default (a single-role line, or
+        the blend itself); and, when no coordinate row is laid out
+        (a blend-only layout), inlines the track's value — the
+        one operand degrades, never the whole formula.
+        """
+        base = node.base
+        if isinstance(base, VarRef):
+            ref = self._track_coordinate_ref(base.var, node.label, ctx)
+            if ref is not None:
+                return ref
+            value = getattr(base.var, '_value', None)
+            if value is not None and hasattr(value, 'roles') and node.label in value:
+                return _value_to_excel_literal(
+                    _value_at_period(value[node.label], ctx.period_idx)
+                )
+        return self.walker.render(base, ctx)
+
+    def _inlined_chain_ref(self, node) -> bool:
+        """A VarRef to an address-less cumsum result — its inline
+        render is a self-referencing chain whose ``prev`` resolves to
+        THIS cell's own previous period, which already contains every
+        other term of the enclosing formula."""
+        return (
+            isinstance(node, VarRef)
+            and getattr(node.var, '_cumsum_source', None) is not None
+            and node.var.id not in self.addresses
+        )
+
+    @staticmethod
+    def _period_constant(node) -> bool:
+        """Renders to the same expression at every period — a scalar
+        input or literal; safe to fold into a chain's seed."""
+        if isinstance(node, Literal):
+            return True
+        if isinstance(node, VarRef):
+            value = getattr(node.var, '_value', None)
+            if isinstance(value, list):
+                return False
+            # A tracked SERIES varies by period exactly like a list —
+            # only an all-scalar tracked value is period-constant.
+            if hasattr(value, 'roles'):
+                return getattr(value, 'time_length', None) is None
+            return True
+        return False
+
     def render_binop(self, node: BinOp, ctx: RenderCtx) -> str:
         op = node.op
+        # ``scalar + cumsum(x)`` — the linear composition law. The
+        # inlined chain's ``prev`` is THIS row's previous cell, which
+        # already includes the scalar; re-adding it every period
+        # compounds the constant (the double-counted opening balance).
+        # Period 0 keeps both terms (seed); later periods are the
+        # chain alone. Any non-'+' composition can't be folded — the
+        # cell falls back to its computed value.
+        for chain_side, other_side in ((node.left, node.right),
+                                       (node.right, node.left)):
+            if not self._inlined_chain_ref(chain_side):
+                continue
+            if op == '+' and self._period_constant(other_side):
+                if ctx.period_idx == 0:
+                    break  # seed period: render both terms normally
+                return self.walker.render(chain_side, ctx)
+            ctx.lossy_inline = True
+            break
         # // → INT(a/b), % → MOD(a,b). Inside INT/MOD the relevant parent op
         # is ``/`` (precedence 3); the comma in MOD separates and needs no
         # parens-handling on either operand.
@@ -288,6 +534,12 @@ class ExcelRenderer:
         """
         if isinstance(node, BinOp):
             return node.op
+        if isinstance(node, Compare):
+            # Comparisons (=, >, …) have the lowest precedence, so a
+            # comparison used as an arithmetic operand must be parenthesized:
+            # ``prev * (hist = 0)``, never ``prev * hist = 0`` (which Excel
+            # re-reads as ``(prev * hist) = 0``).
+            return node.op
         if isinstance(node, VarRef):
             var = node.var
             if var.id in self.addresses:
@@ -295,6 +547,18 @@ class ExcelRenderer:
             if var._expr is not None:
                 return self._effective_op(var._expr)
             return None
+        if isinstance(node, ListExpr):
+            # Renders as ONE positional item (render_listexpr), but this
+            # helper has no period context — report the loosest-binding
+            # (minimum-precedence) op among items so the caller adds parens
+            # whenever ANY period's item would need them; redundant parens
+            # on the other periods are harmless, missing ones re-associate
+            # the formula.
+            ops = [op for item in node.items
+                   if (op := self._effective_op(item)) is not None]
+            if not ops:
+                return None
+            return min(ops, key=lambda o: _BINOP_PRECEDENCE.get(o, 0))
         return None
 
     def render_subscript(self, node: Subscript, ctx: RenderCtx) -> str:
@@ -306,20 +570,43 @@ class ExcelRenderer:
             )
             return f"{self.walker.render(node.base, ctx)}[{node.key}]"
 
-        var_id = node.base.var.id
+        var_id = self._coord_var_id(node.base.var, ctx)
+        if var_id is None:
+            # No row carries this coordinate: element-wise, the whole
+            # cell degrades to its computed value.
+            ctx.lossy_inline = True
+            return self._inline_subscript_value(node.base.var, node.key)
         addr_obj = self.addresses.get(var_id)
         if addr_obj is None:
             return self._inline_subscript_value(node.base.var, node.key)
 
         key = node.key
         if isinstance(key, slice):
+            # PERIOD-AWARE element, not a range. A slice in an element-
+            # wise formula (``cogs = pl_cogs[:20]`` mapping a 26-period
+            # driver onto a 20-period statement) must emit the CURRENT
+            # period's cell within the sliced window; emitting the whole
+            # range stamped the same ``=Input!B1:U1`` into every cell —
+            # #SPILL! chaos in Excel 365, accidental implicit
+            # intersection in older Excel. Aggregate args that genuinely want
+            # the range (``SUM(x[0:12])``) never reach here —
+            # ``_render_range_or_cell`` intercepts them.
             values = addr_obj.values[key]
             if not values:
                 return ""
             if len(values) == 1:
+                # One-cell window → broadcast: every period reads it.
                 return self._maybe_qualify(values[0], var_id, ctx.current_sheet)
-            first = self._maybe_qualify(values[0], var_id, ctx.current_sheet)
-            return f"{first}:{values[-1]}"
+            idx = ctx.period_idx
+            if idx >= len(values):
+                logger.warning(
+                    "Slice window on %r has %d cells but period %d is being "
+                    "rendered — clamping to the last cell (the owning row is "
+                    "longer than the sliced source).",
+                    var_id, len(values), idx,
+                )
+                idx = len(values) - 1
+            return self._maybe_qualify(values[idx], var_id, ctx.current_sheet)
 
         keyed_idx = self._lookup_key_index(node.base.var, key, addr_obj)
         if keyed_idx is not None:
@@ -343,6 +630,8 @@ class ExcelRenderer:
             return self.walker.render(node.base, ctx)
         if node.method == "shift":
             return self._render_shift(node, ctx)
+        if node.method == "cumsum":
+            return self._render_cumsum_chain(node, ctx)
 
         logger.warning(
             "Method %r on %r has no Excel translation — emitting textual "
@@ -369,10 +658,22 @@ class ExcelRenderer:
             return self._fallback_funccall(node, ctx)
 
         if func in _RANGE_TAKING_FUNCS:
-            parts = [self._render_range_or_cell(a, ctx) for a in node.args]
+            parts = [self._render_range_or_cell(a, ctx, func) for a in node.args]
             return f"{func}({', '.join(parts)})"
 
         parts = [self.walker.render(a, ctx) for a in node.args]
+
+        if func == "CONCAT":
+            # Emit the `&` operator, not the CONCAT() function. CONCAT is an
+            # Excel-2016 "future function": in the xlsx it must be stored as
+            # ``_xlfn.CONCAT`` or Excel marks it ``@CONCAT`` / ``#NAME?``.
+            # ``&`` is universal and is what hand-built models use.
+            pieces = [
+                f"({p})" if isinstance(arg, (BinOp, Compare)) else p
+                for arg, p in zip(node.args, parts)
+            ]
+            return " & ".join(pieces)
+
         if func in _PASSTHROUGH_FUNCS:
             return f"{func}({', '.join(parts)})"
 
@@ -419,17 +720,41 @@ class ExcelRenderer:
             prev_str = ctx.self_address.values[ctx.period_idx - 1]
         expansions["prev"] = prev_str
 
-        def _sub(match: "re.Match[str]") -> str:
+        # Support both forms the user may write:
+        #   ``"{prev} * (1 + {growth})"``  — explicit braces
+        #   ``"prev * (1 + growth)"``       — bare identifiers (Python-style)
+        # Python evaluation handles bare names natively (AST eval against the
+        # variables dict); without this branch, Excel emission only saw the
+        # brace form and left bare names like ``prev`` / ``growth`` un-
+        # substituted (literal ``=prev * (1 + growth)`` in the cell).
+        def _sub_braced(match: "re.Match[str]") -> str:
             name = match.group(1)
             return expansions.get(name, match.group(0))
 
-        return re.sub(r"\{([A-Za-z_][A-Za-z0-9_]*)\}", _sub, node.template)
+        # Unicode identifiers — ``{доход}`` is as legal as ``{growth}``
+        # (an ASCII-only class would silently skip Cyrillic placeholders
+        # and the bare-name pass would then substitute INSIDE the braces).
+        emitted = re.sub(r"\{([^\W\d]\w*)\}", _sub_braced, node.template)
+
+        # Substitute bare-identifier occurrences with word boundaries so
+        # ``growth`` doesn't accidentally rewrite a longer identifier like
+        # ``growth_rate``. Replace longest names first so a shorter name
+        # (``g``) doesn't shadow a longer one (``growth``).
+        for name in sorted(expansions, key=len, reverse=True):
+            emitted = re.sub(
+                rf"\b{re.escape(name)}\b", expansions[name], emitted
+            )
+
+        return emitted
 
     def render_rollingaggregate(self, node: RollingAggregate, ctx: RenderCtx) -> str:
         if ctx.period_idx < node.window - 1:
             return _value_to_excel_literal(node.fill)
 
-        var_id = node.source.id
+        var_id = self._coord_var_id(node.source, ctx)
+        if var_id is None:
+            ctx.lossy_inline = True
+            return _value_to_excel_literal(node.fill)
         addr_obj = self.addresses.get(var_id)
         if addr_obj is None or not addr_obj.values:
             return _value_to_excel_literal(node.fill)
@@ -439,6 +764,37 @@ class ExcelRenderer:
         first = self._maybe_qualify(addr_obj.values[start_idx], var_id, ctx.current_sheet)
         last = addr_obj.values[end_idx]
         return f"{node.func}({first}:{last})"
+
+    def render_regrain(self, node: Regrain, ctx: RenderCtx) -> str:
+        i = ctx.period_idx
+        fill = node.fill_values[i] if i < len(node.fill_values) else 0.0
+        # A hole (un-entered bucket) must stay a hole in the workbook:
+        # ``_value_to_excel_literal`` would spell ``None`` as ``0``, and
+        # a range formula over blank cells would show a partial number
+        # where the value layer says "not known yet". Emit blank.
+        if fill is None:
+            return '""'
+        var_id = self._coord_var_id(node.source, ctx)
+        if var_id is None:
+            ctx.inlined_value = True
+            return _value_to_excel_literal(fill)
+        addr_obj = self.addresses.get(var_id)
+        if (addr_obj is None or not addr_obj.values or i >= len(node.buckets)):
+            return _value_to_excel_literal(fill)
+        lo, hi = node.buckets[i]
+        n = len(addr_obj.values)
+        if lo >= n or hi - 1 >= n:
+            return _value_to_excel_literal(fill)
+        if node.recipe == 'first':
+            return self._maybe_qualify(addr_obj.values[lo], var_id, ctx.current_sheet)
+        if node.recipe == 'last':
+            return self._maybe_qualify(addr_obj.values[hi - 1], var_id, ctx.current_sheet)
+        fn = {'sum': 'SUM', 'mean': 'AVERAGE', 'min': 'MIN', 'max': 'MAX'}.get(node.recipe)
+        if fn is None:
+            return _value_to_excel_literal(fill)        # geometric etc. -> inlined value
+        first = self._maybe_qualify(addr_obj.values[lo], var_id, ctx.current_sheet)
+        last = addr_obj.values[hi - 1]
+        return f"{fn}({first}:{last})"
 
     # ─── Excel-specific helpers ─────────────────────────────────
 
@@ -452,7 +808,45 @@ class ExcelRenderer:
             if var._expr is not None:
                 return self._needs_parens(var._expr)
             return False
+        if isinstance(inner, ListExpr):
+            # Renders as one positional item; parenthesize if ANY period's
+            # item would need it (no period context here — see
+            # _effective_op).
+            return any(self._needs_parens(item) for item in inner.items)
         return False
+
+    def _render_cumsum_chain(self, node: MethodCall, ctx: RenderCtx) -> str:
+        """``MethodCall(VarRef(x), 'cumsum')`` — the rank-lifted spelling.
+
+        ``mo.cumsum`` over a TRACKED Variable keeps its formula symbolic
+        (values rank-lift per track) instead of delegating to
+        ``recurrence``, so the Excel renderer sees a method call. Emit
+        the same running chain the recurrence path produces::
+
+            period 0:  =<input cell>
+            period t:  =<own cell at t-1> + <input cell at t>
+
+        ``ctx.self_address.values`` is period-ordered for the exact row
+        being written — under a tracks layout that's the per-track cell
+        list, so ``values[t-1]`` lands on the previous period of the
+        SAME track regardless of the layout's column stride.
+
+        Without an own address (the cumsum is inlined inside a larger
+        formula) a chain has no cell for ``prev`` to point at — mark
+        the render lossy so the cell ships its computed value, never a
+        formula Excel can't evaluate.
+        """
+        base = self.walker.render(node.base, ctx)
+        if ctx.period_idx == 0:
+            return base
+        if (
+            ctx.self_address is not None
+            and ctx.period_idx - 1 < len(ctx.self_address.values)
+        ):
+            prev = ctx.self_address.values[ctx.period_idx - 1]
+            return f"{prev} + {base}"
+        ctx.lossy_inline = True
+        return f"{base}.cumsum()"
 
     def _render_shift(self, node: MethodCall, ctx: RenderCtx) -> str:
         if not isinstance(node.base, VarRef):
@@ -465,23 +859,84 @@ class ExcelRenderer:
         except (TypeError, ValueError):
             periods_int = 1
 
-        fill_value = node.kwargs.get("fill_value", "0")
+        fill_value = node.kwargs.get("fill_value", 0)
         target_period = ctx.period_idx - periods_int
 
-        addr_obj = self.addresses.get(var_id)
+        def _fill() -> str:
+            # A Variable-backed fill (``mo.lag(x, fill=opening)``)
+            # arrives as an Expr — render it as a reference to the
+            # fill cell so the dependency stays live in the workbook.
+            if isinstance(fill_value, Expr):
+                return self.walker.render(fill_value, ctx)
+            return _value_to_excel_literal(fill_value)
+
+        if target_period < 0:
+            return _fill()
+        cid = self._coord_var_id(node.base.var, ctx)
+        if cid is None:
+            # The coordinate has no laid-out row: the lagged VALUE of
+            # that track is the honest content (one operand degrades).
+            shifted = self._coord_value(node.base.var, ctx.track_role or "", target_period)
+            if shifted is None:
+                return _fill()
+            ctx.inlined_value = True
+            return _value_to_excel_literal(shifted)
+        addr_obj = self.addresses.get(cid)
         if addr_obj is None:
-            return str(fill_value)
-        if target_period < 0 or target_period >= len(addr_obj.values):
-            return str(fill_value)
+            return _fill()
+        if target_period >= len(addr_obj.values):
+            return _fill()
 
-        return self._maybe_qualify(addr_obj.values[target_period], var_id, ctx.current_sheet)
+        return self._maybe_qualify(addr_obj.values[target_period], cid, ctx.current_sheet)
 
-    def _render_range_or_cell(self, arg: Expr, ctx: RenderCtx) -> str:
+    def _render_range_or_cell(
+        self, arg: Expr, ctx: RenderCtx, func: Optional[str] = None,
+    ) -> str:
         if isinstance(arg, VarRef):
-            var_id = arg.var.id
-            addr_obj = self.addresses.get(var_id)
+            cid = self._coord_var_id(arg.var, ctx)
+            if cid is None:
+                # A range over a coordinate nothing in the book carries:
+                # a per-period literal is not a range, so the whole
+                # aggregate degrades to its computed value.
+                ctx.lossy_inline = True
+                return self.walker.render(arg, ctx)
+            addr_obj = self.addresses.get(cid)
             if addr_obj is not None and len(addr_obj.values) > 1:
-                return self._resolve_var_range(var_id, ctx.current_sheet)
+                return self._resolve_var_range(
+                    cid, ctx.current_sheet, ctx, func,
+                )
+        # A SLICED row inside an aggregate wants the sliced RANGE:
+        # ``SUM(x[0:12])`` → ``SUM(B1:M1)``. (Element-wise slice
+        # rendering lives in ``render_subscript`` and is period-aware;
+        # this is the one context where the whole window is the point.)
+        # The slice arrives either as a bare Subscript node or — the
+        # common DSL shape — as a VarRef to the intermediate Variable
+        # ``x[0:12]`` produced (its ``_expr`` is the Subscript).
+        sub = arg if isinstance(arg, Subscript) else None
+        if (
+            sub is None
+            and isinstance(arg, VarRef)
+            and arg.var.id not in self.addresses
+            and isinstance(getattr(arg.var, "_expr", None), Subscript)
+        ):
+            sub = arg.var._expr
+        if (
+            sub is not None
+            and isinstance(sub.base, VarRef)
+            and isinstance(sub.key, slice)
+        ):
+            cid = self._coord_var_id(sub.base.var, ctx)
+            if cid is None:
+                ctx.lossy_inline = True
+                return self.walker.render(arg, ctx)
+            addr_obj = self.addresses.get(cid)
+            if addr_obj is not None:
+                values = addr_obj.values[sub.key]
+                if len(values) > 1:
+                    first = self._maybe_qualify(
+                        values[0], cid, ctx.current_sheet
+                    )
+                    return f"{first}:{values[-1]}"
         return self.walker.render(arg, ctx)
 
     def _inline_subscript_value(self, base_var: Any, key: Any) -> str:
@@ -544,12 +999,44 @@ class ExcelRenderer:
                 return self._format_sheet_reference(var_sheet, addr)
         return addr
 
-    def _resolve_var_range(self, var_id: str, current_sheet: Optional[str] = None) -> str:
+    #: Range-taking functions whose Excel signature is VARIADIC, so an
+    #: explicit list of cells reads the same as a range. ``IRR`` and
+    #: ``XIRR`` are not among them: their second argument is a guess /
+    #: a date range, so a comma list would be read as another argument
+    #: entirely.
+    _LIST_SAFE_FUNCS = {"SUM", "AVERAGE", "MIN", "MAX", "COUNT", "NPV"}
+
+    def _resolve_var_range(
+        self,
+        var_id: str,
+        current_sheet: Optional[str] = None,
+        ctx: Optional[RenderCtx] = None,
+        func: Optional[str] = None,
+    ) -> str:
         addr_obj = self.addresses.get(var_id)
         if addr_obj is None:
             return var_id
         if len(addr_obj.values) == 1:
             return self._maybe_qualify(addr_obj.values[0], var_id, current_sheet)
+        # A row's cells are NOT always contiguous: declare quarter
+        # totals and the bucket columns stand between the months, so
+        # ``SUM(C3:I3)`` swallows the Q1 total and double-counts it —
+        # 90 where the model says 60, in a file that looks right.
+        # ``totals.rule_formula`` follows the same rule; this is where
+        # every range is built.
+        if not _contiguous_run(addr_obj.values):
+            if func in self._LIST_SAFE_FUNCS:
+                return ", ".join(
+                    self._maybe_qualify(v, var_id, current_sheet)
+                    if i == 0 else v
+                    for i, v in enumerate(addr_obj.values)
+                )
+            # IRR and friends need a real range and would read a list
+            # as further arguments. The truth beats a formula that
+            # computes something else: fall back to the computed value
+            # (the cell then carries a value, not a formula).
+            if ctx is not None:
+                ctx.lossy_inline = True
         first = self._maybe_qualify(addr_obj.values[0], var_id, current_sheet)
         last = addr_obj.values[-1]
         return f"{first}:{last}"

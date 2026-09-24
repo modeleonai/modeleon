@@ -31,6 +31,8 @@ from ...core.expr import (
     Literal,
     MethodCall,
     Paren,
+    Regrain,
+    Restrict,
     RollingAggregate,
     SelfRef,
     Subscript,
@@ -163,6 +165,22 @@ class JsonRenderer:
             "func": node.func,
             "window": node.window,
             "fill": node.fill,
+        }
+
+    def render_regrain(self, node: Regrain, ctx: RenderCtx) -> Dict[str, Any]:
+        return {
+            "kind": "regrain",
+            "source": self.walker.render(node.source, ctx),
+            "recipe": node.recipe,
+            "buckets": list(node.buckets),
+        }
+
+    def render_restrict(self, node: Restrict, ctx: RenderCtx) -> Dict[str, Any]:
+        return {
+            "kind": "restrict",
+            "base": self.walker.render(node.base, ctx),
+            "axis": node.axis,
+            "label": node.label,
         }
 
 

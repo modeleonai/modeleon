@@ -19,7 +19,7 @@ Core primitives (just two):
   dependencies.
 - ``MultiVariable`` — a container grouping Variables and nested
   MultiVariables. Pass ``excel_props={'tab': True}`` to mark it as an Excel tab;
-  omit ``role`` for a plain grouping MV. First-depth sub-MultiVariables
+  without it, the MV is a plain grouping. First-depth sub-MultiVariables
   of whatever you emit become tabs automatically when no explicit
   ``excel_props={'tab': True}`` markers exist.
 
@@ -58,6 +58,11 @@ from modeleon.plugins import load_plugins as _load_plugins
 
 # Core DSL
 from modeleon.core.variable import Variable
+from modeleon.core.time import Time
+from modeleon.core.regrain import up, frozen, ratio
+from modeleon.core.extend import hold, none, zero
+from modeleon.core.blend import blend
+from modeleon.core.tracks_decl import Tracks
 from modeleon.core.multi_variable import (
     MultiVariableClass,
     MultiVariable,
@@ -71,6 +76,9 @@ from modeleon.core.unit import Unit
 # available for introspection and alternative renderers)
 from modeleon.compile import check_compat, to_json
 
+# Excel presentation view — declared-once, cascading layout/styling
+from modeleon.compile.excel.view import ExcelView
+
 # Pre-built DSL helpers
 from modeleon.functions import (
     val,
@@ -79,16 +87,37 @@ from modeleon.functions import (
     SUM, MAX, MIN, AVERAGE,
     # Math
     ABS, ROUND, INT, MOD,
-    # Conditional
-    IF,
+    # Conditional / logical
+    IF, AND, OR, NOT, CHOOSE, ISBLANK,
     # Dates
-    YEAR, MONTH, DAY, EDATE, EOMONTH, TODAY,
+    YEAR, MONTH, DAY, DATE, EDATE, EOMONTH, DAYS360, TODAY,
     # Text
     LEN, UPPER, LOWER, CONCAT,
-    # Recurrence / cohort
-    cumsum, recurrence, recurrence_sum, cohort_retention,
+    # Recurrence / cohort / shift
+    cumsum, lag, recurrence, recurrence_sum, cohort_retention, schedule,
     # Financial
     IRR, NPV, XIRR, PMT, FV, PV,
+)
+
+# The process-wide default view — EVERY value the engine uses, made explicit so
+# none come "from nowhere". Inspect it (``mo.default_excel_view``), override it
+# globally or per model (``model.default_excel_view = ...``, which fills its
+# unset leaves from this).
+#
+# Note ``font``: this is openpyxl's workbook default (Calibri 11) made explicit,
+# so it now applies to every model — i.e. it LOCKS the font rather than
+# inheriting the user's Excel theme. Set ``font=None`` if you'd rather inherit.
+_house_colors = MultiVariable(
+    "colors", input=Variable("#0563C1"), reference=Variable("#2E7D32")
+)
+default_excel_view = ExcelView(
+    orient="across",
+    font=MultiVariable("font", name=Variable("Calibri"), size=Variable(11)),
+    bands=MultiVariable("bands"),  # empty = no section-band overrides
+    cell_types=MultiVariable("cell_types", on=Variable(False), colors=_house_colors),
+    timeline=MultiVariable(
+        "timeline", header=Variable(True), label_format=Variable("finance")
+    ),
 )
 
 _load_plugins()
@@ -96,20 +125,33 @@ _load_plugins()
 __all__ = [
     # Core DSL
     "Variable",
+    "Time",
+    "Tracks",
+    "blend",
+    "up",
+    "frozen",
+    "ratio",
     "MultiVariable",
     "MultiVariableClass",
     "Model",
     "Unit",
+    "ExcelView",
+    "default_excel_view",
     # Exceptions / warnings
     "CircularDependencyError",
     "CrossScopeReferenceWarning",
     "ModelStructureWarning",
-    # AST introspection (alternative renderer — see compile/json_backend)
+    # AST introspection (alternative renderer — see compile/json)
     "to_json",
     # Backend compatibility inspection (see compile/compat)
     "check_compat",
     # Excel-cased aggregates and helpers (match =SUM(...)=MAX(...) in output)
     "IF",
+    "AND",
+    "OR",
+    "NOT",
+    "ISBLANK",
+    "CHOOSE",
     "SUM",
     "MAX",
     "MIN",
@@ -122,8 +164,10 @@ __all__ = [
     "YEAR",
     "MONTH",
     "DAY",
+    "DATE",
     "EDATE",
     "EOMONTH",
+    "DAYS360",
     "TODAY",
     # Text
     "LEN",
@@ -133,6 +177,11 @@ __all__ = [
     # Domain helpers (no Excel equivalent — stay lowercase)
     "cumsum",
     "cohort_retention",
+    "lag",
+    "schedule",
+    "zero",
+    "hold",
+    "none",
     "recurrence",
     "recurrence_sum",
     "val",

@@ -70,6 +70,7 @@ packages = ["src/modeleon"]
 exclude = [
     "CLAUDE.md",
     "notebooks/",
+    "assets/",
     "*.xlsx",
     "**/__pycache__",
     "**/.pytest_cache",

@@ -19,6 +19,8 @@ from ..core.expr import (
     Literal,
     MethodCall,
     Paren,
+    Regrain,
+    Restrict,
     RollingAggregate,
     SelfRef,
     Subscript,
@@ -51,6 +53,8 @@ class Walker:
             FuncCall:         renderer.render_funccall,
             SelfRef:          renderer.render_selfref,
             RollingAggregate: renderer.render_rollingaggregate,
+            Regrain:          renderer.render_regrain,
+            Restrict:         renderer.render_restrict,
         }
 
     def render(self, node: Expr, ctx: "RenderCtx") -> Any:

@@ -42,6 +42,27 @@ def _extract_date(x):
     )
 
 
+def _broadcast(fn: Callable[..., Any], *raws: Any) -> tuple[Any, str]:
+    """Apply ``fn`` over scalar or list operands, element-wise.
+
+    Scalars repeat; lists shorter than the longest clamp to their last
+    element (matches length-1 broadcast elsewhere). Returns
+    ``(value, var_type)`` where ``var_type`` is ``'list'`` if any operand
+    is a list, else ``'scalar'``.
+    """
+    lists = [r for r in raws if isinstance(r, list)]
+    if not lists:
+        return fn(*raws), 'scalar'
+    n = max(len(r) for r in lists)
+
+    def at(r: Any, i: int) -> Any:
+        if isinstance(r, list):
+            return r[i] if i < len(r) else r[-1]
+        return r
+
+    return [fn(*[at(r, i) for r in raws]) for i in range(n)], 'list'
+
+
 def _unary_date_func(
     func_name: str,
     py_fn: Callable[[date], int],
@@ -130,6 +151,78 @@ def EOMONTH(start_date: DateOperand, months: Union[Variable, int] = 0) -> Variab
         "EOMONTH", [start_expr, months_expr], calc, 'datetime', var_type,
         source_code=f"EOMONTH({src(start_date)}, {m})",
         render_backends=_EXCEL_ONLY,
+    )
+
+
+def DATE(
+    year: Union[Variable, int],
+    month: Union[Variable, int],
+    day: Union[Variable, int],
+) -> Variable:
+    """Construct a date from year / month / day (renders ``=DATE(...)``).
+
+    Excel-style overflow: out-of-range month or day rolls over, so
+    ``DATE(2025, 15, 10)`` → ``date(2026, 3, 10)`` and the common
+    ``DATE(YEAR(d), MONTH(d) + 3, DAY(d))`` quarter-step advances the year
+    past December. Always returns a Variable; scalar or element-wise over
+    list inputs.
+    """
+    y_raw, y_expr = operand(year)
+    m_raw, m_expr = operand(month)
+    d_raw, d_expr = operand(day)
+
+    def build(y: Any, m: Any, d: Any) -> date:
+        return date(int(y), 1, 1) + relativedelta(months=int(m) - 1, days=int(d) - 1)
+
+    calc, var_type = _broadcast(build, y_raw, m_raw, d_raw)
+    return make_func_var(
+        "DATE", [y_expr, m_expr, d_expr], calc, 'datetime', var_type,
+        source_code=f"DATE({src(year)}, {src(month)}, {src(day)})",
+    )
+
+
+def DAYS360(
+    start_date: DateOperand,
+    end_date: DateOperand,
+    method: Union[Variable, bool] = False,
+) -> Variable:
+    """Days between two dates on a 360-day year (renders ``=DAYS360(...)``).
+
+    ``method=False`` (default) uses the US/NASD convention; ``method=True``
+    uses the European convention (day 31 always becomes 30). The core of
+    30/360 interest accrual::
+
+        days = DAYS360(prev_period_date, this_period_date, True)
+        interest = balance * rate / 360 * days
+
+    Always returns a Variable; scalar, or element-wise over list inputs
+    (e.g. ``DAYS360(dates.shift(1), dates, True)`` across a schedule).
+    """
+    start_raw, start_expr = operand(start_date)
+    end_raw, end_expr = operand(end_date)
+    method_raw, method_expr = operand(method)
+    european = bool(method_raw)
+
+    def count(s: Any, e: Any) -> int:
+        d1 = _extract_date(s)
+        d2 = _extract_date(e)
+        day1, day2 = d1.day, d2.day
+        if european:
+            if day1 == 31:
+                day1 = 30
+            if day2 == 31:
+                day2 = 30
+        else:
+            if day1 == 31:
+                day1 = 30
+            if day2 == 31 and day1 == 30:
+                day2 = 30
+        return (d2.year - d1.year) * 360 + (d2.month - d1.month) * 30 + (day2 - day1)
+
+    calc, var_type = _broadcast(count, start_raw, end_raw)
+    return make_func_var(
+        "DAYS360", [start_expr, end_expr, method_expr], calc, 'int', var_type,
+        source_code=f"DAYS360({src(start_date)}, {src(end_date)}, {src(method)})",
     )
 
 

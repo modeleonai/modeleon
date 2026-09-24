@@ -9,7 +9,7 @@ which produces instances) and its consumers
 :class:`~modeleon.compile.excel.translator.ExcelTranslator`).
 
 Lives in ``compile/excel/`` because it's Excel-specific — other
-backends (JSON, Pandas) have completely different addressing or none
+renderers (such as JSON) have completely different addressing or none
 at all. Variables themselves never carry a reference to this type;
 the addresses dict is keyed by ``var.id`` and consumed at emission
 time.
