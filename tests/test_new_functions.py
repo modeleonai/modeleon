@@ -67,6 +67,19 @@ class TestDates:
     def test_days360_us_default_method(self):
         assert mo.DAYS360(date(2025, 1, 31), date(2025, 2, 28))._value == 28
 
+    def test_days360_us_february_month_end_start_counts_as_the_30th(self):
+        # US/NASD as Excel computes it: a start on the last day of
+        # February becomes the 30th, so a day-31 end then clamps too.
+        assert mo.DAYS360(date(2023, 2, 28), date(2023, 3, 31))._value == 30
+        assert mo.DAYS360(date(2024, 2, 29), date(2024, 3, 31))._value == 30
+        assert mo.DAYS360(date(2023, 2, 28), date(2023, 3, 28))._value == 28
+
+    def test_days360_us_february_28_of_a_leap_year_is_not_month_end(self):
+        assert mo.DAYS360(date(2024, 2, 28), date(2024, 3, 31))._value == 33
+
+    def test_days360_european_ignores_february_month_end(self):
+        assert mo.DAYS360(date(2023, 2, 28), date(2023, 3, 31), True)._value == 32
+
     def test_days360_list_elementwise(self):
         starts = mo.Variable([date(2025, 1, 1), date(2025, 4, 1)])
         ends = mo.Variable([date(2025, 4, 1), date(2025, 7, 1)])
@@ -97,6 +110,41 @@ class TestLogical:
     def test_choose_elementwise_phase_switch(self):
         flag = mo.Variable([0, 0, 1, 1])
         assert mo.CHOOSE(flag + 1, 'Ф', 'П')._value == ['Ф', 'Ф', 'П', 'П']
+
+    def test_choose_scalar_index_over_series_choices_is_a_series(self):
+        # The scenario switch: one scenario number picks a whole series.
+        base = mo.Variable([100, 110, 120])
+        bull = mo.Variable([150, 170, 190])
+        result = mo.CHOOSE(mo.Variable(2), base, bull)
+        assert result._value == [150, 170, 190]
+        assert result.var_type == 'list'
+        assert mo.CHOOSE(1, base, bull)._value == [100, 110, 120]
+
+    def test_choose_scalar_choice_repeats_beside_series_choices(self):
+        # The result is a series whichever choice the index picks, so the
+        # row keeps its shape when the scenario number changes.
+        bull = mo.Variable([150, 170, 190])
+        assert mo.CHOOSE(1, 125, bull)._value == [125, 125, 125]
+
+    def test_choose_out_of_range_over_series_choices(self):
+        base = mo.Variable([100, 110, 120])
+        bull = mo.Variable([150, 170, 190])
+        assert mo.CHOOSE(3, base, bull)._value == ['#VALUE!'] * 3
+
+    def test_choose_one_value_series_repeats_beside_longer_series(self):
+        # A one-value series is written as one cell that every period reads.
+        one = mo.Variable([7])
+        bull = mo.Variable([150, 170, 190])
+        assert mo.CHOOSE(1, one, bull)._value == [7, 7, 7]
+
+    @pytest.mark.parametrize('short', [[1, 2], []])
+    def test_choose_series_choices_of_different_lengths_are_refused(self, short):
+        # The workbook has no cell for a short series' missing periods, so
+        # any value Python made up for them would disagree with Excel.
+        base = mo.Variable(short)
+        bull = mo.Variable([150, 170, 190, 210])
+        with pytest.raises(ValueError, match='different lengths'):
+            mo.CHOOSE(1, base, bull)
 
     def test_logical_render_to_excel(self, tmp_path):
         import openpyxl
@@ -248,6 +296,86 @@ class TestExcelOutput:
         assert days_cells
         assert all('"' not in f for f in days_cells), days_cells  # no quoted-text dates
         assert any('DATE(2025, 1, 1)' in f for f in days_cells)   # fill kept its type
+
+
+def _soffice() -> str | None:
+    """Path to the LibreOffice command line, or None when not installed."""
+    import shutil
+    from pathlib import Path
+
+    found = shutil.which('soffice') or shutil.which('libreoffice')
+    if found:
+        return found
+    mac = Path('/Applications/LibreOffice.app/Contents/MacOS/soffice')
+    return str(mac) if mac.exists() else None
+
+
+def _recalculated_rows(xlsx, workdir) -> dict[str, list[str]]:
+    """Open the workbook in LibreOffice, let it calculate every formula,
+    and return the first sheet as ``{label in column A: other cells}``."""
+    import csv
+    import subprocess
+
+    soffice = _soffice()
+    if soffice is None:
+        pytest.skip('LibreOffice is not installed')
+    profile = (workdir / 'lo-profile').as_uri()  # private profile: parallel runs don't clash
+    subprocess.run(
+        [soffice, f'-env:UserInstallation={profile}', '--headless',
+         '--convert-to', 'csv', '--outdir', str(workdir), str(xlsx)],
+        check=True, capture_output=True, timeout=120,
+    )
+    with open(workdir / (xlsx.stem + '.csv'), newline='', encoding='utf-8') as fh:
+        return {row[0]: row[1:] for row in csv.reader(fh) if row}
+
+
+class TestChooseScenarioSwitch:
+    """``mo.CHOOSE(scenario, base, bull)`` — one scenario number, series choices.
+
+    Every period gets its own ``=CHOOSE(...)`` that points at the same
+    scenario cell and at that period's cell of each choice, so changing
+    the scenario number in the workbook switches the whole row.
+    """
+
+    @staticmethod
+    def _model(scenario: int) -> mo.Model:
+        m = mo.Model('Scenarios')
+        m.scenario = mo.Variable(scenario, display_name='Scenario')
+        m.base = mo.Variable([100, 110, 120], display_name='Base')
+        m.bull = mo.Variable([150, 170, 190], display_name='Bull')
+        m.revenue = mo.CHOOSE(m.scenario, m.base, m.bull)
+        m.revenue._display_name = 'Revenue'
+        m.floor = mo.CHOOSE(m.scenario, 125, m.bull)
+        m.floor._display_name = 'Floor'
+        return m
+
+    def test_one_formula_per_period(self, tmp_path):
+        import openpyxl
+
+        out = tmp_path / 'scenarios.xlsx'
+        self._model(2).to_excel(str(out))
+        ws = openpyxl.load_workbook(str(out)).active
+        rows = {row[0].value: row for row in ws.iter_rows()}
+        idx = rows['Scenario'][1].coordinate
+        base_row = rows['Base'][0].row
+        bull_row = rows['Bull'][0].row
+        got = [c.value for c in rows['Revenue'][1:4]]
+        assert got == [
+            f'=CHOOSE({idx}, {col}{base_row}, {col}{bull_row})' for col in 'BCD'
+        ]
+        assert [c.value for c in rows['Floor'][1:4]] == [
+            f'=CHOOSE({idx}, 125, {col}{bull_row})' for col in 'BCD'
+        ]
+
+    @pytest.mark.parametrize('scenario', [1, 2])
+    def test_workbook_recalculates_to_the_python_values(self, tmp_path, scenario):
+        m = self._model(scenario)
+        out = tmp_path / 'scenarios.xlsx'
+        m.to_excel(str(out))
+        calc = _recalculated_rows(out, tmp_path)
+        for label, var in (('Revenue', m.revenue), ('Floor', m.floor)):
+            excel = [float(v) if v else None for v in calc[label][:3]]
+            assert excel == var._value, label
 
 
 class TestISBLANK:

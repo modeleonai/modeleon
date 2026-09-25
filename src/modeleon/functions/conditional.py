@@ -185,8 +185,9 @@ def CHOOSE(index: Any, *choices: Any) -> Variable:
 
     The classic scenario/phase switch — ``mo.CHOOSE(scenario, base, bull)``
     or, element-wise, ``mo.CHOOSE(phase_flag + 1, "Ф", "П")`` where
-    ``phase_flag`` is a per-period Variable. Out-of-range indices yield
-    ``#VALUE!`` (matching Excel).
+    ``phase_flag`` is a per-period Variable. A single index over series
+    choices gives a series: each period picks its own value of the chosen
+    series. Out-of-range indices yield ``#VALUE!`` (matching Excel).
     """
     idx_raw, idx_expr = operand(index)
     pairs = [text_operand(c) for c in choices]
@@ -207,6 +208,24 @@ def CHOOSE(index: Any, *choices: Any) -> Variable:
 
     if isinstance(idx_raw, list):
         value: Any = [pick(iv, p) for p, iv in enumerate(idx_raw)]
+        var_type = 'list'
+    elif any(isinstance(r, list) for r in choice_raws):
+        # One index over series choices (a scenario number): the workbook
+        # writes one CHOOSE per period, all reading the same index cell.
+        # The result is a series whichever choice the index picks, so the
+        # row keeps its shape when the index is changed in the workbook.
+        # The series must be the same length (a one-value series is one
+        # cell every period reads): a short series has no cell for its
+        # missing periods, so no value Python picks there matches Excel.
+        lengths = {len(r) for r in choice_raws if isinstance(r, list)}
+        n = max(lengths)
+        if lengths - {1, n}:
+            raise ValueError(
+                f"CHOOSE: series choices have different lengths "
+                f"{sorted(lengths)}. Give every series choice the same "
+                f"number of periods."
+            )
+        value = [pick(idx_raw, p) for p in range(n)]
         var_type = 'list'
     else:
         value = pick(idx_raw, 0)

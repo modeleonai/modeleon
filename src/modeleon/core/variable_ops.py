@@ -26,7 +26,7 @@ construct results).
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta
 from typing import Any, List, Optional, Tuple, TYPE_CHECKING
 
 from .expr import BinOp, Compare, Expr, Literal, UnaryOp, VarRef
@@ -36,38 +36,104 @@ if TYPE_CHECKING:
     from .variable import Variable
 
 
-def _date_serial_op(a: Any, b: Any, op: Any, a_is_date: bool, b_is_date: bool) -> Any:
-    """Excel-style date arithmetic on serial day numbers.
+# Excel's day 0: a date's serial number counts the days since then.
+_EXCEL_EPOCH_ORDINAL = date(1899, 12, 30).toordinal()
+_ONE_DAY = timedelta(days=1)
+_COMPARISON_SYMBOLS = frozenset({'==', '!=', '<', '<=', '>', '>='})
 
-    Excel stores dates as serial day counts, so the ``+``/``-`` operators
-    work on them directly. This mirrors that on Python ``date`` values:
 
-    - ``date - date`` → integer days between them.
-    - ``date ± number`` (or ``number + date``) → the shifted ``date``.
-    - anything that lands on a non-integer / out-of-range serial → ``#VALUE!``.
+def _to_serial(x: Any) -> Any:
+    """A date as Excel's serial number; a timedelta as its days.
 
-    The Excel formula side already renders as plain ``=B2 - C2`` (which
-    Excel evaluates correctly); this only fixes the Python-side ``_value``.
+    A ``date`` is a whole number of days since 1899-12-30. A ``datetime``
+    adds its time of day as a fraction, so it is always a float (noon on
+    2024-03-31 is 45382.5). Anything else comes back unchanged.
     """
-    def to_serial(x: Any) -> Any:
-        if isinstance(x, datetime):
-            return x.date().toordinal()
-        if isinstance(x, date):
-            return x.toordinal()
-        return x
+    if isinstance(x, datetime):
+        seconds = x.hour * 3600 + x.minute * 60 + x.second + x.microsecond / 1e6
+        return x.toordinal() - _EXCEL_EPOCH_ORDINAL + seconds / 86400
+    if isinstance(x, date):
+        return x.toordinal() - _EXCEL_EPOCH_ORDINAL
+    if isinstance(x, timedelta):
+        return x / _ONE_DAY
+    return x
 
-    sa, sb = to_serial(a), to_serial(b)
+
+def _date_compare(a: Any, b: Any, op: Any) -> Any:
+    """Compare the way Excel does when one side is a date.
+
+    A date compares as its serial number, so it can be compared with a
+    plain number too. Across types Excel never finds two values equal and
+    orders every number (a date included) before any text, and text before
+    TRUE/FALSE. The result is a Python ``bool``.
+    """
+    def key(x: Any) -> Any:
+        if isinstance(x, bool):
+            return (2, x)
+        if isinstance(x, str):
+            return (1, x)
+        serial = _to_serial(x)
+        if isinstance(serial, (int, float)):
+            return (0, serial)
+        return None
+
+    ka, kb = key(a), key(b)
+    if ka is None or kb is None:
+        return '#VALUE!'
+    return bool(op(ka, kb))
+
+
+def _date_serial_op(a: Any, b: Any, op: Any, op_symbol: Optional[str]) -> Any:
+    """Excel-style arithmetic and comparisons where a date is involved.
+
+    Excel stores a date as its serial number (see ``_to_serial``) and
+    every operator works on that number. This mirrors it on Python
+    ``date`` / ``datetime`` values, so Python computes what the written
+    workbook computes:
+
+    - ``date ± number`` (or ``number + date``) → the date that many days
+      later or earlier. A fraction of a day gives a ``datetime``. A
+      ``timedelta`` counts as its days, fraction included.
+    - ``date - date`` → the days between them: an ``int`` for two pure
+      dates, a ``float`` when a ``datetime`` brings a time of day.
+    - any other operation (``date * n``, ``n / date``, ``n - date``,
+      ``date + date``, ``date % 7``, …) → a plain number computed on
+      the serial, as Excel does.
+    - comparisons → ``True`` / ``False`` (see ``_date_compare``).
+    - text, or a day count that no date can hold → ``#VALUE!``.
+    """
+    if op_symbol in _COMPARISON_SYMBOLS:
+        return _date_compare(a, b, op)
+    a_is_date, b_is_date = isinstance(a, date), isinstance(b, date)
+    shifts = ((op_symbol == '+' and a_is_date != b_is_date)
+              or (op_symbol == '-' and a_is_date and not b_is_date))
+    if shifts:
+        when, offset = (a, b) if a_is_date else (b, a)
+        try:
+            if isinstance(offset, timedelta):
+                step = offset
+            elif isinstance(offset, (int, float)):
+                step = timedelta(days=offset)
+            else:
+                return '#VALUE!'
+            if op_symbol == '-':
+                step = -step
+            # A pure date moved by part of a day gains a time of day.
+            if not isinstance(when, datetime) and step % _ONE_DAY:
+                when = datetime.combine(when, time())
+            return when + step
+        except (ValueError, OverflowError):
+            return '#VALUE!'
+
+    sa, sb = _to_serial(a), _to_serial(b)
     if not isinstance(sa, (int, float)) or not isinstance(sb, (int, float)):
         return '#VALUE!'
     try:
-        result = op(sa, sb)
+        return op(sa, sb)
+    except ZeroDivisionError:
+        # A zero serial (1899-12-30, or an empty timedelta) divides like 0.
+        return '#DIV/0!'
     except Exception:
-        return '#VALUE!'
-    if a_is_date and b_is_date:
-        return int(result)  # a span of days, not a date
-    try:
-        return date.fromordinal(int(round(result)))
-    except (ValueError, OverflowError, TypeError):
         return '#VALUE!'
 
 
@@ -119,7 +185,8 @@ class _VariableArithmetic:
                 )
 
     @staticmethod
-    def _broadcast_operation(left, right, op, safe_divide: bool = False):
+    def _broadcast_operation(left, right, op, safe_divide: bool = False,
+                             op_symbol: Optional[str] = None):
         """Element-wise op with NumPy-style broadcasting.
 
         Scalar/scalar → scalar. List/scalar → element-wise list.
@@ -129,6 +196,10 @@ class _VariableArithmetic:
         Excel-style error markers (``'#DIV/0!'``, ``'#NAME?'``, …)
         propagate through operations. With ``safe_divide=True``, division
         by zero yields ``'#DIV/0!'`` instead of raising.
+
+        ``op_symbol`` names the operator (``'+'``, ``'<'``, …). Dates need
+        it: ``date + 5`` is a date, ``date * 5`` is a number and
+        ``date < 5`` is a bool, all computed on the date's serial number.
         """
         def _is_excel_error(v) -> bool:
             return isinstance(v, str) and v.startswith('#')
@@ -147,10 +218,8 @@ class _VariableArithmetic:
                 return None
             if safe_divide and b == 0:
                 return '#DIV/0!'
-            a_is_date = isinstance(a, (date, datetime))
-            b_is_date = isinstance(b, (date, datetime))
-            if a_is_date or b_is_date:
-                return _date_serial_op(a, b, op, a_is_date, b_is_date)
+            if isinstance(a, (date, timedelta)) or isinstance(b, (date, timedelta)):
+                return _date_serial_op(a, b, op, op_symbol)
             try:
                 return op(a, b)
             except Exception:
@@ -342,11 +411,13 @@ class _VariableArithmetic:
                 result._value = TrackValues.combine(
                     lv, rv,
                     lambda a, b: self._broadcast_operation(
-                        a, b, op_func, safe_divide=safe_divide
+                        a, b, op_func, safe_divide=safe_divide, op_symbol=op_symbol
                     ),
                 )
             else:
-                result._value = self._broadcast_operation(lv, rv, op_func, safe_divide=safe_divide)
+                result._value = self._broadcast_operation(
+                    lv, rv, op_func, safe_divide=safe_divide, op_symbol=op_symbol
+                )
             if unit_fn is not None:
                 result._unit = unit_fn(left._get_unit(), right._get_unit())
         else:
@@ -357,11 +428,11 @@ class _VariableArithmetic:
                     return TrackValues.combine(
                         a, b,
                         lambda x, y: self._broadcast_operation(
-                            x, y, op_func, safe_divide=safe_divide
+                            x, y, op_func, safe_divide=safe_divide, op_symbol=op_symbol
                         ),
                     )
                 return self._broadcast_operation(
-                    a, b, op_func, safe_divide=safe_divide
+                    a, b, op_func, safe_divide=safe_divide, op_symbol=op_symbol
                 )
 
             if reversed:
@@ -650,9 +721,11 @@ class _VariableArithmetic:
         def _combine(a, b):
             if isinstance(a, TrackValues) or isinstance(b, TrackValues):
                 return TrackValues.combine(
-                    a, b, lambda x, y: self._broadcast_operation(x, y, op_func)
+                    a, b, lambda x, y: self._broadcast_operation(
+                        x, y, op_func, op_symbol=op_symbol
+                    )
                 )
-            return self._broadcast_operation(a, b, op_func)
+            return self._broadcast_operation(a, b, op_func, op_symbol=op_symbol)
 
         if isinstance(other, Variable):
             result = Variable()

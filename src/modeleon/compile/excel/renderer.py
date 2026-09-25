@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import re
 import warnings
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from .addresses import VariableAddresses
@@ -146,8 +146,8 @@ def _value_to_excel_literal(value: Any) -> str:
     in a formula. Strings get double-quoted; booleans render as
     ``TRUE``/``FALSE``; None becomes ``0`` (matches how ``Literal(None)``
     is emitted elsewhere); dates become ``DATE(y, m, d)`` (a bare
-    ``2025-01-01`` would be read by Excel as arithmetic); numbers pass
-    through via ``str()``."""
+    ``2025-01-01`` would be read by Excel as arithmetic); durations
+    become their day count; numbers pass through via ``str()``."""
     if value is None:
         return "0"
     if isinstance(value, bool):
@@ -156,6 +156,12 @@ def _value_to_excel_literal(value: Any) -> str:
         value = value.date()
     if isinstance(value, date):
         return f"DATE({value.year}, {value.month}, {value.day})"
+    if isinstance(value, timedelta):
+        # A spreadsheet date is a count of days, so a duration is one
+        # too: ``timedelta(days=90)`` → ``90``, ``timedelta(hours=12)``
+        # → ``0.5``. Python's own ``90 days, 0:00:00`` is unreadable there.
+        days = value / timedelta(days=1)
+        return str(int(days)) if days.is_integer() else repr(days)
     if isinstance(value, str):
         escaped = value.replace('"', '""')
         return f'"{escaped}"'
@@ -180,6 +186,26 @@ def _warn_out_of_scope_ref(var: Any, ctx: RenderCtx) -> None:
         f"(via `parent.child = ...`), or belongs to a different model than "
         f"the one being emitted. Attach it under the model (or move the "
         f"formula to the model that owns it) to keep the reference live.",
+        category=CrossScopeReferenceWarning,
+        stacklevel=3,
+    )
+
+
+def _warn_unlaid_aggregate(func: str, arg: Expr, ctx: RenderCtx) -> None:
+    """Fire :class:`CrossScopeReferenceWarning` when ``SUM`` / ``NPV`` / …
+    reduces a list that has no cells in this workbook, so its computed
+    value is written in place of the call."""
+    label = "a literal list"
+    if isinstance(arg, VarRef):
+        name = (getattr(arg.var, "python_name", None)
+                or getattr(arg.var, "_display_name", None))
+        label = repr(name) if name else f"an unnamed list ({arg.var.path})"
+    target_sheet = ctx.current_sheet or "the current emission"
+    warnings.warn(
+        f"{func} in {target_sheet} reduces {label}, which has no cells in "
+        f"this workbook — writing the {func}'s computed value in its place "
+        f"instead of a live {func}. Attach the list to the model "
+        f"(`parent.child = ...`) to keep the {func} live.",
         category=CrossScopeReferenceWarning,
         stacklevel=3,
     )
@@ -301,6 +327,13 @@ class ExcelRenderer:
                 return self._resolve_var_addr(
                     owner_vid, owner_period, ctx.current_sheet
                 )
+        # ``SUM(x) + a`` with ``x`` a list the book has no cells for:
+        # the SUM is one number, written as that number; ``+ a`` stays
+        # a reference.
+        if isinstance(node.var._expr, FuncCall):
+            inlined = self._inline_unlaid_aggregate(node.var._expr, node.var, ctx)
+            if inlined is not None:
+                return inlined
         # Variable not in this emission's layout. Two inlining strategies:
         # - if it has its own AST, recurse into it so we reach real cells;
         # - otherwise (plain input referenced from outside the emission
@@ -658,6 +691,11 @@ class ExcelRenderer:
             return self._fallback_funccall(node, ctx)
 
         if func in _RANGE_TAKING_FUNCS:
+            # Reached here, the call is the cell's whole formula (a call
+            # inside a larger one is met through its Variable first).
+            inlined = self._inline_unlaid_aggregate(node, None, ctx)
+            if inlined is not None:
+                return inlined
             parts = [self._render_range_or_cell(a, ctx, func) for a in node.args]
             return f"{func}({', '.join(parts)})"
 
@@ -852,7 +890,6 @@ class ExcelRenderer:
         if not isinstance(node.base, VarRef):
             return f"{self.walker.render(node.base, ctx)}.shift({node.args[0]})"
 
-        var_id = node.base.var.id
         periods = node.args[0] if node.args else 1
         try:
             periods_int = int(periods)
@@ -933,11 +970,76 @@ class ExcelRenderer:
             if addr_obj is not None:
                 values = addr_obj.values[sub.key]
                 if len(values) > 1:
-                    first = self._maybe_qualify(
-                        values[0], cid, ctx.current_sheet
+                    # A window can step over a totals column too
+                    # (``x[0:4]`` = Jan–Apr crosses the Q1 total).
+                    return self._cells_as_range(
+                        values, cid, ctx.current_sheet, ctx, func,
                     )
-                    return f"{first}:{values[-1]}"
         return self.walker.render(arg, ctx)
+
+    def _unlaid_list_arg(self, call: FuncCall, ctx: RenderCtx) -> Optional[Expr]:
+        """The first list argument of ``call`` that has no cells in this
+        workbook — a Variable never attached to the model, an
+        intermediate such as ``x * 2`` or ``x[0:2]`` of one, a literal
+        ``[10, 20, 30]`` — or None when every list can be written as a
+        range. Scalar arguments never count: one value is one cell or
+        one literal either way."""
+        for arg in call.args:
+            if isinstance(arg, Literal):
+                if isinstance(arg.value, list):
+                    return arg
+                continue
+            if not isinstance(arg, VarRef) or not isinstance(arg.var._value, list):
+                continue
+            cid = self._coord_var_id(arg.var, ctx)
+            if cid is None or cid in self.addresses:
+                continue
+            sub = arg.var._expr
+            if (
+                isinstance(sub, Subscript)
+                and isinstance(sub.key, slice)
+                and isinstance(sub.base, VarRef)
+            ):
+                base_id = self._coord_var_id(sub.base.var, ctx)
+                if base_id is None or base_id in self.addresses:
+                    continue            # a window of a laid-out row
+            return arg
+        return None
+
+    def _inline_unlaid_aggregate(
+        self, call: FuncCall, owner: Any, ctx: RenderCtx,
+    ) -> Optional[str]:
+        """What to write in place of ``SUM(x)`` / ``NPV(r, x)`` / … when a
+        list it reduces has no cells in this workbook; None when every
+        list has cells.
+
+        Such a list can only be written one period's element at a time,
+        and ``SUM`` over one element is not ``SUM`` over the list: the
+        workbook would show 11, 22, 33 where the model says 61, 62, 63.
+        The call's computed value is one number, the same in every
+        period. Inside a larger formula (``owner`` is the Variable the
+        call belongs to) that number takes the call's place and the rest
+        of the formula stays live. When the call is the cell's whole
+        formula (``owner`` None) the cell carries its computed value.
+        """
+        if call.func.upper() not in _RANGE_TAKING_FUNCS:
+            return None
+        arg = self._unlaid_list_arg(call, ctx)
+        if arg is None:
+            return None
+        _warn_unlaid_aggregate(call.func.upper(), arg, ctx)
+        value = getattr(owner, "_value", None)
+        if (value is None or isinstance(value, list)
+                or hasattr(value, "roles")):
+            # No single number stands for the call: the whole cell
+            # falls back to its computed value.
+            ctx.lossy_inline = True
+            whole = getattr(ctx.self_var, "_value", None)
+            return _value_to_excel_literal(_value_at_period(whole, ctx.period_idx))
+        # A number baked into formula text: true now, stale once the
+        # list changes — callers that cache formula text must not reuse it.
+        ctx.inlined_value = True
+        return _value_to_excel_literal(value)
 
     def _inline_subscript_value(self, base_var: Any, key: Any) -> str:
         value = base_var._value
@@ -1018,18 +1120,31 @@ class ExcelRenderer:
             return var_id
         if len(addr_obj.values) == 1:
             return self._maybe_qualify(addr_obj.values[0], var_id, current_sheet)
+        return self._cells_as_range(
+            addr_obj.values, var_id, current_sheet, ctx, func,
+        )
+
+    def _cells_as_range(
+        self,
+        cells: List[str],
+        var_id: str,
+        current_sheet: Optional[str],
+        ctx: Optional[RenderCtx],
+        func: Optional[str],
+    ) -> str:
         # A row's cells are NOT always contiguous: declare quarter
         # totals and the bucket columns stand between the months, so
         # ``SUM(C3:I3)`` swallows the Q1 total and double-counts it —
         # 90 where the model says 60, in a file that looks right.
         # ``totals.rule_formula`` follows the same rule; this is where
-        # every range is built.
-        if not _contiguous_run(addr_obj.values):
+        # every range is built, for a whole row and for a slice of one.
+        if not _contiguous_run(cells):
             if func in self._LIST_SAFE_FUNCS:
+                # Every cell carries its own sheet prefix: unlike a
+                # range, a list does not share one.
                 return ", ".join(
                     self._maybe_qualify(v, var_id, current_sheet)
-                    if i == 0 else v
-                    for i, v in enumerate(addr_obj.values)
+                    for v in cells
                 )
             # IRR and friends need a real range and would read a list
             # as further arguments. The truth beats a formula that
@@ -1037,9 +1152,8 @@ class ExcelRenderer:
             # (the cell then carries a value, not a formula).
             if ctx is not None:
                 ctx.lossy_inline = True
-        first = self._maybe_qualify(addr_obj.values[0], var_id, current_sheet)
-        last = addr_obj.values[-1]
-        return f"{first}:{last}"
+        first = self._maybe_qualify(cells[0], var_id, current_sheet)
+        return f"{first}:{cells[-1]}"
 
     def _format_sheet_reference(self, sheet_name: str, cell_addr: str) -> str:
         if _UNQUOTED_SHEET_NAME.match(sheet_name):

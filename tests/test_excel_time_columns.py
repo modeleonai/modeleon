@@ -275,3 +275,162 @@ class TestConstantsCaption:
         g = _grid(_sheet(m, "План"))
         assert g[0][1] == "Jan 2026"
         assert not any("Значение" in str(c) for row in g for c in row if c)
+
+
+class TestALineOnItsOwnWindow:
+    """A line declared with its own ``start=`` / ``grain=`` that differs
+    from its sheet's window cannot be written yet. Every series is
+    written from the sheet's first period column, so such a line would
+    sit under the wrong dates, and formulas reading it would pair the
+    wrong periods — the file would compute other numbers than Python.
+    The export refuses before writing anything.
+    """
+
+    def _refused(self, model):
+        path = os.path.join(tempfile.mkdtemp(), "t.xlsx")
+        with pytest.raises(ValueError) as err:
+            model.to_excel(path)
+        assert not os.path.exists(path)
+        return str(err.value)
+
+    def _later_start(self):
+        m = _windowed()
+        with m:
+            m.план = mo.MultiVariable("План", excel_props={"tab": True})
+            with m.план as p:
+                p.выручка = mo.Variable([1, 2, 3], display_name="Выручка")
+                p.бонус = mo.Variable(
+                    [10, 20], start="2026-02", grain="month",
+                    display_name="Бонус",
+                )
+        return m
+
+    def test_a_later_start_is_refused(self):
+        self._refused(self._later_start())
+
+    def test_a_different_grain_is_refused(self):
+        m = _windowed()
+        with m:
+            m.план = mo.MultiVariable("План", excel_props={"tab": True})
+            with m.план as p:
+                p.выручка = mo.Variable([1, 2, 3], display_name="Выручка")
+                p.квартал = mo.Variable(
+                    [30, 40], start="2026-Q1", grain="quarter",
+                    display_name="Квартал",
+                )
+        msg = self._refused(m)
+        assert "'Квартал'" in msg and "quarter" in msg
+
+    def test_the_message_names_the_line_both_windows_and_the_way_out(self):
+        msg = self._refused(self._later_start())
+        assert "'Бонус'" in msg and "m.план.бонус" in msg
+        assert "2026-02" in msg and "month" in msg
+        assert "'План'" in msg and "2026-01" in msg
+        assert "start=" in msg and "extend=" in msg
+
+    def test_an_own_window_equal_to_the_sheets_exports(self):
+        m = _windowed()
+        with m:
+            m.план = mo.MultiVariable("План", excel_props={"tab": True})
+            with m.план as p:
+                p.ряд = mo.Variable(
+                    [1, 2, 3], start="2026-01", grain="month",
+                    display_name="Ряд",
+                )
+        g = _grid(_sheet(m, "План"))
+        assert g[0][1:4] == ["Jan 2026", "Feb 2026", "Mar 2026"]
+        assert g[1][:4] == ["Ряд", 1, 2, 3]
+
+    def test_the_same_month_spelled_without_a_leading_zero_exports(self):
+        # '2026-1' and '2026-01' are the same month: the line is on
+        # its sheet's window, whatever the spelling.
+        m = _windowed()
+        with m:
+            m.план = mo.MultiVariable("План", excel_props={"tab": True})
+            with m.план as p:
+                p.ряд = mo.Variable(
+                    [1, 2, 3], start="2026-1", grain="month",
+                    display_name="Ряд",
+                )
+        assert _grid(_sheet(m, "План"))[1][:4] == ["Ряд", 1, 2, 3]
+
+    def test_an_own_window_that_ends_early_is_refused(self):
+        # Same start and grain, fewer periods: Python continues the
+        # series by its extend rule (20 held into March), while a
+        # formula in the book would read an empty or wrong cell there.
+        m = _windowed()
+        with m:
+            m.план = mo.MultiVariable("План", excel_props={"tab": True})
+            with m.план as p:
+                p.выручка = mo.Variable([1, 2, 3], display_name="Выручка")
+                p.ставка = mo.Variable(
+                    [10, 20], start="2026-01", grain="month",
+                    extend=mo.hold(), display_name="Ставка",
+                )
+                p.итого = p.выручка + p.ставка
+        assert m.план.итого.value == [11, 22, 23]
+        msg = self._refused(m)
+        assert "'Ставка'" in msg and "2 period(s)" in msg
+        assert "3 period(s)" in msg
+
+    def test_extend_and_schedule_on_the_models_window_still_export(self):
+        m = _windowed()
+        with m:
+            m.план = mo.MultiVariable("План", excel_props={"tab": True})
+            with m.план as p:
+                p.выручка = mo.Variable([1, 2, 3], display_name="Выручка")
+                p.бонус = mo.Variable(
+                    [10, 20], extend=mo.zero(), display_name="Бонус"
+                )
+                p.ставка = mo.schedule({"2026-01": 0.1, "2026-03": 0.2})
+                p.итого = p.выручка + p.бонус
+        g = _grid(_sheet(m, "План"))
+        assert next(r for r in g if r[0] == "Бонус")[1:4] == [10, 20, 0]
+        assert next(r for r in g if r[0] == "Ставка")[1:4] == [0.1, 0.1, 0.2]
+        assert next(r for r in g if r[0] == "Итого")[1] == "=B2 + B3"
+
+    def test_a_model_without_a_window_is_unaffected(self):
+        m = mo.Model("m", display_name="M")
+        with m:
+            m.план = mo.MultiVariable("План", excel_props={"tab": True})
+            with m.план as p:
+                p.бонус = mo.Variable(
+                    [10, 20], start="2026-02", grain="month",
+                    display_name="Бонус",
+                )
+        assert _grid(_sheet(m, "План"))[0][:3] == ["Бонус", 10, 20]
+
+    def test_a_line_derived_from_it_is_not_written_either(self):
+        m = _windowed()
+        with m:
+            m.план = mo.MultiVariable("План", excel_props={"tab": True})
+            with m.план as p:
+                p.выручка = mo.Variable([1, 2, 3], display_name="Выручка")
+                p.бонус = mo.Variable(
+                    [10, 20], start="2026-02", grain="month",
+                    extend=mo.zero(), display_name="Бонус",
+                )
+                p.итого = p.выручка + p.бонус
+        # The sum itself runs on the sheet's window — it is its operand
+        # that would be misplaced, and the whole book with it.
+        assert m.план.итого.time.start == "2026-01"
+        assert m.план.итого.value == [1, 12, 23]
+        self._refused(m)
+
+    def test_a_derived_line_reading_an_unattached_one_is_refused(self):
+        # The operand lives outside the model, so it has no cells of
+        # its own: its values would be inlined into the sum from the
+        # first period — under the wrong dates.
+        бонус = mo.Variable(
+            [10, 20], start="2026-02", grain="month",
+            extend=mo.zero(), display_name="Бонус",
+        )
+        m = _windowed()
+        with m:
+            m.план = mo.MultiVariable("План", excel_props={"tab": True})
+            with m.план as p:
+                p.выручка = mo.Variable([1, 2, 3], display_name="Выручка")
+                p.итого = p.выручка + бонус
+        assert m.план.итого.value == [1, 12, 23]
+        msg = self._refused(m)
+        assert "'Итого'" in msg and "'Бонус'" in msg

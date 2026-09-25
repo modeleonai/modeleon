@@ -212,31 +212,49 @@ def XIRR(
     for d in date_values:
         if isinstance(d, str):
             date_objects.append(datetime.strptime(d, '%Y-%m-%d').date())
+        elif isinstance(d, datetime):
+            # The spreadsheet counts whole days: a time of day is dropped.
+            date_objects.append(d.date())
         elif isinstance(d, _date_type):
             date_objects.append(d)
         else:
             raise ValueError(f"Invalid date in XIRR dates: {d!r}")
 
+    # The spreadsheet counts every flow's years from the FIRST date in the
+    # list with a 365-day year (leap years included). Later dates may come
+    # in any order but none may fall before the first — the spreadsheet
+    # answers #NUM! there, so refuse it here instead of showing a rate the
+    # workbook will not.
     first = date_objects[0]
+    if any(d < first for d in date_objects):
+        raise ValueError(
+            f"XIRR dates must not fall before the first date ({first}) — the "
+            f"first date starts the schedule. Put the earliest date first."
+        )
     years = np.array(
-        [(d - first).days / 365.25 for d in date_objects], dtype=float,
+        [(d - first).days / 365 for d in date_objects], dtype=float,
     )
     cf_array = np.array(cf_values, dtype=float)
 
+    # Stop when the rate stops moving, not when the NPV falls under a fixed
+    # amount of money: a fixed amount stops too early on flows in
+    # thousandths and is out of reach of rounding on flows in trillions,
+    # while the spreadsheet answers both.
     rate = float(guess)
     for _ in range(100):
         npv = float(np.sum(cf_array / ((1 + rate) ** years)))
         dnpv = float(np.sum(-years * cf_array / ((1 + rate) ** (years + 1))))
-        if abs(npv) < 1e-6:
-            break
         if abs(dnpv) < 1e-10:
             raise RuntimeError(
                 "XIRR failed: derivative near zero. Try a different guess "
                 "or verify the cash flows have a well-defined XIRR."
             )
-        rate -= npv / dnpv
+        step = npv / dnpv
+        rate -= step
         if rate < -0.99:
             rate = -0.99
+        if abs(step) < 1e-12:
+            break
     else:
         raise RuntimeError(
             "XIRR failed to converge within the iteration limit. Try a "

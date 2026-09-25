@@ -188,8 +188,10 @@ def DAYS360(
 ) -> Variable:
     """Days between two dates on a 360-day year (renders ``=DAYS360(...)``).
 
-    ``method=False`` (default) uses the US/NASD convention; ``method=True``
-    uses the European convention (day 31 always becomes 30). The core of
+    ``method=False`` (default) uses the US/NASD convention as Excel applies
+    it (a start on the last day of the month, February included, becomes
+    the 30th); ``method=True`` uses the European convention (day 31 always
+    becomes 30). The core of
     30/360 interest accrual::
 
         days = DAYS360(prev_period_date, this_period_date, True)
@@ -213,7 +215,9 @@ def DAYS360(
             if day2 == 31:
                 day2 = 30
         else:
-            if day1 == 31:
+            # US/NASD as Excel computes it: a start on the last day of
+            # the month — February included — counts as the 30th.
+            if day1 == 31 or (d1.month == 2 and day1 == monthrange(d1.year, 2)[1]):
                 day1 = 30
             if day2 == 31 and day1 == 30:
                 day2 = 30

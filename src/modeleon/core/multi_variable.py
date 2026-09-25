@@ -63,6 +63,8 @@ from .mv_context import _MVLifecycle
 from .mv_inspect import _MVInspect
 from .qpath import QPath
 
+from .mv_context import _is_read_only_property, _refuse_read_only_name
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -354,7 +356,15 @@ class MultiVariableBase(_MVLifecycle, _MVInspect, Component):
             # ``self.__dict__[name]``.
             value = self.__dict__.get(name, value)
         super().__setattr__(name, value)
-    
+
+    def __delattr__(self, name: str) -> None:
+        """``del mv.x`` on a component detaches it exactly like
+        ``mv.remove('x')``; any other attribute is deleted as usual."""
+        if name in self.__dict__.get('_component_names', ()):
+            self._detach_component(name)
+            return
+        super().__delattr__(name)
+
     # ``python_name`` property + setter are inherited from :class:`Base`.
 
     @property
@@ -527,31 +537,44 @@ class MultiVariableClass(MultiVariableBase):
         Args:
             **kwargs: Parameters passed to compute() or stored for later use.
                       Can be raw values or Variable objects (values will be extracted).
-                      Special key: display_name (forwarded to MultiVariableBase).
+                      The node keywords ``display_name``, ``description``,
+                      ``excel_props`` and ``excel_layout`` configure this
+                      node, as on :class:`MultiVariable`, and also reach a
+                      compute() parameter of the same name.
         """
         from .variable import Variable
         self._Variable_class = Variable
 
-        # Pop the kwargs the parent ``MultiVariableBase`` recognizes;
+        # Pop the node keywords the parent ``MultiVariableBase`` takes;
         # everything else is a template parameter (``start_users=100``,
         # ``churn_rate=0.05``) for ``compute()`` or attribute storage.
-        display_name = kwargs.pop('display_name', None)
-        excel_props = kwargs.pop('excel_props', None)
-        excel_layout = kwargs.pop('excel_layout', None)
+        node_kwargs = {
+            key: kwargs.pop(key)
+            for key in ('display_name', 'description', 'excel_props', 'excel_layout')
+            if key in kwargs
+        }
 
-        super().__init__(
-            display_name=display_name,
-            excel_props=excel_props,
-            excel_layout=excel_layout,
-        )
+        super().__init__(**node_kwargs)
 
         self._input_variables: Dict[str, 'Variable'] = {}
+        # What ``compute()`` receives, by parameter name: exactly what the
+        # caller passed. A parameter left out gets its declared default —
+        # never a node attribute that happens to share its name.
+        self._compute_params: Dict[str, Any] = dict(node_kwargs)
 
         for key, value in kwargs.items():
-            extracted = self._extract_value(value)
-            setattr(self, key, extracted)
             if isinstance(value, Variable):
                 self._input_variables[key] = value
+            # A read-only property of the node (``code``, ``python_name``
+            # …) keeps its meaning; such a parameter only reaches compute().
+            if not _is_read_only_property(type(self), key):
+                setattr(self, key, self._extract_value(value))
+            # A Variable reaches compute() as itself, so formulas built
+            # from it keep pointing at it; anything else as stored on the
+            # node (a container passed in is the adopted child).
+            self._compute_params[key] = (
+                value if isinstance(value, Variable) else self.__dict__.get(key, value)
+            )
 
         # If compute() is overridden by subclass, call it with resolved
         # params — unless a ``__shell__`` construction asked for the
@@ -595,11 +618,11 @@ class MultiVariableClass(MultiVariableBase):
         For parameters that were originally Variable objects, pass the Variable
         (not the extracted scalar) so that formula tracking is preserved.
 
-        Required parameters (no default) resolve from the constructor
-        kwargs stored by ``__init__`` — ``Unit(seats=100)`` must reach
-        ``compute(self, seats)``. A required parameter with no stored
-        value is left out so ``compute()`` raises its natural TypeError
-        naming the missing argument."""
+        Each parameter resolves from the constructor kwargs stored by
+        ``__init__`` — ``Unit(seats=100)`` must reach
+        ``compute(self, seats)`` — or else from its declared default.
+        A required parameter the caller left out is left out here too,
+        so ``compute()`` raises its natural TypeError naming it."""
         # Signature by UNDERBOUND function, cached: a model can hold
         # hundreds of instances of a handful of classes, and
         # ``inspect.signature`` costs ~7 µs a call — thousands of
@@ -612,10 +635,8 @@ class MultiVariableClass(MultiVariableBase):
                 inspect.Parameter.VAR_KEYWORD,
             ):
                 continue
-            if k in self._input_variables:
-                params[k] = self._input_variables[k]
-            elif hasattr(self, k):
-                params[k] = getattr(self, k)
+            if k in self._compute_params:
+                params[k] = self._compute_params[k]
             elif v.default is not inspect.Parameter.empty:
                 params[k] = v.default
         self.compute(**params)
@@ -639,7 +660,7 @@ class MultiVariableClass(MultiVariableBase):
         ``self.users = mo.Variable(...)``.
 
         Parameters are auto-resolved from:
-        1. Instance attributes (set via __init__ kwargs)
+        1. The keywords passed to the constructor
         2. Default values in method signature
         """
         pass
@@ -737,6 +758,11 @@ class MultiVariable(MultiVariableBase):
                 registerable[comp_name] = value
             else:
                 other_kwargs[comp_name] = value
+
+        # Refuse a reserved name (``code=``, ``python_name=`` …) before
+        # any sibling component is adopted.
+        for comp_name in registerable:
+            _refuse_read_only_name(type(self), comp_name)
 
         super().__init__(display_name=display_name, **base_kwargs, **other_kwargs)
 

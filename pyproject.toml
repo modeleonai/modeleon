@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "modeleon"
-version = "0.1.3"
+version = "0.2.0"
 description = "Financial Model Engineering — Python code compiles to live Excel formulas"
 requires-python = ">=3.12"
 license = "Apache-2.0"
@@ -89,6 +89,9 @@ line-length = 100
 target-version = "py312"
 
 [tool.ruff.lint]
+# The rule set is pinned so a new ruff release cannot turn on new
+# default rules underneath the project.
+select = ["E4", "E7", "E9", "F"]
 # N802: function name should be lowercase.
 # We deliberately use Excel casing (SUM, MAX, MIN, AVERAGE, ABS, ROUND, INT, MOD, IF)
 # for the public helpers so ``mo.SUM(revenues)`` reads the same as the

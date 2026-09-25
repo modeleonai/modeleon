@@ -55,6 +55,31 @@ class ModelStructureWarning(UserWarning):
 warnings.filterwarnings('always', category=ModelStructureWarning)
 
 
+def _is_read_only_property(cls: type, name: str) -> bool:
+    """Whether ``name`` is a property of ``cls`` that cannot be assigned
+    (``code``, ``description``, ``excel_props``, ``python_name``, ``path``,
+    ``id`` … on every container, plus any a subclass declares)."""
+    attr = getattr(cls, name, None)
+    return isinstance(attr, property) and attr.fset is None
+
+
+def _refuse_read_only_name(cls: type, name: str) -> None:
+    """Refuse ``name`` as a component name when the node already answers
+    it with a read-only property.
+
+    ``mv.<name>`` would keep returning the property, so the component
+    could never be reached by that name — yet it would still be written
+    to the workbook. Callers check this before registering anything, so
+    a refused name leaves the container exactly as it was.
+    """
+    if _is_read_only_property(cls, name):
+        raise AttributeError(
+            f"Cannot name a component `{name}`: `{name}` is a read-only "
+            f"property of {cls.__name__}, so `.{name}` could never return "
+            f"the component. Pick another name for it."
+        )
+
+
 def _crystallize_subtree(item: Any, path: QPath) -> None:
     """Recursively set ``_qualified_id`` on an adopted subtree.
 
@@ -166,6 +191,10 @@ class _MVLifecycle:
         from .model import Model
         from .multi_variable import MultiVariable, MultiVariableBase
         from .variable import Variable
+
+        # A name the node answers itself (``mv.code``, ``mv.description``
+        # …) is refused before anything below changes state.
+        _refuse_read_only_name(type(self), name)
 
         # Demote a Model to a plain MultiVariable on adoption — Models
         # are top-level roots by contract; once adopted they are sub-

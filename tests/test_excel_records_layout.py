@@ -198,7 +198,8 @@ class TestPerPeriodRecords:
         m.default_start, m.default_grain, m.default_periods = (
             "2026-01", "month", 3,
         )
-        import tempfile, pathlib as _pl
+        import pathlib as _pl
+        import tempfile
         with tempfile.TemporaryDirectory() as d:
             path = _pl.Path(d) / "m.xlsx"
             m.to_excel(str(path))

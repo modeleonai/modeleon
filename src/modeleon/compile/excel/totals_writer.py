@@ -10,7 +10,7 @@ ALIVE:
 * formula lines — the line's own formula rendered AT the bucket, via a
   translator whose address book maps every periodic line to its bucket
   cells (:func:`project_model` supplies the bucket-grain expression
-  tree, and it keys lines by the same qpaths);
+  tree, rebuilt under the sheet's own component names);
 * ruleless literals — the projection's ``#VALUE!`` teaching token.
 
 Edit January in the written file and the quarter and year move —
@@ -38,6 +38,19 @@ def _walk_vars(mv: MultiVariableBase) -> Dict[str, Variable]:
     return out
 
 
+def _vars_by_place(mv: MultiVariableBase, prefix: str = "") -> Dict[str, Variable]:
+    """Every Variable under ``mv`` keyed by its PLACE — the dotted
+    component names from ``mv`` down («налог», «доходы.выручка»)."""
+    out: Dict[str, Variable] = {}
+    for name in mv._component_order:
+        comp = mv._components[name]
+        if isinstance(comp, Variable):
+            out.setdefault(f"{prefix}{name}", comp)
+        elif isinstance(comp, MultiVariableBase):
+            out.update(_vars_by_place(comp, f"{prefix}{name}."))
+    return out
+
+
 def bucket_cells(
     sheet_mv: MultiVariableBase,
     plan: TotalsPlan,
@@ -51,31 +64,34 @@ def bucket_cells(
     .xlsx writer and any other renderer of the totals, so no two
     renderings of a bucket cell can disagree.
 
-    ``projected`` — pre-computed ``{kind: {rel_id: projected Var}}``
+    ``projected`` — pre-computed ``{kind: {place: projected Var}}``
     from a caller that already ran :func:`project_model` (e.g. one that
-    memoizes one projection per kind across sheets); ``None`` projects
-    here, which is fine for the writer's one-shot export."""
+    memoizes one projection per kind across sheets), keyed by each
+    line's dotted place below ``sheet_mv`` — which is also its projected
+    id without the projected root's prefix; ``None`` projects here,
+    which is fine for the writer's one-shot export."""
     from ...core.projection import project_model
 
     native = _walk_vars(sheet_mv)
-    # The projected tree roots at the SHEET, the native ids at the
-    # MODEL — «m.план.налог» vs «план.налог». Key both by the path
-    # RELATIVE to their roots so the same line meets itself.
-    sheet_prefix = f"{sheet_mv.id}." if sheet_mv.id else ""
-
-    def _rel(vid: str) -> str:
-        return vid[len(sheet_prefix):] if vid.startswith(sheet_prefix) else vid
+    # A line meets its projected self by its PLACE in the sheet — the
+    # dotted names from the sheet down — because the projection rebuilds
+    # the sheet under those very names. Not by id: a tab the writer
+    # makes on its own (from a container not marked as a tab, from the
+    # Variables placed straight on the model, or for a container written
+    # with its own ``to_excel()``) is a stand-in whose id is unrelated to
+    # the ids its lines keep, so no id prefix would ever line them up.
+    place_of: Dict[str, str] = {}
+    for place, var in _vars_by_place(sheet_mv).items():
+        if var.id:
+            place_of.setdefault(var.id, place)
 
     if projected is None:
         projected = {}
         for kind in plan.kinds:
             try:
-                ptree = project_model(sheet_mv, kind, on_error="absorb")
-                pprefix = f"{ptree.id}." if ptree.id else ""
-                projected[kind] = {
-                    (pid[len(pprefix):] if pid.startswith(pprefix) else pid): v
-                    for pid, v in _walk_vars(ptree).items()
-                }
+                projected[kind] = _vars_by_place(
+                    project_model(sheet_mv, kind, on_error="absorb")
+                )
             except Exception as exc:  # projection must never kill the book
                 logger.warning("totals: %s projection failed: %s", kind, exc)
                 projected[kind] = {}
@@ -95,7 +111,7 @@ def bucket_cells(
                 continue
             if vid not in native:
                 continue
-            pvar = projected[kind].get(_rel(vid))
+            pvar = projected[kind].get(place_of.get(vid, ""))
             if getattr(native[vid], '_metric_no_bucket', False):
                 # A growth-% metric has no prior-year bucket — the
                 # file shows empty there, never a projected lag whose
@@ -137,7 +153,7 @@ def bucket_cells(
         row_refs = bucket_refs[kind][vid]
         month_row = _row_of(addresses[vid].values[0])
         rule = regrain_rule_of(var)
-        pvar = projected.get(kind, {}).get(_rel(vid))
+        pvar = projected.get(kind, {}).get(place_of.get(vid, ""))
         for bi, (_label, lo, hi) in enumerate(plan.buckets[kind]):
             formula: Any = None
             value: Any = None

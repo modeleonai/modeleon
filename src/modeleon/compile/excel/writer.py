@@ -22,11 +22,13 @@ from __future__ import annotations
 
 import logging
 import re
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Optional
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.styles.numbers import is_date_format
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.cell import coordinate_to_tuple
 from openpyxl.worksheet.worksheet import Worksheet
@@ -97,6 +99,7 @@ def to_excel(path: str | Path, root: "MultiVariableBase") -> None:
     # them verbatim (no openpyxl re-dedup), so ``ws.title`` matches. See
     # ``_unique_sheet_names`` / ``_maybe_qualify``.
     sheet_names = _unique_sheet_names(roots)
+    _refuse_lines_off_the_window(engine, roots, sheet_names, addresses)
 
     var_to_sheet = _build_var_to_sheet(addresses, roots, sheet_names)
     identity_cells = _identity_homes(roots, addresses)
@@ -157,6 +160,147 @@ def to_excel(path: str | Path, root: "MultiVariableBase") -> None:
         )
 
     wb.save(path)
+
+
+def _refuse_lines_off_the_window(
+    engine: LayoutEngine,
+    roots: list[MultiVariableBase],
+    sheet_names: list[str],
+    addresses: dict[str, VariableAddresses],
+) -> None:
+    """Stop the export when a line runs on a time window of its own.
+
+    Every series on a sheet is written from the sheet's first period
+    column, one cell per period of the sheet's window. A line declared
+    with its own ``start=`` / ``grain=`` that differs from that window —
+    another start, another grain, or another number of periods — would
+    not line up with the sheet's dates, and formulas reading it would
+    pair the wrong periods: the workbook would compute other numbers
+    than Python does. Excel export cannot place such a line yet, so it
+    refuses before anything is written. A line whose own window equals
+    its sheet's, and a model with no window at all, are unaffected.
+    """
+    found = []
+    for sheet_mv, sheet_name in zip(roots, sheet_names):
+        window = engine.window_by_sheet.get(id(sheet_mv))
+        if window is None or window.start is None or window.grain is None:
+            continue    # undated columns: no date to put a line under
+        for var in engine._iter_sheet_variables(sheet_mv):
+            if var.id not in addresses:
+                continue
+            source, loc = var, _off_window(var, window)
+            if loc is None and var._expr is not None:
+                read = _reads_unwritten_off_window(
+                    var._expr, window, addresses, set()
+                )
+                if read is not None:
+                    source, loc = read, read.time
+            if loc is not None:
+                found.append((var, source, loc, sheet_name, window))
+    if not found:
+        return
+
+    def _name(v: Variable) -> str:
+        return (f"'{v.display_name}'" if v.path.is_floating
+                else f"'{v.display_name}' ({v.path})")
+
+    def _span(start: object, grain: object, n: Optional[int]) -> str:
+        periods = "" if n is None else f", {n} period(s)"
+        return f"starts {start}, grain '{grain}'{periods}"
+
+    shown = []
+    for var, source, loc, sheet_name, window in found[:10]:
+        reads = "" if source is var else f" reads {_name(source)}, which"
+        shown.append(
+            f"  - {_name(var)}{reads} "
+            f"{_span(loc.start, loc.grain, _periods_of(source))}; "
+            f"sheet '{sheet_name}' "
+            f"{_span(window.start, window.grain, window.periods)}"
+        )
+    if len(found) > 10:
+        shown.append(f"  - … and {len(found) - 10} more")
+    raise ValueError(
+        "Excel export does not support a line on a time window of its "
+        "own yet. Every series is written from its sheet's first period "
+        "column, one cell per period of the sheet's window, so these "
+        "would not line up with the sheet's dates and formulas reading "
+        "them would compute other numbers than Python. Nothing was "
+        "written.\n" + "\n".join(shown) + "\n"
+        "Put each such line on its sheet's window instead: drop its "
+        "start= and grain=, and give it one value per period of that "
+        "window, padding the periods it does not cover (e.g. with "
+        "zeros). A series that starts with the window and ends early "
+        "may keep its shorter list if it declares extend=mo.zero() or "
+        "extend=mo.hold()."
+    )
+
+
+def _periods_of(var: Variable) -> Optional[int]:
+    value = var._value
+    if isinstance(value, list):
+        return len(value)
+    return getattr(value, 'time_length', None)
+
+
+def _off_window(var: Variable, window: Any) -> Any:
+    """``var``'s time location when it is a series that does not run
+    on ``window``; ``None`` when it does, or carries no dates at all (a
+    constant, a coordinate row, a row of axis labels)."""
+    from ...core.time import Time, _parse
+    from .layout import _is_periodic
+
+    if isinstance(var, Time) or not _is_periodic(var):
+        return None
+    loc = var.time
+    if loc is None or loc.start is None:
+        return None
+    if loc.grain != window.grain:
+        return loc
+    if loc.start != window.start:
+        try:
+            # '2026-1' and '2026-01' name the same month.
+            if _parse(loc.start, loc.grain) != _parse(window.start, window.grain):
+                return loc
+        except ValueError:
+            return loc
+    # A line placed by its own start= / grain= keeps exactly the values
+    # it was given — it is never stretched to the window the way a bare
+    # list with extend= is. Shorter or longer than the window, a formula
+    # reading it in the book would pair periods Python does not pair.
+    if var._grain is not None and window.periods is not None:
+        n = _periods_of(var)
+        if n is not None and n != window.periods:
+            return loc
+    return None
+
+
+def _reads_unwritten_off_window(
+    expr, window: Any, addresses: dict, seen: set,
+) -> Optional[Variable]:
+    """The first input ``expr`` reads that the workbook does not write
+    and that is declared on a window of its own, or ``None``.
+
+    A line the book writes is checked where it is written. One it does
+    not write (a Variable left outside the model) is inlined into the
+    formula as a literal list starting at the sheet's first period, so
+    a series dated otherwise lands under the wrong dates. Anonymous
+    intermediates (``a + b`` inside a longer formula) have no cells
+    either — the formula is spelled through them, so the walk goes
+    through them too.
+    """
+    for ref in expr.iter_refs():
+        if id(ref) in seen or ref.id in addresses:
+            continue
+        seen.add(id(ref))
+        if ref._expr is not None:
+            found = _reads_unwritten_off_window(
+                ref._expr, window, addresses, seen
+            )
+            if found is not None:
+                return found
+        elif ref._grain is not None and _off_window(ref, window) is not None:
+            return ref
+    return None
 
 
 def _has_tracked(mv: "MultiVariableBase") -> bool:
@@ -950,8 +1094,10 @@ def resolve_number_format(comp: Variable) -> str | None:
     Priority: the Variable's own ``_excel_layout.format`` → its own
     ``excel_props['number_format']`` → the nearest ancestor MV's
     ``excel_props['number_format']`` (a section states its unit
-    convention once) → the datetime default → the resolved ExcelView's
-    ``formats['number']`` floor for numeric cells.
+    convention once; a line of dates skips it unless it is a date
+    format) → a date format when the values are dates (with the
+    clock when any has a time of day) → the datetime default → the
+    resolved ExcelView's ``formats['number']`` floor for numeric cells.
     """
     layout = getattr(comp, "_excel_layout", None)
     if layout is not None:
@@ -961,12 +1107,20 @@ def resolve_number_format(comp: Variable) -> str | None:
     props = getattr(comp, "_excel_props", None)
     if props and props.get("number_format"):
         return props["number_format"]
+    date_format = _date_format_of(getattr(comp, "_value", None))
     node = getattr(comp, "_owner", None)
     while node is not None:
         props_up = getattr(node, "_excel_props", None)
         if props_up and props_up.get("number_format"):
-            return props_up["number_format"]
+            inherited = props_up["number_format"]
+            # A section's format speaks for its numbers: a date line in
+            # it keeps a date format unless the section's is one itself.
+            if date_format is None or is_date_format(inherited):
+                return inherited
+            break
         node = getattr(node, "_parent", None)
+    if date_format is not None:
+        return date_format
     if getattr(comp, "value_type", None) == "datetime":
         return "yyyy-mm-dd"
     if getattr(comp, "value_type", None) in ("int", "float"):
@@ -983,6 +1137,24 @@ def resolve_number_format(comp: Variable) -> str | None:
                     return by_unit
             return fmts.get("number")
     return None
+
+
+def _date_format_of(value: object) -> str | None:
+    """The date format a line's values call for, or ``None``.
+
+    A date in a spreadsheet is a number that only LOOKS like a date
+    through its format, so a line whose values are all dates (blanks
+    aside) needs one — whether the dates were typed in or computed by a
+    formula. The clock is shown when any value carries a time of day;
+    otherwise 18:30 would silently read as the start of the day.
+    """
+    items = value if isinstance(value, list) else [value]
+    present = [v for v in items if v is not None]
+    if not present or not all(isinstance(v, date) for v in present):
+        return None
+    if any(isinstance(v, datetime) and v.time() != time() for v in present):
+        return "yyyy-mm-dd hh:mm:ss"
+    return "yyyy-mm-dd"
 
 
 def _resolve_var_id(var: Variable, addresses: dict[str, VariableAddresses]) -> str | None:
@@ -1949,15 +2121,26 @@ def _cell_content(
 
 
 def _scalarize(value: Any) -> Any:
-    """Coerce unsupported types to ``str`` before handing to openpyxl.
+    """The cell value for one computed value.
 
-    openpyxl only knows how to serialize ``None`` / ``int`` / ``float`` /
-    ``str`` / ``bool`` directly. Anything else (``datetime.date``, custom
-    objects, numpy scalars) gets stringified so the cell write doesn't
-    raise — the cell shows the ``repr``, which is readable if imperfect.
+    Numbers, text, booleans and ``None`` go in as they are. A date or
+    datetime goes in as a real spreadsheet date (openpyxl stores it as
+    the day number), never as its text: text only looks like a date,
+    and a comparison against a real date then answers wrong because
+    text sorts above every number. A ``timedelta`` goes in as its count
+    of days (12 hours is 0.5), the number a formula adds to a date.
+    Anything else (custom objects, numpy scalars) is stringified so the
+    cell write doesn't raise — readable if imperfect.
     """
     if value is None or isinstance(value, (int, float, str, bool)):
         return value
+    if isinstance(value, datetime):
+        # A spreadsheet date has no time zone: keep the clock reading.
+        return value.replace(tzinfo=None)
+    if isinstance(value, date):
+        return value
+    if isinstance(value, timedelta):
+        return value / timedelta(days=1)
     return str(value)
 
 

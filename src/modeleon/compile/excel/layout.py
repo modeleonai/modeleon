@@ -347,6 +347,10 @@ class LayoutEngine:
         # in-process writer keeps the id() keying above; the deduped name
         # is unique per compute_addresses pass, so no clone collision).
         self.time_headers_by_sheet: Dict[str, tuple] = {}
+        #: id(sheet_mv) -> the time window its period columns follow
+        #: (``None`` when the model declares none) — recorded whether or
+        #: not a header shows it, because the columns follow it anyway.
+        self.window_by_sheet: Dict[int, Any] = {}
         # sheet_name -> {row -> item_id that claimed it}
         self._occupied_rows: Dict[str, Dict[int, str]] = {}
         #: sheet name -> the ``id(mv)`` keys sharing it, so the
@@ -455,6 +459,7 @@ class LayoutEngine:
             window = (
                 resolve_default_window(anchor_var) if anchor_var is not None else None
             )
+            self.window_by_sheet[id(sheet_mv)] = window
 
             # Transpose (``orient='down'``) is supported for a FLAT sheet only —
             # all direct children are Variables, no sub-sections. Anything nested

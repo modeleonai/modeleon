@@ -402,6 +402,12 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
         if isinstance(value, Variable):
             if getattr(value, '_schedule', None) is not None:
                 self._schedule = dict(value._schedule)
+                # The steps travel with their re-grain rule: a wrapped
+                # schedule is the same rate as the bare one, so it
+                # averages into a quarter the same way unless the
+                # wrapper declares a rule of its own.
+                if self._regrain is None:
+                    self._regrain = value._regrain
             if self._extend is None:
                 self._extend = getattr(value, '_extend', None)
             # Wrapping never strips units: ``mo.Variable(a + b,
@@ -556,6 +562,7 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
         have_window = window is not None and window.grain is not None
 
         from .tracks import TrackValues
+        materialized_here = False
         if (have_window and self._schedule is not None
                 and not isinstance(self._value, (list, TrackValues))):
             if window.start is None or window.periods is None:
@@ -595,6 +602,7 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
                 values.append(current)
             self._value = values
             self.var_type = 'list'
+            materialized_here = True
             # No return: a schedule can be the SHARED value under role
             # kwargs (override spelling) — materialization continues below.
 
@@ -619,6 +627,39 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
                 [pad] * (window.periods - len(self._value))
             )
             self.var_type = 'list'
+            materialized_here = True
+
+        # --- a line that materialized its own values stops re-reading ---
+        # Wrapping or cloning a source that still holds the pending form
+        # (``mo.Variable(mo.schedule({...}))``, a partial series with
+        # ``extend=``, a schedule cloned out of a container with no
+        # window) hands this line the steps / extension, and the line
+        # materialized them itself just above. Its expression, though,
+        # only re-reads the source, which still holds the pending form
+        # (no value yet, or the short list), not the numbers this line
+        # now carries. Written as a reference, the workbook would show
+        # the source's form instead (an absent value inlines as ``=0``).
+        # So the line becomes the input it is and writes its own
+        # values, exactly like the bare spelling. The same holds for a
+        # formula the line's ``extend=`` carried past its operands'
+        # periods (``mo.Variable(z * 2, extend=mo.zero())``): no formula
+        # says "0 from here on". A source that already holds these very
+        # numbers keeps the reference: it is true. So does a formula
+        # reading a series placed by its own ``start=`` / ``grain=``:
+        # the padding above ignored that placement, and the export must
+        # still see the read to refuse it rather than write the series
+        # under the wrong dates.
+        if materialized_here and self._expr is not None:
+            reread = self._expr
+            if (isinstance(reread, MethodCall) and reread.method == 'copy'
+                    and not reread.args and not reread.kwargs):
+                reread = reread.base    # ``source.copy()`` — a clone
+            held = reread.var._value if isinstance(reread, VarRef) else None
+            placed = any(getattr(v, '_grain', None) is not None
+                         for v in self._expr.iter_refs())
+            if not placed and not (
+                    isinstance(held, list) and held == self._value):
+                self.expr = None
 
         # --- role materialization ---
         # ``mo.Variable(actual=..., budget=...)`` recorded intent at
