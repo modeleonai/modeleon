@@ -148,10 +148,11 @@ Standard library functions emit live formulas, not values:
 mo.IRR(cf)       # =IRR(B2:F2, 0.1)
 mo.NPV(0.1, cf)  # =NPV(0.1, B2:F2)
 mo.IF(rev > 0, rev * 0.25, 0)   # =IF(B1>0, B1*0.25, 0)
+mo.CHOOSE(scenario, base, bull) # =CHOOSE(B1, B4, B5) in every period — one scenario cell switches the row
 mo.EOMONTH(start, 1)            # =EOMONTH(B1, 1)
 ```
 
-Also: `IRR`, `NPV`, `XIRR`, `PMT`, `FV`, `PV` · `SUM`, `MAX`, `MIN`, `AVERAGE` · `IF`, `AND`, `OR`, `NOT` · `ABS`, `ROUND`, `INT`, `MOD` · `YEAR`, `MONTH`, `DAY`, `EDATE`, `EOMONTH`, `DATE`, `TODAY` · `CONCAT`, `UPPER`, `LOWER`, `LEN`. All emit live formulas.
+Also: `IRR`, `NPV`, `XIRR`, `PMT`, `FV`, `PV` · `SUM`, `MAX`, `MIN`, `AVERAGE` · `IF`, `AND`, `OR`, `NOT`, `CHOOSE` · `ABS`, `ROUND`, `INT`, `MOD` · `YEAR`, `MONTH`, `DAY`, `EDATE`, `EOMONTH`, `DATE`, `TODAY` · `CONCAT`, `UPPER`, `LOWER`, `LEN`. All emit live formulas.
 
 ---
 
