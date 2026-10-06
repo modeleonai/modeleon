@@ -24,5 +24,6 @@ Layer cake (one coherent job per module):
     tracks / tracks_decl / blend — the tracks axis and its declaration
     unit               — measurement units with algebra
     expr               — AST node types (BinOp, VarRef, Literal, SelfRef, …)
-    errors             — CircularDependencyError, CrossScopeReferenceWarning
+    errors             — CircularDependencyError, CrossScopeReferenceWarning,
+                         ForwardReferenceError, SamePeriodCycleError
 """

@@ -75,8 +75,9 @@ class TestShiftByDays:
             date(2024, 1, 16), date(2024, 4, 1),
         ]
 
-    def test_holes_and_errors_pass_through(self):
-        assert (V([D0, None]) + 1).value == [date(2024, 1, 16), None]
+    def test_a_blank_counts_as_zero_and_errors_pass_through(self):
+        # As in Excel: a blank cell plus one day is serial 1.
+        assert (V([D0, None]) + 1).value == [date(2024, 1, 16), 1]
         assert (V([D0, "#N/A"]) + 1).value == [date(2024, 1, 16), "#N/A"]
 
     def test_text_is_not_a_day_count(self):
@@ -201,9 +202,13 @@ class TestComparisons:
         assert (V([D0, D1]) == 45306).value == [True, False]
         assert (V([D0, D1]) > D0).value == [False, True]
 
-    def test_holes_and_errors_pass_through(self):
-        assert (V([D0, None]) < D1).value == [True, None]
+    def test_a_blank_compares_as_zero_and_errors_pass_through(self):
+        assert (V([D0, None]) < D1).value == [True, True]
         assert (V([D0, "#N/A"]) < D1).value == [True, "#N/A"]
+
+    def test_a_blank_equals_empty_text(self):
+        # Excel's A1="" is true for a blank cell.
+        assert (V([None, "a"]) == "").value == [True, False]
 
 
 class TestIfOverADateComparison:

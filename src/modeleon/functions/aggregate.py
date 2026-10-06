@@ -67,10 +67,11 @@ def _first_variable_value_type(args: tuple, fallback: str = 'float') -> str:
 
 def _common_unit(args: tuple):
     """The single unit shared by every unit-bearing Variable operand —
-    an aggregation of ₸ is ₸. Mixed or absent units → None (never
+    an aggregation of $ is $. Mixed or absent units → None (never
     guess)."""
+    from ..core.unit import unit_key
     units = {
-        str(a._unit) for a in args
+        unit_key(a._unit) for a in args
         if isinstance(a, Variable) and getattr(a, '_unit', None) is not None
     }
     if len(units) != 1:
@@ -96,13 +97,16 @@ def _aggregate(func_name: str, args: tuple, value: Any, value_type: str) -> Vari
 
 def _lifted_reduce(func_name: str, var: Variable, reducer) -> Variable:
     """Per-coordinate reduction of ONE Variable with tracks:
-    ``SUM(выручка)`` → Tracks of per-role totals. The AST stays the
+    ``SUM(revenue)`` → Tracks of per-role totals. The AST stays the
     ordinary FuncCall; the value lifts."""
     from ..core.expr import VarRef
     from ..core.tracks import TrackValues
     from ._helpers import make_func_var
     lifted = TrackValues.lift(
-        lambda track: reducer(track) if isinstance(track, list) else track,
+        # A single value per track stands as itself; a blank one reduces
+        # as an empty range does (0, or #DIV/0! for AVERAGE).
+        lambda track: (reducer(track) if isinstance(track, list)
+                       else reducer([]) if track is None else track),
         var._value,
     )
     label = getattr(var, "python_name", None) or var.path.leaf
@@ -113,6 +117,25 @@ def _lifted_reduce(func_name: str, var: Variable, reducer) -> Variable:
     if getattr(var, '_unit', None) is not None:
         out._unit = var._unit
     return out
+
+
+def _excel_reduce(reduce: Any, empty: Any = 0) -> Any:
+    """``reduce`` over one range as the spreadsheet reads it: an error in
+    the range is the result — the first one, in reading order — and a hole
+    (a cell not entered yet) is skipped, as a blank is. With nothing left
+    the result is ``empty``: 0 for SUM, MAX and MIN, ``#DIV/0!`` for
+    AVERAGE."""
+    def excel(values: List[Any]) -> Any:
+        for value in values:
+            if isinstance(value, str) and value.startswith("#"):
+                return value
+        known = [value for value in values if value is not None]
+        return reduce(known) if known else empty
+    return excel
+
+
+def _mean(values: List[Any]) -> Any:
+    return builtins.sum(values) / len(values)
 
 
 def SUM(*args: AggOperand) -> Variable:
@@ -131,9 +154,9 @@ def SUM(*args: AggOperand) -> Variable:
     from ..core.tracks import TrackValues
     if (len(args) == 1 and isinstance(args[0], Variable)
             and isinstance(args[0]._value, TrackValues)):
-        return _lifted_reduce("SUM", args[0], builtins.sum)
+        return _lifted_reduce("SUM", args[0], _excel_reduce(builtins.sum))
     flat, _ = _flatten_args(args, "SUM")
-    return _aggregate("SUM", args, builtins.sum(flat),
+    return _aggregate("SUM", args, _excel_reduce(builtins.sum)(flat),
                       _first_variable_value_type(args, 'float'))
 
 
@@ -142,9 +165,9 @@ def MAX(*args: AggOperand) -> Variable:
     from ..core.tracks import TrackValues
     if (len(args) == 1 and isinstance(args[0], Variable)
             and isinstance(args[0]._value, TrackValues)):
-        return _lifted_reduce("MAX", args[0], builtins.max)
+        return _lifted_reduce("MAX", args[0], _excel_reduce(builtins.max))
     flat, _ = _flatten_args(args, "MAX")
-    return _aggregate("MAX", args, builtins.max(flat),
+    return _aggregate("MAX", args, _excel_reduce(builtins.max)(flat),
                       _first_variable_value_type(args, 'float'))
 
 
@@ -153,9 +176,9 @@ def MIN(*args: AggOperand) -> Variable:
     from ..core.tracks import TrackValues
     if (len(args) == 1 and isinstance(args[0], Variable)
             and isinstance(args[0]._value, TrackValues)):
-        return _lifted_reduce("MIN", args[0], builtins.min)
+        return _lifted_reduce("MIN", args[0], _excel_reduce(builtins.min))
     flat, _ = _flatten_args(args, "MIN")
-    return _aggregate("MIN", args, builtins.min(flat),
+    return _aggregate("MIN", args, _excel_reduce(builtins.min)(flat),
                       _first_variable_value_type(args, 'float'))
 
 
@@ -164,7 +187,7 @@ def AVERAGE(*args: AggOperand) -> Variable:
     from ..core.tracks import TrackValues
     if (len(args) == 1 and isinstance(args[0], Variable)
             and isinstance(args[0]._value, TrackValues)):
-        return _lifted_reduce("AVERAGE", args[0], lambda f: builtins.sum(f) / len(f) if f else 0)
+        return _lifted_reduce("AVERAGE", args[0], _excel_reduce(_mean, "#DIV/0!"))
     flat, _ = _flatten_args(args, "AVERAGE")
-    value = builtins.sum(flat) / len(flat) if flat else 0
+    value = _excel_reduce(_mean, "#DIV/0!")(flat)
     return _aggregate("AVERAGE", args, value, 'float')

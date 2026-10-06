@@ -1,6 +1,6 @@
 """A track authored as a list of REFERENCES keeps them as formulas.
 
-``forecast=[fact, None, None, solved_cell]`` is a sparse row of links — each
+``forecast=[known, None, None, solved_cell]`` is a sparse row of links — each
 milestone cell points at the cell that holds the number. The role stash
 keeps the original list, so the track's expression is a ListExpr: a
 reference per period where the list holds a Variable, a literal (or a
@@ -35,9 +35,9 @@ def test_sparse_reference_list_emits_links():
     m.default_excel_view = ExcelView(tracks="blend")
     m.s = mo.MultiVariable("S", excel_props={"tab": True})
     with m.s as s:
-        s.fact = mo.Variable(280.0, display_name="Fact")
+        s.known = mo.Variable(280.0, display_name="Known")
         s.solved = mo.Variable(1000.0, display_name="Solved")
-        s.points = mo.Variable(forecast=[s.fact, None, s.solved * 2, s.solved],
+        s.points = mo.Variable(forecast=[s.known, None, s.solved * 2, s.solved],
                                display_name="Points")
     assert isinstance(m.s.points.track_expr("forecast"), ListExpr)
     ws = _book(m, "S")
@@ -45,7 +45,7 @@ def test_sparse_reference_list_emits_links():
     r = rows["Points"]
     cells = [ws.cell(r, c).value for c in range(2, ws.max_column + 1)]
     vals = [v for v in cells if v is not None]   # blanks and the constants column drop out
-    assert vals[0] == f"=B{rows['Fact']}", vals
+    assert vals[0] == f"=B{rows['Known']}", vals
     assert vals[1] == f"=B{rows['Solved']} * 2", vals
     assert vals[2] == f"=B{rows['Solved']}", vals
 

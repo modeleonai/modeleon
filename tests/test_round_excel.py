@@ -44,7 +44,7 @@ class TestHalvesRoundAwayFromZero:
 
     def test_list_is_rounded_element_by_element(self):
         v = mo.Variable([0.5, 1.5, 2.5, -2.5, None, 3.7])
-        assert mo.ROUND(v, 0)._value == [1.0, 2.0, 3.0, -3.0, None, 4.0]
+        assert mo.ROUND(v, 0)._value == [1.0, 2.0, 3.0, -3.0, 0, 4.0]
 
     def test_list_with_decimals(self):
         v = mo.Variable([0.125, 1.005, 2.675, -1.005])
@@ -130,8 +130,18 @@ class TestTypes:
         result = mo.ROUND(1250, -2)._value
         assert result == 1300 and isinstance(result, int)
 
-    def test_none_passes_through(self):
-        assert mo.ROUND(mo.Variable([None, 2.5]), 0)._value == [None, 3.0]
+    def test_a_blank_rounds_to_zero(self):
+        # As in Excel, ROUND of a blank cell is 0.
+        assert mo.ROUND(mo.Variable([None, 2.5]), 0)._value == [0, 3.0]
+
+    def test_a_line_with_tracks_rounds_track_by_track(self):
+        m = mo.Model('m', default_grain='month', default_start='2026-01',
+                     default_periods=2, tracks=mo.Tracks('plan', 'actual'))
+        with m:
+            m.x = mo.Variable(plan=[1.26, 2.0], actual=[1.0, None])
+            m.r = mo.ROUND(m.x, 1)
+        assert m.r.value['plan'] == [1.3, 2.0]
+        assert m.r.value['actual'] == [1.0, 0]
 
     def test_formula_is_unchanged(self):
         assert mo.ROUND(2.5, 0).formula == "ROUND(2.5, 0)"
@@ -200,6 +210,7 @@ _LARGE = [
 ]
 
 
+@pytest.mark.slow
 def test_workbook_rounds_like_python(tmp_path):
     m = mo.Model("Rounding")
     rounded = {}

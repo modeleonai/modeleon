@@ -276,3 +276,12 @@ class TestVariableTruthiness:
         years = Variable([2025, 2026, 2027], var_type="list")
         assert len(years) == 3
         assert len(Variable(5)) == 1
+
+
+def test_set_unit_chains_like_the_other_setters():
+    a = Variable(100.0).set_unit("EUR").set_display_name("Amount")
+    assert a.unit is not None and str(a.unit) == "EUR"
+    assert a.display_name == "Amount"
+    # the unit then rides arithmetic as a declared unit does
+    b = (a * Variable(2.0)).set_unit(None)
+    assert b.unit is None

@@ -5,9 +5,9 @@ A tracked line emits one row per track (``expand_tracked_tree``). The
 blend row carries the line's formula, rendered against its operands'
 blend rows — a derived line's live series is computed from its
 operands' live series. Written as bare numbers, the other subrows
-would read as frozen literals — «Итого доходы · план» a plain number
+would read as frozen literals — "Total revenue · plan" a plain number
 while the very same line one row up explains itself. Change January's
-план in the workbook and the план total would sit still: the
+plan in the workbook and the plan total would sit still: the
 dead-values habit Excel parity exists to kill.
 
 This needs no new arithmetic, because the engine already computed
@@ -20,7 +20,7 @@ bucket cells.
 
 What keeps its number, by construction:
 
-* an AUTHORED track (``mo.Variable(..., факт=[...])``) — that series is
+* an AUTHORED track (``mo.Variable(..., actual=[...])``) — that series is
   DATA, and data has no formula, exactly like an input cell;
 * a line with no expression at all — same reason;
 * a track whose operand does not carry it, so the reference would have
@@ -67,6 +67,7 @@ def write_track_formulas(
     addresses: Dict[str, VariableAddresses],
     var_to_sheet: Dict[str, str],
     sheet_name: str,
+    time: Any = None,
 ) -> None:
     """Stamp each DERIVED track subrow with the line's own formula,
     read in that track's coordinates."""
@@ -79,9 +80,9 @@ def write_track_formulas(
     # loop-built operands resolve to the subrow cells that hold them
     # (one object repeated several times in a formula), never
     # unrolled. Built PER ROLE below: a shared object lives in several
-    # subrows (an inherited прогноз holds the план's very elements),
-    # and this role's own subrow must win — a прогноз formula
-    # referencing a план cell would sit still when the прогноз row is
+    # subrows (an inherited forecast holds the plan's very elements),
+    # and this role's own subrow must win — a forecast formula
+    # referencing a plan cell would sit still when the forecast row is
     # edited in the file.
     from .translator import identity_cells_for
     from .writer import _identity_homes
@@ -158,14 +159,14 @@ def write_track_formulas(
             continue
         book = _role_book(addresses, role)
         translator = ExcelTranslator(book, var_to_sheet,
-                                     identity_cells=_homes_for(role))
+                                     identity_cells=_homes_for(role), time=time)
         for i, ref in enumerate(addr.values):
             # Empty periods keep the formula too — Excel's own rule:
             # empty + empty is 0 there, and a live formula that
-            # answers 0 beats a frozen blank. The one place this could
-            # speak louder than the engine is a SPLICE line, whose blend
-            # row asks ``=IF(факт="",…)`` — but a spliced track is
-            # AUTHORED, and authored tracks never reach this loop.
+            # answers 0 beats a frozen blank. Where a SPLICE reads this
+            # row (a line that enters its plan and derives its actual),
+            # the blend row does not ask ``=""`` of it: it asks the
+            # entries the formula is built from (``blend_writer``).
             try:
                 rendered = translator.translate(
                     expr, i, current_sheet=sheet_name,

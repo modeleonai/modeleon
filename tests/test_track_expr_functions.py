@@ -95,11 +95,15 @@ def test_sum_degrades_to_the_value_without_a_coordinate_row():
     assert tot[0] == 20.0, tot
 
 
-def test_cumsum_plus_series_degrades_to_true_values():
-    # ``cumsum(rev) + d`` with d a tracked SERIES cannot fold d into
-    # the chain's seed (it varies by period); the composition has no
-    # honest chain formula, so the cells hold the true values —
-    # never the folded formula that dropped the per-period term.
+def test_cumsum_plus_series_sums_its_source_live():
+    # ``cumsum(rev) + d`` with d a tracked SERIES cannot fold d into the
+    # chain's seed (it varies by period) — never the folded formula that
+    # dropped the per-period term. The running total is the SUM of rev's
+    # SAME-track row so far, and d stays in every cell: a live formula
+    # where the values used to be baked in.
     ws = _book(_model("rows"), "S")
+    rows = _rows(ws)
+    rev, d = rows["Rev · plan"], rows["D · plan"]
+    cols = _period_cols(ws, "CumRevD · plan")
     c = _cells(ws, "CumRevD · plan")
-    assert c == [3.0, 8.0, 15.0, 24.0], c
+    assert c == [f"=SUM({cols[0]}{rev}:{col}{rev}) + {col}{d}" for col in cols], c

@@ -51,7 +51,7 @@ Package layout:
     plugins.py  - extension point registry
 """
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 # Plugin system — extensions register via entry points
 from modeleon.plugins import load_plugins as _load_plugins
@@ -59,6 +59,7 @@ from modeleon.plugins import load_plugins as _load_plugins
 # Core DSL
 from modeleon.core.variable import Variable
 from modeleon.core.time import Time
+from modeleon.core.time import time as time  # mo.time — not in __all__: it would shadow the stdlib module on `import *`
 from modeleon.core.regrain import up, frozen, ratio
 from modeleon.core.extend import hold, none, zero
 from modeleon.core.blend import blend
@@ -68,7 +69,10 @@ from modeleon.core.multi_variable import (
     MultiVariable,
 )
 from modeleon.core.model import Model
-from modeleon.core.errors import CircularDependencyError, CrossScopeReferenceWarning
+from modeleon.core.errors import (
+    CircularDependencyError, CrossScopeReferenceWarning, ForwardReferenceError,
+    SamePeriodCycleError,
+)
 from modeleon.core.mv_context import ModelStructureWarning
 from modeleon.core.unit import Unit
 
@@ -77,7 +81,7 @@ from modeleon.core.unit import Unit
 from modeleon.compile import check_compat, to_json
 
 # Excel presentation view — declared-once, cascading layout/styling
-from modeleon.compile.excel.view import ExcelView
+from modeleon.compile.excel.view import ExcelView, house_view
 
 # Pre-built DSL helpers
 from modeleon.functions import (
@@ -90,13 +94,13 @@ from modeleon.functions import (
     # Conditional / logical
     IF, AND, OR, NOT, CHOOSE, ISBLANK,
     # Dates
-    YEAR, MONTH, DAY, DATE, EDATE, EOMONTH, DAYS360, TODAY,
+    YEAR, MONTH, DAY, DATE, EDATE, EOMONTH, DAYS360, YEARFRAC, DAYS, TODAY,
     # Text
     LEN, UPPER, LOWER, CONCAT,
     # Recurrence / cohort / shift
     cumsum, lag, recurrence, recurrence_sum, cohort_retention, schedule,
     # Financial
-    IRR, NPV, XIRR, PMT, FV, PV,
+    IRR, NPV, XIRR, XNPV, PMT, FV, PV,
 )
 
 # The process-wide default view — EVERY value the engine uses, made explicit so
@@ -137,8 +141,11 @@ __all__ = [
     "Unit",
     "ExcelView",
     "default_excel_view",
+    "house_view",
     # Exceptions / warnings
     "CircularDependencyError",
+    "ForwardReferenceError",
+    "SamePeriodCycleError",
     "CrossScopeReferenceWarning",
     "ModelStructureWarning",
     # AST introspection (alternative renderer — see compile/json)
@@ -168,6 +175,8 @@ __all__ = [
     "EDATE",
     "EOMONTH",
     "DAYS360",
+    "YEARFRAC",
+    "DAYS",
     "TODAY",
     # Text
     "LEN",
@@ -190,6 +199,7 @@ __all__ = [
     "IRR",
     "NPV",
     "XIRR",
+    "XNPV",
     "PMT",
     "FV",
     "PV",

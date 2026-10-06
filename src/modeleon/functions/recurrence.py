@@ -189,10 +189,11 @@ def _safe_eval(node: ast.AST, names: Dict[str, Any]) -> Any:
 # Converts ``"{name}"`` placeholders to bare identifiers so the template
 # becomes parseable Python. ``"{prev} * (1 - {churn})"`` →
 # ``"prev * (1 - churn)"``.
-#: ``\w`` with re.UNICODE covers Cyrillic (and any other script) —
-#: models are often written in Russian; an ASCII-only placeholder
-#: silently left ``{п}`` unsubstituted and the parser then read the
-#: braces as a Python set literal ("Expression not allowed: Set").
+#: ``\w`` with re.UNICODE covers any script, not just Latin — models
+#: are often written in their authors' own language; an ASCII-only
+#: placeholder silently left ``{収入}`` (non-Latin on purpose: a
+#: Unicode name) unsubstituted and the parser then read the braces
+#: as a Python set literal ("Expression not allowed: Set").
 _PLACEHOLDER_RE = re.compile(r'\{([^\W\d]\w*)\}', re.UNICODE)
 
 
@@ -212,9 +213,11 @@ def _resolve_periods(periods, variables: Dict[str, Any]) -> Tuple[int, Optional[
             if isinstance(var, Variable) and var.var_type == 'list':
                 return len(var._value), None
         raise ValueError(
-            "recurrence() couldn't determine `periods`. Either:\n"
-            "  - pass periods=N explicitly, e.g. recurrence(start, formula, periods=12), or\n"
-            "  - pass a list-valued Variable as one of the template inputs."
+            "recurrence() couldn't determine `periods`: it counts them from a "
+            "list-valued Variable among its template inputs (the line it rolls). "
+            "A line grown from scalars alone is no recurrence but a formula of "
+            "the period's time, e.g. base * (1 + g) ** (mo.time.index - 1); "
+            "outside a model with a time window, pass periods=N."
         )
 
     if isinstance(periods, Variable):
@@ -284,6 +287,8 @@ def _eval_template(formula: str, start_value, periods: int,
     # Per-period variable values at index 0 are unused — kept aligned
     # with the result so callers can read `var[t]` and get the value
     # that was in effect at output period `t`.
+    if start_value is None:
+        start_value = 0                 # a blank start reads as 0, as in Excel
     result = [start_value]
     prev = start_value
     for t in range(1, periods):
@@ -291,31 +296,30 @@ def _eval_template(formula: str, start_value, periods: int,
         for key, per_period in var_values_per_period.items():
             v = per_period[t]
             names[key] = v._value if isinstance(v, Variable) else v
-        # Excel-error markers ABSORB before evaluation (string '+'
-        # would silently concatenate them); ``None`` holes (un-entered
-        # fact months) absorb through the TypeError below, AFTER the
-        # structural validation inside ``_safe_eval`` has had its say —
-        # a malformed template still teaches, but one missing month
-        # (say, an early month not entered yet) must not kill the
-        # whole chain.
-        if any(isinstance(v, str) and v.startswith('#')
-               for v in names.values()):
-            result.append('#VALUE!')
-            prev = '#VALUE!'
+        # A blank counts as zero, as in Excel: a month nobody entered
+        # leaves the balance where it was instead of blanking the chain.
+        names = {k: (0 if v is None else v) for k, v in names.items()}
+        # An Excel error marker carries on as itself, as Excel's own
+        # formulas carry it (string '+' would concatenate it).
+        error = next((v for v in names.values()
+                      if isinstance(v, str) and v.startswith('#')), None)
+        if error is not None:
+            result.append(error)
+            prev = error
             continue
         try:
             current = _safe_eval(tree, names)
+        except ZeroDivisionError:
+            # Over a blank month a divisor reads 0 - Excel's #DIV/0!,
+            # carried on like any error rather than ending the run.
+            result.append('#DIV/0!')
+            prev = '#DIV/0!'
+            continue
         except TypeError as e:
-            if any(v is None for v in names.values()):
-                # A hole is absence, not failure — the chain goes
-                # quiet (blank) from here rather than into an error.
-                result.append(None)
-                prev = None
-                continue
             raise ValueError(
                 f"Error evaluating formula {formula!r} at period {t}: {e}"
             ) from e
-        except (ValueError, NameError, ZeroDivisionError) as e:
+        except (ValueError, NameError) as e:
             raise ValueError(
                 f"Error evaluating formula {formula!r} at period {t}: {e}"
             ) from e
@@ -425,9 +429,28 @@ def recurrence(
     for _k, _v in (variables or {}).items():
         reject_axised(_v, f"recurrence(variables[{_k!r}])")
 
+    # The line's own keywords (``regrain=``, ``unit=``, ...) are the
+    # line's, never template variables - unless the template names one.
+    if isinstance(formula, str):
+        named = set(re.findall(r"[A-Za-z_]\w*", formula))       # braced or bare
+    elif callable(formula):
+        try:
+            named = set(inspect.signature(formula).parameters)
+        except (TypeError, ValueError):
+            named = set()
+    else:
+        named = set()
+    line = {k: kwargs.pop(k) for k in _LINE_KEYWORDS
+            if k in kwargs and (variables is not None or k not in named)}
     # Remaining kwargs are template variables (``{name}`` substitutions).
     if variables is None:
         variables = kwargs or {}
+    elif kwargs:
+        raise TypeError(
+            f"recurrence() got {', '.join(sorted(kwargs))} beside variables= - "
+            f"template variables go in variables= (or as keywords without "
+            f"it); a line keeps only {', '.join(_LINE_KEYWORDS)}."
+        )
 
     # ─── track lift: N independent chains, one per coordinate ───
     # A roll-forward over a track-carrying driver rolls SEPARATELY in
@@ -480,7 +503,10 @@ def recurrence(
             if tl is None:
                 raise ValueError(
                     "recurrence() couldn't determine `periods` from "
-                    "all-scalar tracks — pass periods=N explicitly."
+                    "all-scalar tracks: it counts them from a list-valued "
+                    "input; a line grown from scalars alone is a formula of "
+                    "the period's time (mo.time); outside a model with a "
+                    "time window, pass periods=N."
                 )
             periods_resolved = tl
         else:
@@ -521,7 +547,7 @@ def recurrence(
         )
         if display_name:
             result._display_name = display_name
-        return result
+        return _with_line(result, line)
 
     is_lambda = callable(formula) and (inspect.isfunction(formula) or inspect.ismethod(formula))
     periods_resolved, periods_var = _resolve_periods(periods, variables)
@@ -530,6 +556,15 @@ def recurrence(
 
     # Evaluate in Python regardless of mode — user code expects ``._value`` populated.
     if is_lambda:
+        if any(isinstance(v, Variable) and (v._awaits or v._forward_of is not None)
+               for v in (start, *variables.values())):
+            # A lambda cannot be run again when the loop closes; its
+            # values would stay the provisional ones.
+            raise ValueError(
+                "recurrence(lambda ...) over a row whose loop has not closed "
+                "yet — write the formula as a template, or build this row "
+                "after the loop's last line."
+            )
         values = _eval_lambda(formula, start_value, periods_resolved)
         recurrence_expr = None
     else:
@@ -574,6 +609,24 @@ def recurrence(
 
     if display_name:
         result._display_name = display_name
+    return _with_line(result, line)
+
+
+#: What a line takes beside its recurrence: its fold rule, unit, words and
+#: look - kept on the result, never read as a template variable.
+_LINE_KEYWORDS = ('regrain', 'unit', 'description', 'excel_props')
+
+
+def _with_line(result: Variable, line: Dict[str, Any]) -> Variable:
+    if 'regrain' in line and line['regrain'] is not None:
+        result.set_regrain(line['regrain'])
+    if 'unit' in line and line['unit'] is not None:
+        result.set_unit(line['unit'])
+    if 'description' in line and line['description'] is not None:
+        result.set_description(line['description'])
+    if 'excel_props' in line and line['excel_props'] is not None:
+        result._excel_props = {
+            **result._excel_props, **result._validate_excel_props(line['excel_props'])}
     return result
 
 
@@ -616,13 +669,13 @@ def cumsum(iterable: Variable) -> Variable:
                 return track
             out, run = [], 0.0
             for v in track:
-                # Holes and error markers stop the running total —
-                # absence is quiet (None from here on), failure loud.
-                if run is None or v is None:
-                    run = None
-                elif isinstance(v, str) or isinstance(run, str):
-                    run = v if isinstance(v, str) else run
-                else:
+                # A blank month adds 0, as in Excel; an error marker
+                # stops the running total and stays.
+                if isinstance(run, str):
+                    pass
+                elif isinstance(v, str):
+                    run = v
+                elif v is not None:
                     run += v
                 out.append(run)
             return out
@@ -635,7 +688,7 @@ def cumsum(iterable: Variable) -> Variable:
         result.var_type = 'list'
         result._cumsum_source = iterable
         if getattr(iterable, '_unit', None) is not None:
-            result._unit = iterable._unit  # a running total of ₸ is ₸
+            result._unit = iterable._unit  # a running total of $ is $
         return result
     reject_axised(iterable, "cumsum")
     if not isinstance(iterable, Variable):
@@ -674,5 +727,5 @@ def cumsum(iterable: Variable) -> Variable:
     # forbidden; this identity lets core.projection rebuild the row.
     result._cumsum_source = iterable
     if getattr(iterable, '_unit', None) is not None:
-        result._unit = iterable._unit  # a running total of ₸ is ₸
+        result._unit = iterable._unit  # a running total of $ is $
     return result

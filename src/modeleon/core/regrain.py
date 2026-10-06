@@ -24,6 +24,7 @@ supported.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import date as _date
 from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 #: Built-in coarsening recipes. Each is sugar for a rule over the bucket's
@@ -140,8 +141,27 @@ def ratio(num: str, den: str) -> RegrainSpec:
     return RegrainSpec(default=Ratio(num, den))
 
 
+def hole_value(series: Any) -> Any:
+    """What a hole counts as when ``series`` is folded: ``0``, as a blank
+    cell in a formula - or ``None`` in a line of dates or words, where a
+    blank has no zero. A line with tracks is judged on all of them: its
+    actuals not entered yet are no less a line of dates."""
+    if hasattr(series, 'roles'):
+        values = [v for role in series.roles
+                  for v in (series[role] if isinstance(series[role], list) else [series[role]])]
+    else:
+        values = series if isinstance(series, list) else [series]
+    return None if any(
+        isinstance(value, _date) or (isinstance(value, str) and not value.startswith('#'))
+        for value in values) else 0
+
+
+#: ``blank`` not given: the values at hand decide what a hole counts as.
+LINE_UNKNOWN: Any = object()
+
+
 def apply_recipe(bucket: list, recipe: str,
-                 weights: Optional[list] = None) -> Any:
+                 weights: Optional[list] = None, *, blank: Any = LINE_UNKNOWN) -> Any:
     """Reduce one bucket of native cells to a single coarse value via a named
     recipe. (Callable and :class:`Ratio` rules are evaluated by the projection
     driver, not here.)
@@ -154,15 +174,25 @@ def apply_recipe(bucket: list, recipe: str,
     regardless of period length, and ``geometric`` compounds per period (each
     rate already applies to its own period, whatever its length).
 
-    Error cells absorb: a bucket containing an Excel error token (a ``'#'``-
-    prefixed string, the same convention the operator chokepoint uses) reduces
-    to that token. Holes absorb into AGGREGATING recipes the same way: a
-    bucket containing ``None`` (an un-entered period) has no aggregate yet —
-    absence, not failure. Positional recipes (``first`` / ``last``) read only
-    their own period, matching the positional cell reference they emit.
-    Domain failures produce tokens, never raise: ``geometric`` with any ``1 + x <= 0`` is ``'#NUM!'``; a weighted ``mean`` over zero
-    total weight is ``'#DIV/0!'`` — one bad bucket is one error cell, not a
-    projection-wide crash.
+    A hole (``None``, an un-entered period) counts as zero, as a blank cell
+    does in the book's formula: a quarter with one month entered sums that
+    month, and ``geometric`` compounds the blank month at 0%. ``mean``,
+    ``min`` and ``max`` skip holes, as Excel's ``AVERAGE`` / ``MIN`` /
+    ``MAX`` skip blank cells (a mean over the entered periods' days), and a
+    bucket of holes alone is ``0``. Positional recipes (``first`` /
+    ``last``) read only their own period, matching the cell reference they
+    emit: a hole there is ``0``, a sibling's error is not theirs. A line of
+    dates or words has no zero: a bucket with a hole stays ``None`` there
+    (a positional pick of an entered period excepted). ``blank`` is what a
+    hole counts as (:func:`hole_value` of the whole line); left out, the
+    bucket alone decides.
+
+    Error cells absorb into aggregating recipes: a bucket containing an
+    Excel error token (a ``'#'``-prefixed string, the same convention the
+    operator chokepoint uses) reduces to that token. Domain failures produce
+    tokens, never raise: ``geometric`` with any ``1 + x <= 0`` is
+    ``'#NUM!'``; a weighted ``mean`` over zero total weight is ``'#DIV/0!'``
+    - one bad bucket is one error cell, not a projection-wide crash.
     """
     if not bucket:
         raise ValueError("Cannot re-grain an empty bucket.")
@@ -171,42 +201,37 @@ def apply_recipe(bucket: list, recipe: str,
             f"Re-grain weights length {len(weights)} does not match bucket "
             f"length {len(bucket)}."
         )
+    if blank is LINE_UNKNOWN:
+        blank = hole_value(bucket)
+    if recipe in ('first', 'last'):
+        picked = bucket[0] if recipe == 'first' else bucket[-1]
+        return blank if picked is None else picked
     for value in bucket:
         if isinstance(value, str) and value.startswith('#'):
             return value                       # absorbing error token
-    # Positional recipes pick ONE period's value, and the emitted
-    # Excel formula is a positional cell reference — value and formula
-    # must agree, so the coarse cell is a hole only when THAT period
-    # is a hole, never because a sibling is.
-    if recipe == 'first':
-        return bucket[0]
-    if recipe == 'last':
-        return bucket[-1]
-    # Aggregating recipes fold the whole bucket, and holes absorb —
-    # absence, not failure. ``None`` is an un-entered period; a bucket
-    # containing one has no aggregate yet (the quarter isn't known
-    # until every month in it is). Mirrors the operator chokepoint's
-    # None law; without this, ``sum`` raises ``int + NoneType`` and
-    # one hole kills the whole projection.
-    for value in bucket:
-        if value is None:
-            return None
-    if recipe == 'sum':
-        return sum(bucket)
+    if blank is None and any(value is None for value in bucket):
+        return None
+    if recipe in ('min', 'max'):
+        entered = [value for value in bucket if value is not None]
+        if not entered:
+            return blank
+        return min(entered) if recipe == 'min' else max(entered)
     if recipe == 'mean':
-        if weights is None:
-            return sum(bucket) / len(bucket)
-        total = sum(weights)
+        # Over the periods entered, as Excel's AVERAGE skips a blank cell.
+        pairs = [(value, 1 if weights is None else weights[i])
+                 for i, value in enumerate(bucket) if value is not None]
+        if not pairs:
+            return blank
+        total = sum(w for _v, w in pairs)
         if total == 0:
             return '#DIV/0!'
-        return sum(v * w for v, w in zip(bucket, weights)) / total
-    if recipe == 'min':
-        return min(bucket)
-    if recipe == 'max':
-        return max(bucket)
+        return sum(v * w for v, w in pairs) / total
+    values = [0 if value is None else value for value in bucket]
+    if recipe == 'sum':
+        return sum(values)
     if recipe == 'geometric':
         product = 1.0
-        for value in bucket:
+        for value in values:
             if 1 + value <= 0:
                 return '#NUM!'                 # -100% or worse: no real compound
             product *= (1 + value)

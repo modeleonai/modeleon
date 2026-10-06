@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for financial functions: IRR, NPV, XIRR, PMT, FV, PV."""
 
+from datetime import date
+
 import pytest
 from openpyxl import load_workbook
 
@@ -138,3 +140,75 @@ class TestExcelFormulaEmission:
         rate_result = IRR([-100, 30, 40, 50, 60])
         assert rate_result._expr is None
         assert rate_result._value is not None
+
+
+class TestAListHoldingARowIsRefused:
+    """A cell beside a row - ``mo.XIRR([cost, flows], [close, dates])`` - has
+    no range in the book, and numpy failed on it with 'inhomogeneous
+    shape'. The refusal says what to write instead, and that works."""
+
+    @staticmethod
+    def _model():
+        m = mo.Model("m", default_grain="month", default_start="2025-12", default_periods=4)
+        with m:
+            m.close = mo.Variable(mo.DATE(2025, 12, 31), display_name="Close")
+            m.cost = mo.Variable(300.0, display_name="Cost")
+            m.op = mo.Variable([0.0, 100.0, 110.0, 120.0], display_name="Operating flow")
+            m.rate = mo.Variable(0.1, display_name="Rate")
+        return m
+
+    @pytest.mark.parametrize("call", ["XIRR", "XIRR dates", "XNPV", "IRR", "NPV"])
+    def test_the_refusal_names_one_row(self, call):
+        m = self._model()
+        calls = {
+            "XIRR": lambda: mo.XIRR([-m.cost, m.op], [m.close, mo.time.end]),
+            "XIRR dates": lambda: mo.XIRR(m.op, [m.close, mo.time.end]),
+            "XNPV": lambda: mo.XNPV(m.rate, [-m.cost, m.op], [m.close, mo.time.end]),
+            "IRR": lambda: mo.IRR([-m.cost, m.op]),
+            "NPV": lambda: mo.NPV(m.rate, [m.op, -m.cost]),
+        }
+        with m, pytest.raises(ValueError, match="one row of flows") as err:
+            calls[call]()
+        assert "inhomogeneous" not in str(err.value)
+        hint = "outside the call" if call == "NPV" else "a period of its own"
+        assert hint in str(err.value)
+
+    def test_a_list_holding_only_a_row_says_to_drop_the_brackets(self):
+        m = self._model()
+        with m, pytest.raises(ValueError, match="the row itself, not a list holding it"):
+            mo.NPV(m.rate, [m.op])
+
+    def test_cells_in_a_list_are_their_numbers(self):
+        # A cell iterates as a one-item sequence: numpy made an n x n grid
+        # of the flows, and the NPV of two 50s at 10% read 173.55.
+        m = mo.Model("deal")
+        with m:
+            m.rate = mo.Variable(0.10)
+            m.y1, m.y2, m.cost = mo.Variable(50.0), mo.Variable(50.0), mo.Variable(100.0)
+            m.close = mo.Variable(mo.DATE(2025, 1, 1))
+            m.exit_date = mo.Variable(mo.DATE(2027, 1, 1))
+            m.exit = mo.Variable(150.0)
+            dates = [date(2025, 1, 1), date(2027, 1, 1)]
+            assert mo.NPV(m.rate, [m.y1, m.y2]).value == pytest.approx(
+                mo.NPV(0.1, [50.0, 50.0]).value)
+            assert mo.NPV(m.rate, [m.y1, 50.0]).value == pytest.approx(86.776859504)
+            assert mo.IRR([-m.cost, m.y1, m.y2]).value == pytest.approx(0.0, abs=1e-9)
+            assert mo.XNPV(m.rate, [-m.cost, m.exit], [m.close, m.exit_date]).value == (
+                pytest.approx(mo.XNPV(0.1, [-100.0, 150.0], dates).value))
+            assert mo.XIRR([-m.cost, m.exit], [m.close, m.exit_date]).value == (
+                pytest.approx(mo.XIRR([-100.0, 150.0], dates).value))
+
+    def test_the_outlay_in_its_own_period_gives_a_live_xirr(self, tmp_path):
+        m = self._model()
+        with m:
+            m.flows = mo.IF(mo.time.index == 1, -m.cost, m.op).set_display_name("Flows")
+            m.dates = mo.IF(mo.time.index == 1, m.close, mo.time.end).set_display_name("Dates")
+            m.irr = mo.XIRR(m.flows, m.dates).set_display_name("IRR")
+        plain = mo.XIRR([-300.0, 100.0, 110.0, 120.0],
+                        [date(2025, 12, 31), date(2026, 1, 31), date(2026, 2, 28),
+                         date(2026, 3, 31)])
+        assert m.irr.value == pytest.approx(plain.value, rel=1e-12)
+        m.to_excel(tmp_path / "xirr.xlsx")
+        ws = load_workbook(tmp_path / "xirr.xlsx").active
+        row = next(r for r in range(1, ws.max_row + 1) if ws.cell(r, 1).value == "IRR")
+        assert str(ws.cell(row, 2).value).startswith("=XIRR(")

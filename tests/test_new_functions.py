@@ -86,6 +86,52 @@ class TestDates:
         assert mo.DAYS360(starts, ends, True)._value == [90, 90]
 
 
+class TestABlankDateIsRefusedByName:
+    """A date function over a blank stops the run, and says which line is
+    blank in which period - it said "got NoneType". Excel reads the blank
+    as 0 and computes on with the year 1900; the engine refuses."""
+
+    @staticmethod
+    def _lines():
+        m = mo.Model("m", default_grain="month", default_start="2026-01", default_periods=4)
+        with m:
+            m.s = mo.MultiVariable("S")
+            with m.s as s:
+                s.due = mo.Variable([date(2026, 3, 31), None, date(2026, 6, 30), date(2026, 9, 30)],
+                                    display_name="Due date")
+                s.start = mo.Variable([date(2026, 1, 1)] * 4, display_name="Start")
+                s.year = mo.Variable([2026, 2026, None, 2026], display_name="Year")
+        return m.s
+
+    @pytest.mark.parametrize("call", [
+        lambda s: mo.YEAR(s.due),
+        lambda s: mo.MONTH(s.due),
+        lambda s: mo.DAY(s.due),
+        lambda s: mo.EDATE(s.due, 1),
+        lambda s: mo.EOMONTH(s.due, 0),
+        lambda s: mo.DAYS360(s.start, s.due),
+        lambda s: mo.YEARFRAC(s.start, s.due, 3),
+        lambda s: mo.DAYS(s.due, s.start),
+    ], ids=["YEAR", "MONTH", "DAY", "EDATE", "EOMONTH", "DAYS360", "YEARFRAC", "DAYS"])
+    def test_names_the_line_and_the_month(self, call):
+        with pytest.raises(TypeError, match=r"needs a date in every period: "
+                                            r"'Due date' is blank in Feb 2026\.$"):
+            call(self._lines())
+
+    def test_date_names_its_blank_number(self):
+        with pytest.raises(TypeError, match=r"^DATE needs a number in every period: "
+                                            r"'Year' is blank in Mar 2026\.$"):
+            mo.DATE(self._lines().year, 1, 1)
+
+    def test_one_blank_date(self):
+        with pytest.raises(TypeError, match=r"^YEAR needs a date: 'Close' is blank\.$"):
+            mo.YEAR(mo.Variable(None, display_name="Close"))
+
+    def test_a_line_with_no_time_counts_its_periods(self):
+        with pytest.raises(TypeError, match=r"'Dates' is blank in period 2\.$"):
+            mo.YEAR(mo.Variable([date(2026, 1, 1), None], display_name="Dates"))
+
+
 class TestLogical:
     def test_and_scalar(self):
         assert mo.AND(mo.Variable(5) > 3, mo.Variable(2) < 10)._value is True
@@ -109,7 +155,7 @@ class TestLogical:
 
     def test_choose_elementwise_phase_switch(self):
         flag = mo.Variable([0, 0, 1, 1])
-        assert mo.CHOOSE(flag + 1, 'Ф', 'П')._value == ['Ф', 'Ф', 'П', 'П']
+        assert mo.CHOOSE(flag + 1, 'A', 'F')._value == ['A', 'A', 'F', 'F']
 
     def test_choose_scalar_index_over_series_choices_is_a_series(self):
         # The scenario switch: one scenario number picks a whole series.
@@ -136,6 +182,21 @@ class TestLogical:
         one = mo.Variable([7])
         bull = mo.Variable([150, 170, 190])
         assert mo.CHOOSE(1, one, bull)._value == [7, 7, 7]
+
+    def test_if_scalar_condition_choosing_a_series_is_a_series(self):
+        # One flag picks a whole series: whatever reads the row by its type
+        # (cumsum, recurrence) must see one value per period.
+        capex = mo.Variable([10, 20, 30])
+        result = mo.IF(mo.Variable(1) > 0, capex, 0)
+        assert result._value == [10, 20, 30]
+        assert result.var_type == 'list'
+        assert mo.cumsum(result)._value == [10, 30, 60]
+
+    def test_if_scalar_condition_choosing_a_scalar_is_a_scalar(self):
+        capex = mo.Variable([10, 20, 30])
+        result = mo.IF(mo.Variable(0) > 0, capex, 0)
+        assert result._value == 0
+        assert result.var_type == 'scalar'
 
     @pytest.mark.parametrize('short', [[1, 2], []])
     def test_choose_series_choices_of_different_lengths_are_refused(self, short):
@@ -167,9 +228,9 @@ class TestText:
     def test_concat_elementwise_period_label(self):
         quarter = mo.Variable([1, 2, 3])
         year = mo.Variable([2022, 2022, 2022])
-        phase = mo.Variable(['Ф', 'Ф', 'П'])
+        phase = mo.Variable(['A', 'A', 'F'])
         label = mo.CONCAT(quarter, 'Q ', year, ' ', phase)
-        assert label._value == ['1Q 2022 Ф', '2Q 2022 Ф', '3Q 2022 П']
+        assert label._value == ['1Q 2022 A', '2Q 2022 A', '3Q 2022 F']
 
     def test_upper(self):
         assert mo.UPPER(mo.Variable('hello'))._value == 'HELLO'
@@ -368,6 +429,7 @@ class TestChooseScenarioSwitch:
         ]
 
     @pytest.mark.parametrize('scenario', [1, 2])
+    @pytest.mark.slow
     def test_workbook_recalculates_to_the_python_values(self, tmp_path, scenario):
         m = self._model(scenario)
         out = tmp_path / 'scenarios.xlsx'
@@ -382,7 +444,7 @@ class TestISBLANK:
     """``ISBLANK`` — the only honest way to write an OPTIONAL value.
 
     A leaving date that has not happened yet must read as an EMPTY cell.
-    Filling it with the end of the window says "dismissed on 31
+    Filling it with the end of the window says "left on 31
     December", which an accountant will act on. But comparing against an
     empty operand answers all-False, so "no upper bound" cannot be said
     without a blank test — and Excel's own answer to that is ISBLANK.
@@ -392,7 +454,7 @@ class TestISBLANK:
         assert mo.ISBLANK(mo.Variable(None)).value is True
         assert mo.ISBLANK(mo.Variable("")).value is True
         assert mo.ISBLANK(mo.Variable(0)).value is False
-        assert mo.ISBLANK(mo.Variable("Иванов")).value is False
+        assert mo.ISBLANK(mo.Variable("Smith")).value is False
 
     def test_zero_is_not_blank(self) -> None:
         """The distinction the whole thing rests on: a rate of 0 % is a

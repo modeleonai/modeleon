@@ -5,6 +5,7 @@ Every test builds an explicit root MultiVariable and calls ``.to_excel()``
 on it. Components attach via ``parent.child = ...`` only.
 """
 
+import re
 from pathlib import Path
 
 import pytest
@@ -938,3 +939,215 @@ class TestChildrenAreSections:
         assert "Rec2" in names, names
         assert "Records" in names, names
         assert len(names) == 2, names
+
+
+class TestSheetReferences:
+    @staticmethod
+    def _rows(path: Path, sheet: str) -> dict:
+        ws = load_workbook(path)[sheet]
+        return {r[0].value: [c.value for c in r[1:] if c.value is not None]
+                for r in ws.iter_rows() if r[0].value is not None}
+
+    def test_an_apostrophe_in_a_sheet_name_is_doubled(self, tmp_path: Path) -> None:
+        root = mo.MultiVariable("root")
+        root.bob = mo.MultiVariable("Bob's inputs")
+        root.bob.x = mo.Variable([1.0, 2.0], display_name="X")
+        root.pl = mo.MultiVariable("PL")
+        root.pl.y = mo.Variable(root.bob.x * 2, display_name="Y")
+        out = tmp_path / "apostrophe.xlsx"
+        root.to_excel(out)
+        x_row = next(r[0].row for r in load_workbook(out)["Bob's inputs"].iter_rows()
+                     if r[0].value == "X")
+        assert self._rows(out, "PL")["Y"] == [
+            f"='Bob''s inputs'!B{x_row} * 2", f"='Bob''s inputs'!C{x_row} * 2"]
+
+    def test_a_tab_ending_in_a_newline_is_quoted(self, tmp_path: Path) -> None:
+        # The identifier test matched with ``$``, which also matches before
+        # a trailing newline: the reference came out ``Plan\n!B2``, a
+        # formula Excel cannot read.
+        root = mo.MultiVariable("root")
+        root.plan = mo.MultiVariable("Plan\n")
+        root.plan.x = mo.Variable([1.0, 2.0], display_name="X")
+        root.pl = mo.MultiVariable("PL")
+        root.pl.y = mo.Variable(root.plan.x * 2, display_name="Y")
+        out = tmp_path / "newline.xlsx"
+        root.to_excel(out)
+        x_row = next(r[0].row for r in load_workbook(out)["Plan\n"].iter_rows()
+                     if r[0].value == "X")
+        assert self._rows(out, "PL")["Y"] == [
+            f"='Plan\n'!B{x_row} * 2", f"='Plan\n'!C{x_row} * 2"]
+
+
+    def test_a_tab_never_begins_or_ends_with_an_apostrophe(self, tmp_path: Path) -> None:
+        root = mo.MultiVariable("root")
+        # Cut to 31 characters, the name would end with the apostrophe.
+        root.a = mo.MultiVariable("Operating expenses of the firm's budget")
+        root.a.x = mo.Variable([1.0, 2.0], display_name="X")
+        root.b = mo.MultiVariable("'Adjusted")
+        root.b.z = mo.Variable([5.0, 6.0], display_name="Z")
+        root.pl = mo.MultiVariable("PL")
+        root.pl.y = mo.Variable(root.a.x * 2, display_name="Y")
+        root.pl.w = mo.Variable(root.b.z * 3, display_name="W")
+        out = tmp_path / "ends.xlsx"
+        root.to_excel(out)
+        assert load_workbook(out).sheetnames == [
+            "Operating expenses of the firm", "Adjusted", "PL"]
+        rows = self._rows(out, "PL")
+        assert rows["Y"][0].startswith("='Operating expenses of the firm'!B")
+        assert rows["W"][0].startswith("=Adjusted!B")
+
+    def test_tabs_differing_only_by_case_are_two_names(self, tmp_path: Path) -> None:
+        """Excel compares tab names case-insensitively: a second ``SALES``
+        beside ``Sales`` is renamed, and the formulas must follow."""
+        root = mo.MultiVariable("root")
+        root.a = mo.MultiVariable("Sales")
+        root.a.x = mo.Variable([1.0, 2.0], display_name="X")
+        root.b = mo.MultiVariable("SALES")
+        root.b.z = mo.Variable([100.0, 200.0], display_name="Z")
+        root.pl = mo.MultiVariable("PL")
+        root.pl.y = mo.Variable(root.b.z * 2, display_name="Y")
+        out = tmp_path / "case.xlsx"
+        root.to_excel(out)
+        assert load_workbook(out).sheetnames == ["Sales", "SALES1", "PL"]
+        assert self._rows(out, "PL")["Y"][0].startswith("=SALES1!B")
+
+    def test_a_recurrence_leaves_the_sheet_names_it_reads_alone(
+        self, tmp_path: Path
+    ) -> None:
+        root = mo.MultiVariable("root")
+        root.a = mo.MultiVariable("Bob's data")
+        root.a.sales = mo.Variable([1.0, 2.0, 3.0], display_name="Sales")
+        root.c = mo.MultiVariable("prev year")
+        root.c.rate = mo.Variable(0.1, display_name="Rate")
+        root.pl = mo.MultiVariable("PL")
+        # ``s`` and ``prev`` also occur inside the sheet names.
+        root.pl.r1 = mo.recurrence(1.0, "{prev} + {s}", s=root.a.sales,
+                                   display_name="R1")
+        root.pl.r3 = mo.recurrence(100.0, "prev * (1 + rate)", rate=root.c.rate,
+                                   periods=3, display_name="R3")
+        out = tmp_path / "template.xlsx"
+        root.to_excel(out)
+        ws = load_workbook(out)
+        sales = next(r[0].row for r in ws["Bob's data"].iter_rows()
+                     if r[0].value == "Sales")
+        rate = next(r[0].row for r in ws["prev year"].iter_rows()
+                    if r[0].value == "Rate")
+        rows = self._rows(out, "PL")
+        assert rows["R1"][1].endswith(f" + 'Bob''s data'!C{sales}")
+        assert rows["R3"][1].endswith(f" * (1 + 'prev year'!B{rate})")
+
+    def test_a_renamed_tab_keeps_its_total_columns(self, tmp_path: Path) -> None:
+        """``P/L`` is written as ``P_L``; its quarter totals come along."""
+        m = mo.Model("m", default_grain="month", default_start="2026-01",
+                     default_periods=6,
+                     default_excel_view=mo.ExcelView(timeline={"totals": ["quarter"]}))
+        with m:
+            m.a = mo.MultiVariable("P/L")
+            m.a.x = mo.Variable([1.0, 2, 3, 4, 5, 6], display_name="X",
+                                regrain=mo.up("sum"))
+        out = tmp_path / "renamed.xlsx"
+        m.to_excel(out)
+        header = [c.value for c in load_workbook(out)["P_L"][1]]
+        assert "Total Q1" in header and "Total Q2" in header
+
+
+class TestProjectedBook:
+    """``m.at('quarter')`` keys its lines like ``m`` — a copied line and
+    its source share one id, so the copy must never read itself."""
+
+    @staticmethod
+    def _model() -> mo.Model:
+        m = mo.Model("m", default_grain="month", default_start="2026-01",
+                     default_periods=6)
+        with m:
+            m.inputs = mo.MultiVariable("Inputs")
+            with m.inputs as i:
+                i.annual = mo.Variable(0.12)
+                i.monthly = (1 + i.annual) ** (1 / 12) - 1
+                i.qty = mo.Variable([1.0, 2, 3, 4, 5, 6], regrain=mo.up("sum"))
+                i.total = mo.SUM(i.qty)
+                i.twice = i.total * 2
+        return m
+
+    def test_scalars_are_their_values_or_live_formulas(self, tmp_path: Path) -> None:
+        out = tmp_path / "quarter.xlsx"
+        self._model().at("quarter").to_excel(out)
+        rows = TestSheetReferences._rows(out, "Inputs")
+        assert rows["Annual"] == [0.12]                  # was =B2 in B2
+        assert rows["Monthly"] == ["=(B2 + 1) ^ 0.08333333333333333 - 1"]
+        # A SUM over months would compute something else over quarters:
+        # the value, not a formula.
+        assert rows["Total"] == [21]
+        assert rows["Twice"] == ["=B5 * 2"]
+
+    def test_a_regrained_line_is_its_bucket_values(self, tmp_path: Path) -> None:
+        """Its source's id lands on the projected row itself: a range over
+        those cells would read quarters as months."""
+        m = mo.Model("m", default_grain="month", default_start="2026-01",
+                     default_periods=12)
+        with m:
+            m.inputs = mo.MultiVariable("Inputs")
+            with m.inputs as i:
+                i.qty = mo.Variable([float(k + 1) for k in range(12)],
+                                    regrain=mo.up("sum"))
+                i.bal = mo.Variable([100.0 + k for k in range(12)],
+                                    regrain=mo.up("last"))
+                i.users = mo.Variable([5.0 + k for k in range(12)],
+                                      regrain=mo.up("sum"))
+                i.arpu = mo.Variable([2.0] * 12, regrain=mo.ratio("qty", "users"))
+        q = m.at("quarter")
+        out = tmp_path / "regrained.xlsx"
+        q.to_excel(out)
+        rows = TestSheetReferences._rows(out, "Inputs")
+        for label in ("Qty", "Bal", "Users", "Arpu"):
+            assert not any(re.search(r"[A-Z]+\d", f) for f in rows[label]), rows[label]
+        assert [float(f.lstrip("=")) for f in rows["Qty"]] == q.inputs.qty.value
+        assert [float(f.lstrip("=")) for f in rows["Bal"]] == q.inputs.bal.value
+
+    def test_a_blend_is_its_regrained_values(self, tmp_path: Path) -> None:
+        """A close inside a quarter splits it: the quarter's blend is
+        actual for two months and plan for the third — not a splice of
+        the quarterly tracks."""
+        from modeleon.compile.excel.view import ExcelView
+
+        m = mo.Model("m", tracks=mo.Tracks("plan", "actual", blend=mo.blend(
+            given="actual", follow="plan", until="2026-02")),
+            default_grain="month", default_start="2026-01", default_periods=6)
+        m.default_excel_view = ExcelView(tracks="rows")
+        m.s = mo.MultiVariable("S", excel_props={"tab": True})
+        with m.s as s:
+            s.d = mo.Variable(plan=[1.0, 2, 3, 4, 5, 6],
+                              actual=[10.0, 20, 30, 40, 50, 60],
+                              regrain=mo.up("sum"), display_name="D")
+        q = m.at("quarter")
+        out = tmp_path / "blend.xlsx"
+        q.to_excel(out)
+        assert TestSheetReferences._rows(out, "S")["D"] == [33, 15]
+
+
+class TestListOperands:
+    def test_a_list_operand_is_one_item_per_period(self, tmp_path: Path) -> None:
+        m = mo.Model("m", default_grain="month", default_start="2026-01",
+                     default_periods=3)
+        with m:
+            m.s = mo.MultiVariable("S")
+            with m.s as s:
+                s.x = mo.Variable([1.0, 2.0, 3.0], display_name="X")
+                s.y = mo.Variable(s.x + [10.0, 20.0, 30.0], display_name="Y")
+        out = tmp_path / "list.xlsx"
+        m.to_excel(out)
+        assert TestSheetReferences._rows(out, "S")["Y"] == [
+            "=B2 + 10.0", "=C2 + 20.0", "=D2 + 30.0"]
+
+    def test_a_recurrence_operand_stays_one_operand(self, tmp_path: Path) -> None:
+        m = mo.Model("m", default_grain="month", default_start="2026-01",
+                     default_periods=3)
+        with m:
+            m.a = mo.MultiVariable("A")
+            with m.a as a:
+                a.x = mo.Variable([1.0, 2.0, 3.0], display_name="X")
+                a.y = mo.Variable([10.0, 20.0, 30.0], display_name="Y")
+                a.r = mo.recurrence(1.0, "{prev} * {g}", g=a.x + a.y, display_name="R")
+        out = tmp_path / "rec.xlsx"
+        m.to_excel(out)
+        assert TestSheetReferences._rows(out, "A")["R"][1] == "=B4 * (C2 + C3)"

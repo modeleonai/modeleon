@@ -119,9 +119,21 @@ class TestResolveCascade:
         m.section.default_excel_view = ExcelView(font={"name": "Calibri"})
         m.section.x = mo.Variable(1)
         m.y = mo.Variable(2)
-        # the leaf under section sees the nearer view; a sibling sees the root view
+        # the leaf under section sees the nearer view; a sibling sees the
+        # root view — a group a model could always declare (the font, the
+        # bands, the type colours) replaces the whole group, as it did
         assert resolve_excel_view(m.section.x).base_font == {"name": "Calibri"}
         assert resolve_excel_view(m.y).base_font == {"name": "Arial Narrow"}
+
+    def test_the_new_groups_layer_key_by_key(self):
+        m = mo.Model("m")
+        m.default_excel_view = ExcelView(formats={"date": "dd mmm yyyy", "number": "0.0"})
+        m.section = mo.MultiVariable("Section")
+        m.section.default_excel_view = ExcelView(formats={"number": "#,##0"})
+        m.section.x = mo.Variable(1)
+        # a format the nearer view does not name shows through
+        assert resolve_excel_view(m.section.x).number_formats == {
+            "date": "dd mmm yyyy", "number": "#,##0"}
 
     def test_cascade_is_per_field_through_intermediate_levels(self):
         # The nearest level wins per FIELD; fields it leaves unset fall back to
@@ -266,8 +278,8 @@ class TestBandStylesField:
     def test_band_role_is_depth_first_level_is_a_section(self, tmp_path):
         # The old rule keyed the role on the MV's OWN fill, which made
         # ``bands.section.bg`` unreachable: whoever had a fill kept it,
-        # whoever hadn't was a «subsection» — the view could never
-        # paint an unstyled раздел («I. Доходы» stayed plain under a
+        # whoever hadn't was a "subsection" — the view could never
+        # paint an unstyled section ("I. Income" stayed plain under a
         # beige-band view). Role is DEPTH under the tab.
         m = mo.Model("m")
         m.default_excel_view = mo.ExcelView(
@@ -609,46 +621,46 @@ class TestNamedViews:
         m.rates = mo.MultiVariable(
             display_name="Rates", excel_props={"number_format": "0.0%"}
         )
-        m.rates.vat = mo.Variable(0.12, display_name="VAT")
+        m.rates.margin = mo.Variable(0.25, display_name="Margin")
         m.money = mo.Variable(1000.0, display_name="Money")
         path = tmp_path / "fmt2.xlsx"
         m.to_excel(str(path))
         from openpyxl import load_workbook
         wb = load_workbook(str(path))
         cells = [c for ws in wb.worksheets for row in ws.iter_rows() for c in row]
-        vat = next(c for c in cells if c.value == 0.12)
+        margin = next(c for c in cells if c.value == 0.25)
         money = next(c for c in cells if c.value == 1000.0)
-        assert vat.number_format == "0.0%"
+        assert margin.number_format == "0.0%"
         assert money.number_format == "#,##0"
 
     def test_untracked_sections_ride_the_expansion_by_reference(self, tmp_path):
         # A tracked model's UNTRACKED sections must keep their literal
         # cells and labels through expand_tracked_tree — re-adoption
         # used to reference-clone them into self-referential formulas.
-        m = mo.Model("m", tracks=mo.Tracks("plan", "fact"),
+        m = mo.Model("m", tracks=mo.Tracks("plan", "actual"),
                      default_grain="month", default_start="2026-01",
                      default_periods=3)
         m.params = mo.MultiVariable(display_name="Params")
-        m.params.rate = mo.Variable(0.12, display_name="Tax rate")
+        m.params.rate = mo.Variable(0.12, display_name="Discount rate")
         m.pnl = mo.MultiVariable(display_name="PnL")
-        m.pnl.revenue = mo.Variable(plan=[100.0] * 3, fact=[110.0, None, None])
+        m.pnl.revenue = mo.Variable(plan=[100.0] * 3, actual=[110.0, None, None])
         path = tmp_path / "ref.xlsx"
         m.to_excel(str(path))
         from openpyxl import load_workbook
         wb = load_workbook(str(path))
         cells = [c for ws in wb.worksheets for row in ws.iter_rows() for c in row]
-        assert any(c.value == "Tax rate" for c in cells)
+        assert any(c.value == "Discount rate" for c in cells)
         assert any(c.value == 0.12 for c in cells)
         assert not any(isinstance(c.value, str) and c.value == f"={c.coordinate}"
                        for c in cells), "self-referential clone leaked"
 
     def test_slot_view_rides_the_expansion(self, tmp_path):
-        m = mo.Model("m", tracks=mo.Tracks("plan", "fact"),
+        m = mo.Model("m", tracks=mo.Tracks("plan", "actual"),
                      default_grain="month", default_start="2026-01",
                      default_periods=3)
         m.default_excel_view = ExcelView(formats={"number": "#,##0"})
         m.pnl = mo.MultiVariable(display_name="PnL")
-        m.pnl.revenue = mo.Variable(plan=[100.0] * 3, fact=[110.0, None, None])
+        m.pnl.revenue = mo.Variable(plan=[100.0] * 3, actual=[110.0, None, None])
         path = tmp_path / "slot.xlsx"
         m.to_excel(str(path))
         from openpyxl import load_workbook
@@ -689,16 +701,16 @@ class TestNamedViews:
         assert col_a == ["Section A", "X", None, "Section B", "Z"]
 
     def test_header_row_total_prints_on_the_section_header(self, tmp_path):
-        # The financial-book form: «Взносы | 8 | 8» on the header
+        # The financial-book form: "Charges | 8 | 8" on the header
         # line, components under it.
         m = mo.Model("m", default_grain="month", default_start="2026-01",
                      default_periods=2)
         m.tab = mo.MultiVariable(display_name="Tab", excel_props={"tab": True})
-        m.tab.взносы = mo.MultiVariable(display_name="1.2 · Взносы")
-        m.tab.взносы.со = mo.Variable([5.0, 5.0], display_name="СО")
-        m.tab.взносы.осмс = mo.Variable([3.0, 3.0], display_name="ОСМС")
-        m.tab.взносы.итого = mo.Variable(
-            m.tab.взносы.со + m.tab.взносы.осмс,
+        m.tab.charges = mo.MultiVariable(display_name="1.2 · Charges")
+        m.tab.charges.rent = mo.Variable([5.0, 5.0], display_name="Rent")
+        m.tab.charges.utilities = mo.Variable([3.0, 3.0], display_name="Utilities")
+        m.tab.charges.total = mo.Variable(
+            m.tab.charges.rent + m.tab.charges.utilities,
             excel_props={"header_row": True},
         )
         path = tmp_path / "hdr.xlsx"
@@ -711,11 +723,11 @@ class TestNamedViews:
             if a:
                 rows[a] = [ws.cell(row=r, column=c).value for c in (2, 3)]
         # The header line carries the subtotal formula/values.
-        hdr = rows["1.2 · Взносы"]
+        hdr = rows["1.2 · Charges"]
         assert hdr[0] is not None and hdr[1] is not None
-        # Components still have their own rows; no extra «итого» row.
-        assert "СО" in "".join(str(k) for k in rows)
-        assert not any("итого" in str(k).lower() for k in rows)
+        # Components still have their own rows; no extra "total" row.
+        assert "Rent" in "".join(str(k) for k in rows)
+        assert not any("total" in str(k).lower() for k in rows)
 
     def test_columns_orientation_spreads_instances_across(self, tmp_path):
         # The board form: instances as columns, scalar fields as rows.
@@ -739,22 +751,22 @@ class TestNamedViews:
         assert [ws.cell(row=3, column=c).value for c in (2, 3)] == [12, 18]
 
     def test_meta_columns_article_and_unit(self, tmp_path):
-        # The financial-book form: № | наименование | ед. | values…
+        # The financial-book form: No. | name | unit | values…
         m = mo.Model("m", default_grain="month", default_start="2026-01",
                      default_periods=2)
         m.default_excel_view = ExcelView(meta={"article": True, "unit": True})
         m.tab = mo.MultiVariable(display_name="Tab", excel_props={"tab": True})
-        m.tab.fot = mo.Variable([10.0, 11.0], unit="₸",
-                                display_name="ФОТ",
-                                excel_props={"article": "1.1"})
+        m.tab.salaries = mo.Variable([10.0, 11.0], unit="$",
+                                     display_name="Salaries",
+                                     excel_props={"article": "1.1"})
         path = tmp_path / "meta.xlsx"
         m.to_excel(str(path))
         from openpyxl import load_workbook
         ws = load_workbook(str(path))["Tab"]
         row = next(r for r in range(1, 6)
-                   if ws.cell(row=r, column=2).value == "ФОТ")
-        assert ws.cell(row=row, column=1).value == "1.1"      # №
-        assert ws.cell(row=row, column=3).value == "₸"        # ед.
+                   if ws.cell(row=r, column=2).value == "Salaries")
+        assert ws.cell(row=row, column=1).value == "1.1"      # article
+        assert ws.cell(row=row, column=3).value == "$"        # unit
         assert ws.cell(row=row, column=4).value == 10.0       # values from D
         assert ws.cell(row=1, column=4).value is not None     # header shifts
         assert ws.freeze_panes == "D2"
@@ -766,7 +778,7 @@ class TestNamedViews:
                      default_periods=2)
         m.default_excel_view = ExcelView(meta={"article": True, "unit": True})
         m.tab = mo.MultiVariable(display_name="P/L", excel_props={"tab": True})
-        m.tab.x = mo.Variable([10.0, 11.0], unit="₸",
+        m.tab.x = mo.Variable([10.0, 11.0], unit="$",
                               excel_props={"article": "1.1"})
         path = tmp_path / "sanitized.xlsx"
         m.to_excel(str(path))
@@ -845,18 +857,18 @@ class TestNamedViews:
         m.default_excel_view = ExcelView(
             orient="down", meta={"article": True, "unit": True})
         m.tab = mo.MultiVariable(display_name="Tab", excel_props={"tab": True})
-        m.tab.rev = mo.Variable([1.0, 2.0, 3.0], unit="₸", display_name="Rev")
-        m.tab.cost = mo.Variable([4.0, 5.0, 6.0], unit="₸", display_name="Cost")
+        m.tab.rev = mo.Variable([1.0, 2.0, 3.0], unit="$", display_name="Rev")
+        m.tab.cost = mo.Variable([4.0, 5.0, 6.0], unit="$", display_name="Cost")
         path = tmp_path / "transposed_meta.xlsx"
         m.to_excel(str(path))
         from openpyxl import load_workbook
         ws = load_workbook(str(path))["Tab"]
         row1 = [ws.cell(row=1, column=c).value for c in (1, 2, 3)]
-        assert row1 == ["Rev (₸)", "Cost (₸)", None]
+        assert row1 == ["Rev ($)", "Cost ($)", None]
         assert ws.freeze_panes in ("B1", "B2")
 
     def test_scalar_plus_cumsum_rolls_forward_without_compounding(self, tmp_path):
-        # остаток = начало + cumsum(поток): the opening balance must
+        # balance = opening + cumsum(flow): the opening balance must
         # live ONLY in the seed cell — later cells are prev + flow.
         m = mo.Model("m", default_grain="month", default_start="2026-01",
                      default_periods=3)
@@ -881,6 +893,82 @@ class TestNamedViews:
         # Later periods: prev + flow ONLY — the opening ref must not
         # reappear (it lives inside prev).
         assert f"B{opening_row}" not in f1, f1
+
+    def test_a_running_total_inside_a_condition_sums_its_source(self, tmp_path):
+        # "the first period the pool is empty": flag * IF(cumsum(flag) < 1.5).
+        # The cumsum has no row of its own; chained on "its previous cell"
+        # it read the ENCLOSING row's — right while the flag stays up for
+        # two periods, another number from the third (recalculated: 1
+        # where the engine holds 0).
+        m = mo.Model("m", default_grain="month", default_start="2026-01",
+                     default_periods=6)
+        m.tab = mo.MultiVariable(display_name="Tab", excel_props={"tab": True})
+        m.tab.flag = mo.Variable([0.0, 0.0, 1.0, 1.0, 1.0, 1.0], display_name="Flag")
+        m.tab.first = mo.Variable(
+            m.tab.flag * mo.IF(mo.cumsum(m.tab.flag) < 1.5, 1.0, 0.0), display_name="First")
+        assert m.tab.first.value == [0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+        path = tmp_path / "running.xlsx"
+        m.to_excel(str(path))
+        from openpyxl import load_workbook
+        ws = load_workbook(str(path))["Tab"]
+        row = next(r for r in range(1, 8) if ws.cell(row=r, column=1).value == "First")
+        flag_row = next(r for r in range(1, 8) if ws.cell(row=r, column=1).value == "Flag")
+        formulas = [ws.cell(row=row, column=c).value for c in range(2, 8)]
+        # The flag's running SUM from its first cell, never this row's own
+        # previous cell.
+        assert all(f"SUM(B{flag_row}:" in f for f in formulas), formulas
+        assert all(f"{col}{row}" not in f for f, col in zip(formulas[1:], "BCDEF")), formulas
+
+    def test_a_balance_inside_a_condition_is_not_folded(self, tmp_path):
+        # opening + cumsum(flow) folds onto "the previous cell" only as the
+        # WHOLE cell. Inside IF the row's previous cell is 0 where the
+        # condition was off, and the fold restarted the balance there (40
+        # where the engine holds 1100).
+        m = mo.Model("m", default_grain="month", default_start="2026-01",
+                     default_periods=4)
+        m.tab = mo.MultiVariable(display_name="Tab", excel_props={"tab": True})
+        m.tab.opening = mo.Variable(1000.0, display_name="Opening")
+        m.tab.flow = mo.Variable([10.0, 20.0, 30.0, 40.0], display_name="Flow")
+        m.tab.on = mo.Variable([1.0, 1.0, 0.0, 1.0], display_name="On")
+        m.tab.shown = mo.Variable(
+            mo.IF(m.tab.on > 0.5, m.tab.opening + mo.cumsum(m.tab.flow), 0.0),
+            display_name="Shown")
+        assert m.tab.shown.value == [1010.0, 1030.0, 0.0, 1100.0]
+        path = tmp_path / "fold.xlsx"
+        m.to_excel(str(path))
+        from openpyxl import load_workbook
+        from openpyxl.utils import get_column_letter
+        ws = load_workbook(str(path))["Tab"]
+        labels = {ws.cell(row=r, column=1).value: r for r in range(1, 10)}
+        row, flow = labels["Shown"], labels["Flow"]
+        cols = [c for c in range(2, 8) if ws.cell(row=row, column=c).value is not None]
+        formulas = [ws.cell(row=row, column=c).value for c in cols]
+        assert len(formulas) == 4, formulas
+        assert all("SUM(" in f and f"{flow}:" in f for f in formulas), formulas
+        assert all(f"{get_column_letter(c - 1)}{row}" not in f
+                   for f, c in zip(formulas[1:], cols[1:])), formulas
+
+    def test_a_roll_forward_inside_another_formula_ships_its_value(self, tmp_path):
+        # A recurrence with no row of its own, inside a larger formula: its
+        # "previous cell" would be the enclosing row's (200 * 1.1 * 2 = 440
+        # where the engine holds 220). No formula chains on it — the cells
+        # carry the engine's values.
+        m = mo.Model("m", default_grain="month", default_start="2026-01",
+                     default_periods=3)
+        m.tab = mo.MultiVariable(display_name="Tab", excel_props={"tab": True})
+        m.tab.g = mo.Variable([0.1, 0.1, 0.1], display_name="G")
+        m.tab.twice = mo.Variable(
+            mo.recurrence(100.0, "{prev} * (1 + {g})", g=m.tab.g) * 2, display_name="Twice")
+        assert [round(v, 6) for v in m.tab.twice.value] == [200.0, 220.0, 242.0]
+        path = tmp_path / "roll.xlsx"
+        m.to_excel(str(path))
+        from openpyxl import load_workbook
+        ws = load_workbook(str(path))["Tab"]
+        row = next(r for r in range(1, 8) if ws.cell(row=r, column=1).value == "Twice")
+        cells = [ws.cell(row=row, column=c).value for c in range(2, 8)]
+        cells = [c for c in cells if c is not None]
+        assert all(not isinstance(c, str) for c in cells[1:]), cells
+        assert [round(float(c), 6) for c in cells[1:]] == [220.0, 242.0], cells
 
     def test_sum_over_foreign_list_inlines_the_value(self, tmp_path):
         # SUM over an address-less list can't render positionally — the
@@ -922,25 +1010,25 @@ def test_meta_flag_is_its_own_column_caption(tmp_path):
         )
         m.default_excel_view = mo.ExcelView(meta=meta)
         tab = mo.MultiVariable("P&L", excel_props={"tab": True})
-        tab.revenue = mo.Variable([10, 20], display_name="Выручка", unit="₸")
+        tab.revenue = mo.Variable([10, 20], display_name="Revenue", unit="$")
         m.pnl = tab
         path = tmp_path / f"{'-'.join(map(str, meta.values()))}.xlsx"
         m.to_excel(str(path))
         return openpyxl.load_workbook(str(path)).active
 
-    named = build({"article": "№", "unit": "Ед. изм."})
-    assert named.cell(row=1, column=1).value == "№"
-    assert named.cell(row=1, column=3).value == "Ед. изм."
+    named = build({"article": "No.", "unit": "Unit"})
+    assert named.cell(row=1, column=1).value == "No."
+    assert named.cell(row=1, column=3).value == "Unit"
     # The captions never displace the period band.
     assert named.cell(row=1, column=4).value == "Jan 2025"
     # …and the column still carries the unit itself, row by row.
-    assert named.cell(row=2, column=3).value == "₸"
+    assert named.cell(row=2, column=3).value == "$"
 
     bare = build({"article": True, "unit": True})
     assert bare.cell(row=1, column=1).value is None
     assert bare.cell(row=1, column=3).value is None
     assert bare.cell(row=1, column=4).value == "Jan 2025"
-    assert bare.cell(row=2, column=3).value == "₸"
+    assert bare.cell(row=2, column=3).value == "$"
 
 
 class TestNestedSectionTitleIndent:
@@ -951,46 +1039,46 @@ class TestNestedSectionTitleIndent:
         m = mo.Model("m", display_name="M",
                      default_excel_view=ExcelView(
                          nesting={"gap_rows": 0, "indent": 2}))
-        m.регионы = mo.MultiVariable("Регионы", excel_props={"tab": True})
-        m.регионы.p1 = mo.MultiVariable("Регион 1")
-        m.регионы.p1.выручка = mo.Variable(100, display_name="Выручка")
-        m.регионы.p1.филиалы = mo.MultiVariable("Филиалы")
-        m.регионы.p1.филиалы.ф1 = mo.Variable(50, display_name="Филиал А")
+        m.regions = mo.MultiVariable("Regions", excel_props={"tab": True})
+        m.regions.r1 = mo.MultiVariable("Region 1")
+        m.regions.r1.revenue = mo.Variable(100, display_name="Revenue")
+        m.regions.r1.branches = mo.MultiVariable("Branches")
+        m.regions.r1.branches.b1 = mo.Variable(50, display_name="Branch A")
         path = tmp_path / "n.xlsx"
         m.to_excel(str(path))
         col_a = [
-            load_workbook(str(path))["Регионы"].cell(r, 1).value
+            load_workbook(str(path))["Regions"].cell(r, 1).value
             for r in range(1, 5)
         ]
-        assert col_a[0] == "Регион 1"           # level 0 — flush
-        assert col_a[2] == "  Филиалы"           # level 1 — one indent
-        assert col_a[3] == "    Филиал А"        # its row, one deeper
+        assert col_a[0] == "Region 1"           # level 0 — flush
+        assert col_a[2] == "  Branches"          # level 1 — one indent
+        assert col_a[3] == "    Branch A"        # its row, one deeper
 
     def test_no_indent_declared_no_padding_invented(self, tmp_path):
         m = mo.Model("m", display_name="M")
-        m.регионы = mo.MultiVariable("Регионы", excel_props={"tab": True})
-        m.регионы.p1 = mo.MultiVariable("Регион 1")
-        m.регионы.p1.филиалы = mo.MultiVariable("Филиалы")
-        m.регионы.p1.филиалы.ф1 = mo.Variable(50, display_name="Филиал А")
+        m.regions = mo.MultiVariable("Regions", excel_props={"tab": True})
+        m.regions.r1 = mo.MultiVariable("Region 1")
+        m.regions.r1.branches = mo.MultiVariable("Branches")
+        m.regions.r1.branches.b1 = mo.Variable(50, display_name="Branch A")
         path = tmp_path / "n.xlsx"
         m.to_excel(str(path))
-        ws = load_workbook(str(path))["Регионы"]
+        ws = load_workbook(str(path))["Regions"]
         titles = [ws.cell(r, 1).value for r in range(1, 6)]
-        assert "Филиалы" in titles               # exact, unpadded
+        assert "Branches" in titles              # exact, unpadded
 
 
 class TestCtorKwargViewIsASlot:
     def test_a_windowed_tracked_model_takes_the_view_kwarg(self, tmp_path):
         # The ctor's registerable loop used to adopt the view as
         # CONTENT — its config leaves (totals=['quarter','year']) hit
-        # the extent law under the model's window («'totals' has 2
-        # value(s) in a 36-period window») and the view rendered as a
+        # the extent law under the model's window ("'totals' has 2
+        # value(s) in a 36-period window") and the view rendered as a
         # spurious tab.
         m = mo.Model(
             "m", display_name="M",
             tracks=mo.Tracks(
-                "план", "факт",
-                blend=mo.blend(given="факт", follow="план",
+                "plan", "actual",
+                blend=mo.blend(given="actual", follow="plan",
                                until="2026-03"),
             ),
             default_grain="month", default_start="2026-01",
@@ -1002,8 +1090,8 @@ class TestCtorKwargViewIsASlot:
         )
         assert "default_excel_view" not in m._components
         assert resolve_excel_view(m).time_totals == ("quarter", "year")
-        m.поток = mo.Variable([1.0] * 36, display_name="Поток",
-                              regrain=mo.up("sum"))
+        m.flow = mo.Variable([1.0] * 36, display_name="Flow",
+                             regrain=mo.up("sum"))
         m.to_excel(tmp_path / "v.xlsx")
         assert "default_excel_view" not in load_workbook(
             tmp_path / "v.xlsx"

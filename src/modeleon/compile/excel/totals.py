@@ -3,7 +3,7 @@
 
 The book form every finance team builds by hand:
 
-    янв   фев   мар   (1 кв)   апр … дек   (4 кв)   (год)
+    Jan   Feb   Mar   (Q1)   Apr … Dec   (Q4)   (year)
 
 ``ExcelView(timeline={'totals': ['quarter', 'year']})`` declares it;
 this module owns the geometry (which physical column each month and
@@ -51,10 +51,11 @@ class TotalsPlan:
     )
     #: the sheet's label style ('finance' | 'iso' | 'compact')
     style: str = "finance"
-    #: the word total columns wear on the month row («Итого», "Total")
+    #: the word total columns wear on the month row ("Total", or the
+    #: model's own word)
     totals_word: str = "Total"
-    #: header depth: 1 + one row per bucket kind — «год» over
-    #: «кварталы» over «месяцы». Data starts at ``depth + 1``.
+    #: header depth: 1 + one row per bucket kind — "year" over
+    #: "quarters" over "months". Data starts at ``depth + 1``.
     depth: int = 1
     #: Track column groups: how many columns one period-area column
     #: key occupies. ``col_of`` speaks GROUPED space — where a group
@@ -133,30 +134,130 @@ def display_label(bucket_label: str, kind: str, style: str) -> str:
     return bucket_label
 
 
-def regrain_rule_of(var: Any) -> Optional[str]:
-    """The line's declared coarsening rule, when it is one the writer
-    can spell as Excel arithmetic. ``None`` otherwise."""
+def regrain_rule_of(var: Any) -> Any:
+    """The line's declared coarsening rule, when the writer can spell it
+    as Excel arithmetic: a recipe name (``'sum'``, ``'mean'``,
+    ``'geometric'``, …) or a :class:`~modeleon.core.regrain.Ratio`.
+    ``None`` otherwise (a callable rule, or no rule)."""
+    from ...core.regrain import RECIPES, Ratio
+
     spec = getattr(var, "_regrain", None)
     rule = getattr(spec, "default", None) if spec is not None else None
-    if isinstance(rule, str) and rule in ("sum", "last", "mean"):
+    if isinstance(rule, str) and rule in RECIPES:
+        return rule
+    if isinstance(rule, Ratio):
         return rule
     return None
 
 
-def rule_formula(rule: str, refs: List[str]) -> str:
-    """The bucket cell for a rule-based line — explicit ref lists, not
-    ranges: the year's months are NOT contiguous once quarter columns
-    stand between them, and ``SUM(B5:M5)`` would swallow the quarter
-    cells and double-count."""
-    if rule == "last":
-        return f"={refs[-1]}"
-    fn = "SUM" if rule == "sum" else "AVERAGE"
-    return f"={fn}({','.join(refs)})"
+def _cell(ref: str) -> Tuple[int, int]:
+    i = 0
+    while i < len(ref) and ref[i].isalpha():
+        i += 1
+    col = 0
+    for ch in ref[:i].upper():
+        col = col * 26 + (ord(ch) - 64)
+    return int(ref[i:]), col
+
+
+def compact_refs(refs: List[str]) -> List[Tuple[str, Optional[str]]]:
+    """Consecutive cells as ``(first, last)`` runs — along a row or down a
+    column — and a lone cell as ``(cell, None)``. The cells of one bucket
+    are NOT contiguous once subtotal columns stand between them, so a
+    single ``first:last`` range would swallow the subtotals."""
+    runs: List[List[str]] = []
+    prev: Optional[Tuple[int, int]] = None
+    step: Optional[Tuple[int, int]] = None
+    for ref in refs:
+        here = _cell(ref)
+        if runs and prev is not None:
+            d = (here[0] - prev[0], here[1] - prev[1])
+            if d in ((0, 1), (1, 0)) and (step is None or d == step):
+                runs[-1].append(ref)
+                step, prev = d, here
+                continue
+        runs.append([ref])
+        step, prev = None, here
+    return [(r[0], r[-1] if len(r) > 1 else None) for r in runs]
+
+
+def bucket_formula(
+    recipe: str,
+    refs: List[str],
+    weights: Optional[List[int]] = None,
+    qualify: Any = None,
+    ranges: bool = True,
+    blanks: bool = True,
+) -> Optional[str]:
+    """The Excel arithmetic (no leading ``=``) that folds one bucket of a
+    line's native cells exactly as the engine's re-grain does
+    (:func:`modeleon.core.regrain.apply_recipe`), a blank cell at zero:
+    ``mean`` over the periods entered, weighted by their days when they
+    differ (0 when none is entered), ``geometric`` compounded as
+    ``EXP(LN(1+x)+…)-1`` — which is ``#NUM!`` where a rate is ``-100%``
+    or worse, as the engine's value is. ``qualify`` prefixes a cell with
+    its sheet when the bucket reads another sheet; ``ranges=False``
+    lists every cell instead of joining runs into ranges; ``blanks=False``
+    says every period of the bucket is entered, and a mean is then the
+    plain weighted form. ``None`` for a recipe Excel arithmetic does not
+    spell."""
+    if not refs:
+        return None
+    q = qualify or (lambda ref: ref)
+    if recipe == "first":
+        return q(refs[0])
+    if recipe == "last":
+        return q(refs[-1])
+    pieces = ([q(a) if b is None else f"{q(a)}:{b}" for a, b in compact_refs(refs)]
+              if ranges else [q(r) for r in refs])
+    if recipe == "geometric":
+        logs = [f"SUMPRODUCT(LN(1+{p}))" if ":" in p else f"LN(1+{p})" for p in pieces]
+        return "EXP(" + "+".join(logs) + ")-1"
+    if recipe == "mean":
+        weighted = bool(weights) and len(set(weights or ())) > 1
+        terms = ("+".join(f"{q(r)}*{w}" for r, w in zip(refs, weights or ()))
+                 if weighted else "")
+        if not blanks:
+            return (f"({terms})/{sum(weights or ())}" if weighted
+                    else f"AVERAGE({','.join(pieces)})")
+        # Over the periods entered - a blank one skipped, as AVERAGE skips
+        # it - and 0 when none is: COUNTA, not IFERROR, so an error cell
+        # still spreads, as the engine's bucket takes it.
+        none_entered = f"COUNTA({','.join(pieces)})=0"
+        if weighted:
+            days = "+".join(f"ISNUMBER({q(r)})*{w}" for r, w in zip(refs, weights or ()))
+            return f"IF({none_entered},0,({terms})/({days}))"
+        return f"IF({none_entered},0,AVERAGE({','.join(pieces)}))"
+    fn = {"sum": "SUM", "min": "MIN", "max": "MAX"}.get(recipe)
+    if fn is None:
+        return None
+    return f"{fn}({','.join(pieces)})"
+
+
+#: Excel's own limits on one formula.
+_MAX_ARGS, _MAX_CHARS = 255, 8192
+
+
+def listed_or_ranged(recipe: str, refs: List[str], weights: Optional[List[int]] = None,
+                     qualify: Any = None, blanks: bool = True) -> Optional[str]:
+    """Every cell listed, as a hand-built subtotal column reads - unless the
+    list would break Excel's limits (a year of days), then runs as ranges."""
+    body = bucket_formula(recipe, refs, weights, qualify, ranges=False, blanks=blanks)
+    if body is not None and (len(refs) > _MAX_ARGS or len(body) > _MAX_CHARS - 1):
+        body = bucket_formula(recipe, refs, weights, qualify, ranges=True, blanks=blanks)
+    return body
+
+
+def rule_formula(rule: str, refs: List[str],
+                 weights: Optional[List[int]] = None, blanks: bool = True) -> Optional[str]:
+    """The bucket cell for a rule-based line (see :func:`listed_or_ranged`)."""
+    body = listed_or_ranged(rule, refs, weights, blanks=blanks)
+    return None if body is None else f"={body}"
 
 
 def short_label(label: str, kind: str, style: str, hierarchical: bool) -> str:
     """The label a HIERARCHICAL header wants: the year lives on its own
-    row, so the rows below drop it — «Jan», «Q1» — while a flat header
+    row, so the rows below drop it — "Jan", "Q1" — while a flat header
     keeps the full form. Non-finance styles keep their native spelling
     either way."""
     if not hierarchical or style != "finance":
@@ -173,16 +274,16 @@ def header_rows(
 ) -> List[dict]:
     """The multi-row header — one list per row, top (coarsest) first:
 
-        [{row: 1, cells: [{col, colspan, label, kind}]},   # год
-         {row: 2, cells: [...]},                           # кварталы
-         {row: 3, cells: [...]}]                           # месяцы
+        [{row: 1, cells: [{col, colspan, label, kind}]},   # years
+         {row: 2, cells: [...]},                           # quarters
+         {row: 3, cells: [...]}]                           # months
 
     A bucket's span covers its months and every finer bucket column
     inside it — but NOT its own total column, which stands beside the
-    span carrying its own name («Итого Q1») from the bucket's OWN tier
+    span carrying its own name ("Total Q1") from the bucket's OWN tier
     down through the month row. A quarter's total is a quarter-level
-    number, so it starts where «Q1» starts; the year's starts where
-    «2026» does. Plain data, not openpyxl calls: the .xlsx writer
+    number, so it starts where "Q1" starts; the year's starts where
+    "2026" does. Plain data, not openpyxl calls: the .xlsx writer
     paints and merges it, and any other renderer can draw the same
     header from it.
     """
@@ -196,10 +297,10 @@ def header_rows(
         for bi, (blabel, lo, hi) in enumerate(plan.buckets[kind]):
             first = plan.col_of[("month", lo)]
             # …up to but NOT including its own total column: that one
-            # carries the bucket's «Итого» label, starting on this very
+            # carries the bucket's "Total" label, starting on this very
             # row. Swallowing it left the label nowhere to go but the
             # month row, one tier below the thing it totals. The total
-            # is a GROUP too, so «before it» means one full stride.
+            # is a GROUP too, so "before it" means one full stride.
             last = plan.col_of[(kind, bi)] - 1
             if last < first:
                 continue
@@ -224,11 +325,11 @@ def header_rows(
         for i in range(plan.n)
     ]
     rows.append({"row": month_row, "cells": cells})
-    # The total columns get NAMED — «Итого Q1», «Итого 2026» — an
+    # The total columns get NAMED — "Total Q1", "Total 2026" — an
     # unlabeled bold column under a merged span reads as "what is
     # this". Each label starts on its OWN tier and merges DOWN through
-    # the month row: «Итого Q1» begins where «Q1» begins, «Итого 2026»
-    # where «2026» does. Starting one row lower put a quarter-level
+    # the month row: "Total Q1" begins where "Q1" begins, "Total 2026"
+    # where "2026" does. Starting one row lower put a quarter-level
     # number on the month tier, reading as a thirteenth month.
     for j, kind in enumerate(kinds_top_down or ["quarter"]):
         if kind not in plan.buckets:

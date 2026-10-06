@@ -20,6 +20,36 @@ class TestRecurrence:
         assert result._value[2] == pytest.approx(100 * 1.1 * 1.1)
 
 
+class TestRecurrenceKeepsItsLine:
+    """``regrain=`` / ``unit=`` beside ``variables=`` were dropped without a
+    word: an opening balance declared ``regrain=mo.up('first')`` had no rule
+    and its subtotals were '#VALUE!'."""
+
+    def test_regrain_and_unit_stay_on_the_line(self):
+        m = mo.Model("m", default_grain="month", default_start="2026-01", default_periods=6)
+        with m:
+            m.flow = mo.Variable([10.0] * 6, regrain=mo.up("sum"))
+            m.opening = mo.recurrence_sum(100.0, mo.lag(m.flow, 1), unit="USD",
+                                          regrain=mo.up("first"))
+        assert m.opening._regrain is not None and str(m.opening.unit) == "USD"
+        assert m.at("quarter").opening.value == [100.0, 130.0]
+
+    def test_an_unknown_keyword_beside_variables_is_refused(self):
+        with pytest.raises(TypeError, match="beside variables="):
+            mo.recurrence(0.0, "{prev} + {x}", variables={"x": 1.0}, periods=3, colour="red")
+
+    def test_a_template_may_still_name_unit(self):
+        r = mo.recurrence(1.0, "{prev} * {unit}", unit=2.0, periods=3)
+        assert r.value == [1.0, 2.0, 4.0]
+        named = mo.recurrence(1.0, "{prev} * {unit}", variables={"unit": 2.0}, periods=3,
+                              unit="EUR")
+        assert named.value == [1.0, 2.0, 4.0] and str(named.unit) == "EUR"
+        assert mo.recurrence(1.0, "prev * unit", unit=2.0, periods=3).value == [1.0, 2.0, 4.0]
+        # A lambda that names it keeps it too: never read as the line's unit.
+        assert mo.recurrence(1.0, lambda prev, unit: prev + unit, unit=1.0,
+                             periods=3).unit is None
+
+
 class TestSum:
     def test_sum_of_list_variable(self):
         v = mo.Variable([10, 20, 30])

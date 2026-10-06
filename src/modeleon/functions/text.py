@@ -28,11 +28,13 @@ def _unary_text_func(
     """
     def helper(value: TextOperand) -> Variable:
         raw, expr = text_operand(value)
+        # A blank cell reads as empty text, as in Excel (LEN of a blank
+        # is 0, UPPER of a blank is "").
         if isinstance(raw, list):
-            calc: Any = [py_fn(v) if v is not None else None for v in raw]
+            calc: Any = [py_fn('' if v is None else v) for v in raw]
             var_type = 'list'
         else:
-            calc = py_fn(raw) if raw is not None else None
+            calc = py_fn('' if raw is None else raw)
             var_type = 'scalar'
         return make_func_var(
             func_name, [expr], calc, result_value_type, var_type,
@@ -70,7 +72,7 @@ def CONCAT(*args: TextOperand) -> Variable:
 
     Element-wise over list (period-indexed) operands, so
     ``mo.CONCAT(quarter, "Q ", year, " ", phase)`` over per-period
-    Variables yields per-period labels (``"1Q 2022 Ф"``, …). Always
+    Variables yields per-period labels (``"1Q 2022 A"``, …). Always
     returns a Variable carrying the ``=CONCAT(...)`` formula.
     """
     if not args:

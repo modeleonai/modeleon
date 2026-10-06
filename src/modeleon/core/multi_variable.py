@@ -52,10 +52,12 @@ Split across two mixin modules:
   read-only tree navigation.
 """
 
+from datetime import date
 from typing import Dict, List, Optional, Any, TYPE_CHECKING
 import contextvars
-import functools
 import inspect
+import weakref
+import sys
 
 # Re-exported for code that imports these from modeleon.core.multi_variable.
 from .component import Component
@@ -63,7 +65,7 @@ from .mv_context import _MVLifecycle
 from .mv_inspect import _MVInspect
 from .qpath import QPath
 
-from .mv_context import _is_read_only_property, _refuse_read_only_name
+from .mv_context import _SETTING_SLOTS, _is_read_only_property, _refuse_read_only_name
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -77,11 +79,63 @@ _SUPPRESS_COMPUTE: contextvars.ContextVar[bool] = contextvars.ContextVar(
 )
 
 
+#: ``default_header`` not passed to a constructor (``None`` means "no header").
+_NO_HEADER_SLOT = object()
 
-@functools.lru_cache(maxsize=256)
+
+def _check_header_value(value: Any) -> Any:
+    """``default_header`` is the rows a workbook shows above every sheet:
+    a MultiVariable (its rows; it is also where time is anchored), a list
+    of rows, or ``None`` for no header on this part of the model."""
+    from .variable import Variable
+    if value is None:
+        return None
+    if isinstance(value, MultiVariableBase):
+        from ..compile.excel.view import ExcelView
+        if not isinstance(value, ExcelView):
+            return value
+    elif isinstance(value, (list, tuple)):
+        rows = list(value)
+        if rows and all(isinstance(v, Variable) for v in rows):
+            floating = [v for v in rows if getattr(v, '_owner', None) is None]
+            if floating:
+                raise ValueError(
+                    "default_header lists rows of the model (= [m.header.end]); "
+                    "a value that is not a row — mo.time.end itself — has no "
+                    "row to show."
+                )
+            return rows
+        if not rows:
+            raise ValueError("default_header=[] shows nothing; use None for no header.")
+    raise TypeError(
+        f"default_header takes a MultiVariable (m.default_header = m.header), "
+        f"a list of its rows (= [m.header.end, m.header.days]) or None; "
+        f"got {type(value).__name__}."
+    )
+
+
+# Signature memo with a WEAK key. The key is the compute function itself,
+# not its ``__code__``: ``_call_compute`` reads parameter defaults, which
+# live on the function (``__defaults__``) — two execs of the same source
+# share a code object but not their defaults. And the key must be weak:
+# a function holds its whole module namespace through ``__globals__``, so
+# a strong key (what ``functools.lru_cache`` gives) kept every model a
+# long-lived process had exec'd alive. A weak entry dies with its class.
+_SIG_MEMO: "weakref.WeakKeyDictionary[Any, inspect.Signature]" = weakref.WeakKeyDictionary()
+
+
 def _signature_of(compute_func: Any) -> "inspect.Signature":
-    """``inspect.signature`` keyed by the class's compute function."""
-    return inspect.signature(compute_func)
+    """``inspect.signature``, memoized per compute function (weak key)."""
+    try:
+        return _SIG_MEMO[compute_func]
+    except KeyError:
+        sig = inspect.signature(compute_func)
+        _SIG_MEMO[compute_func] = sig
+        return sig
+    except TypeError:
+        # A callable that can't be weakly referenced (e.g. a builtin set
+        # as ``compute``): introspect each time rather than pin it.
+        return inspect.signature(compute_func)
 
 
 class MultiVariableBase(_MVLifecycle, _MVInspect, Component):
@@ -98,6 +152,18 @@ class MultiVariableBase(_MVLifecycle, _MVInspect, Component):
     # writer dispatches on ``_role``, so new roles slot in additively
     # without touching existing code.
     _role: str = 'group'
+    #: A loop container: its rows may be read before the lines that assign
+    #: them (see :mod:`modeleon.core.loops`). ``MultiVariable(..., loop=True)``
+    #: for one container, ``class X(mo.MultiVariableClass, loop=True)``
+    #: for every instance of a class.
+    _loop: bool = False
+
+    def __init_subclass__(cls, loop: Optional[bool] = None, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        if loop is not None:
+            if not isinstance(loop, bool):
+                raise TypeError(f"class {cls.__name__}(..., loop=) takes True or False.")
+            cls._loop = loop
 
     # Valid keys inside ``excel_props``. Passing any other key raises.
     _EXCEL_PROP_KEYS = frozenset({
@@ -107,7 +173,7 @@ class MultiVariableBase(_MVLifecycle, _MVInspect, Component):
         # Section orientation: 'columns' spreads repeating children
         # ACROSS (instances as columns, scalar fields as rows).
         'orient',
-        # The section's article number («1.2») — see Variable.
+        # The section's article number ("1.2") — see Variable.
         'article', 'row', 'col',
         # Typography
         'bold', 'italic', 'font_color', 'font_size', 'font_family',
@@ -223,6 +289,7 @@ class MultiVariableBase(_MVLifecycle, _MVInspect, Component):
         unvalidated; this constructor path fails loudly on a bad window.
         """
         from .time import GRAINS, _parse
+        from .variable import Variable
         if default_grain is None:
             given = 'default_start' if default_start is not None else 'default_periods'
             raise ValueError(
@@ -236,7 +303,7 @@ class MultiVariableBase(_MVLifecycle, _MVInspect, Component):
                 f"Unknown default_grain {default_grain!r}; supported: "
                 f"{', '.join(GRAINS)}."
             )
-        if default_start is not None:
+        if default_start is not None and not isinstance(default_start, (date, Variable)):
             _parse(default_start, default_grain)     # raises with the format hint
         if default_periods is not None:
             if isinstance(default_periods, bool) or not isinstance(default_periods, int):
@@ -253,6 +320,8 @@ class MultiVariableBase(_MVLifecycle, _MVInspect, Component):
             self.default_start = default_start
         if default_periods is not None:
             self.default_periods = default_periods
+            from .mv_context import _note_window
+            _note_window(self)
 
     @property
     def _components(self) -> Dict[str, Any]:
@@ -326,6 +395,20 @@ class MultiVariableBase(_MVLifecycle, _MVInspect, Component):
         """
         if name.startswith('_'):
             raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+        # A loop container (``loop=True``) lets a row be read before the
+        # line that assigns it — rows that read each other across periods
+        # (see :mod:`modeleon.core.loops`). The engine's own probes never
+        # create rows; every other container raises, as it always has.
+        forward = self.__dict__.get('_forward')
+        if forward and name in forward:
+            return forward[name]
+        from .mv_context import is_loop_container
+        if is_loop_container(self) and name not in _SETTING_SLOTS:
+            frame = sys._getframe(1)
+            from .mv_context import _forward_placeholder, is_engine_frame
+            if not is_engine_frame(frame):
+                return _forward_placeholder(
+                    self, name, (frame.f_code.co_filename, frame.f_lineno))
         raise AttributeError(f"'{type(self).__name__}' has no component '{name}'")
 
     def __setattr__(self, name: str, value: Any) -> None:
@@ -340,6 +423,28 @@ class MultiVariableBase(_MVLifecycle, _MVInspect, Component):
         through normal attribute assignment.
         """
         from .variable import Variable
+        if name == 'default_grain' and '_default_start_source' in self.__dict__ \
+                and isinstance(value, str):
+            from .time import window_start_label
+            window_start_label(self.__dict__['_default_start_source']._value, value)
+        if (name in ('default_start', 'default_grain', 'default_periods')
+                and '_time_read_by' in self.__dict__
+                and self.__dict__.get(name) != value
+                and not (name == 'default_start' and value is self.__dict__.get(
+                    '_default_start_source'))):
+            from .mv_context import refuse_window_change
+            refuse_window_change(self, name)
+        if name == 'default_start' and isinstance(value, (date, Variable)):
+            self._set_default_start(value)
+            return
+        if name == 'default_header':
+            super().__setattr__(name, _check_header_value(value))
+            return
+        if not name.startswith('_') and '_forward' in self.__dict__ and not (
+            isinstance(value, Variable) or isinstance(value, MultiVariableBase)
+        ):
+            from .mv_context import _refuse_plain_value
+            _refuse_plain_value(self, name, value)
         if (
             not name.startswith('_')
             # ``default_excel_view`` is a presentation POINTER slot, not content.
@@ -355,7 +460,54 @@ class MultiVariableBase(_MVLifecycle, _MVInspect, Component):
             # so the attribute slot holds the same instance as
             # ``self.__dict__[name]``.
             value = self.__dict__.get(name, value)
+        if name == 'default_start':
+            self.__dict__.pop('_default_start_source', None)
+            self.__dict__.pop('_default_first_day', None)
         super().__setattr__(name, value)
+        if name == 'default_grain':
+            # The start is read again against the new grain: from its
+            # Variable, or from the day a short first period kept.
+            start_day = (self.__dict__.get('_default_start_source')
+                         or self.__dict__.get('_default_first_day'))
+            if start_day is not None and self.__dict__.get('default_grain') is not None:
+                self._set_default_start(start_day)
+
+    def _set_default_start(self, value: Any) -> None:
+        """The window starts at a date — typed, or held by a Variable
+        (``m.default_start = m.inputs.financial_close``). The slot keeps
+        the date's period LABEL, which is what every reader of a window
+        works with; the Variable is remembered as the window's source, the
+        cell a workbook anchors its time to. Never adopted as a row."""
+        from .variable import Variable
+        from .time import stub_first_day, window_start_label
+        source = value if isinstance(value, Variable) else None
+        raw = value._value if source is not None else value
+        if isinstance(raw, list):
+            raise TypeError(
+                "default_start is one day, the window's first — got a series. "
+                "Point it at a scalar date Variable."
+            )
+        grain = self.__dict__.get('default_grain')
+        if grain is None:
+            raise ValueError(
+                "default_start belongs with the window: declare default_grain "
+                "(e.g. 'month') on this container too — a start set below the "
+                "container that declares the window would be ignored."
+            )
+        label = window_start_label(raw, grain)
+        self.__dict__['default_start'] = label
+        first_day = stub_first_day(raw, grain)
+        if first_day is not None:
+            # The first period is the rest of the period this day falls in.
+            self.__dict__['_default_first_day'] = first_day
+        else:
+            self.__dict__.pop('_default_first_day', None)
+        if source is not None and not isinstance(raw, str):
+            self.__dict__['_default_start_source'] = source
+        else:
+            # A label (typed, or held by a Variable) has no date cell to
+            # anchor a workbook to: the window starts at the label.
+            self.__dict__.pop('_default_start_source', None)
 
     def __delattr__(self, name: str) -> None:
         """``del mv.x`` on a component detaches it exactly like
@@ -640,6 +792,10 @@ class MultiVariableClass(MultiVariableBase):
             elif v.default is not inspect.Parameter.empty:
                 params[k] = v.default
         self.compute(**params)
+        # A loop class reports a row compute() read ahead but never assigned.
+        if self.__dict__.get('_forward'):
+            from .mv_context import check_loop_rows
+            check_loop_rows(self)
     
     def _extract_value(self, value: Any) -> Any:
         """
@@ -704,7 +860,8 @@ class MultiVariable(MultiVariableBase):
             display_name: User-friendly label (e.g. "Income Statement").
             **components: Named Variables or MultiVariables to include,
                 plus optional ``excel_props={'tab': True}`` to mark an
-                Excel tab.
+                Excel tab, and ``loop=True`` to let rows read each other
+                across periods (see :mod:`modeleon.core.loops`).
         """
         from .variable import Variable
 
@@ -718,6 +875,9 @@ class MultiVariable(MultiVariableBase):
             base_kwargs["excel_layout"] = components.pop("excel_layout")
         if "description" in components:
             base_kwargs["description"] = components.pop("description")
+        # ``loop=`` is the flag only as a bool; a component may be named
+        # ``loop`` (``MultiVariable(loop=mo.Variable(...))``).
+        loop = components.pop("loop") if isinstance(components.get("loop"), bool) else None
 
         # The ambient time window — declared once on a container, inherited
         # by every list-valued line under it (``Variable.time``) and by the
@@ -740,6 +900,9 @@ class MultiVariable(MultiVariableBase):
         # a windowed model, and the view itself would render as a
         # spurious tab.
         view_slot = components.pop("default_excel_view", None)
+        # The HEADER slot, same reason: a header MV passed as a kwarg is a
+        # pointer to rows that live elsewhere, never content of this one.
+        header_slot = components.pop("default_header", _NO_HEADER_SLOT)
 
         tracks_decl = components.pop("tracks", None)
         if tracks_decl is not None:
@@ -766,6 +929,11 @@ class MultiVariable(MultiVariableBase):
 
         super().__init__(display_name=display_name, **base_kwargs, **other_kwargs)
 
+        if loop is not None:
+            # Rows of this container may be read before their lines — a
+            # loop across periods (see :mod:`modeleon.core.loops`).
+            self._loop = bool(loop)
+
         if window_kwargs:
             self._set_default_window(**window_kwargs)
 
@@ -790,6 +958,8 @@ class MultiVariable(MultiVariableBase):
         if view_slot is not None:
             # Through the exempted slot — a pointer, never content.
             self.default_excel_view = view_slot
+        if header_slot is not _NO_HEADER_SLOT:
+            self.default_header = header_slot
 
         for name, comp in registerable.items():
             self._register_component(name, comp)

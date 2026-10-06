@@ -138,6 +138,41 @@ Change a growth value on Assumptions — every later cell recalculates.
 
 ---
 
+## Loops — rows that read each other across periods
+
+A debt block is a circle if you read it row by row: interest reads the
+balance, the balance reads the sweep, the sweep reads the cash left
+after interest. Read period by period it is not — interest reads
+*last* period's balance. Put the rows in a loop container and write
+them as ordinary rows; there a row may be read before the line that
+defines it:
+
+```python
+m.debt = mo.MultiVariable("Debt", loop=True)
+with m.debt as d:
+    d.interest = mo.lag(d.balance, fill=m.inp.opening) * m.inp.rate
+    d.pot      = m.inp.cash - d.interest - m.inp.scheduled
+    d.sweep    = mo.IF(d.pot > 0, d.pot, 0.0) * m.inp.share
+    d.balance  = mo.lag(d.balance, fill=m.inp.opening) - m.inp.scheduled - d.sweep
+```
+
+The engine settles the loop when `balance` is assigned. The emitted
+cells are the shape a hand-built workbook has always had. The loop
+closes through the previous column, so Excel sees no circular reference:
+
+```
+Interest  B2: =Inputs!B6 * Inputs!B2       C2: =B5 * Inputs!B2
+Balance   B5: =Inputs!B6 - Inputs!C4 - B4   C5: =B5 - Inputs!D4 - C4
+```
+
+A cycle that does not pass through `mo.lag` is refused by name — it
+would need a fixed point, not an order. So is `SUM`/`MAX`/`MIN` over a
+loop row inside the loop: those read a whole series, and a per-period
+floor is `mo.IF(x > 0, x, 0)`. A class is a loop container for every
+instance with `class Tranche(mo.MultiVariableClass, loop=True)`.
+
+---
+
 ## Excel as a snapshot
 
 `.to_excel()` walks the MultiVariable tree and writes a workbook where every Variable is a cell, every formula is `=A1*B2`, every cross-sheet reference is `=Sheet!Cell`.
@@ -152,7 +187,7 @@ mo.CHOOSE(scenario, base, bull) # =CHOOSE(B1, B4, B5) in every period — one sc
 mo.EOMONTH(start, 1)            # =EOMONTH(B1, 1)
 ```
 
-Also: `IRR`, `NPV`, `XIRR`, `PMT`, `FV`, `PV` · `SUM`, `MAX`, `MIN`, `AVERAGE` · `IF`, `AND`, `OR`, `NOT`, `CHOOSE` · `ABS`, `ROUND`, `INT`, `MOD` · `YEAR`, `MONTH`, `DAY`, `EDATE`, `EOMONTH`, `DATE`, `TODAY` · `CONCAT`, `UPPER`, `LOWER`, `LEN`. All emit live formulas.
+Also: `IRR`, `NPV`, `XIRR`, `XNPV`, `PMT`, `FV`, `PV` · `SUM`, `MAX`, `MIN`, `AVERAGE` · `IF`, `AND`, `OR`, `NOT`, `CHOOSE` · `ABS`, `ROUND`, `INT`, `MOD` · `YEAR`, `MONTH`, `DAY`, `DAYS`, `YEARFRAC`, `EDATE`, `EOMONTH`, `DATE`, `TODAY` · `CONCAT`, `UPPER`, `LOWER`, `LEN`. All emit live formulas.
 
 ---
 

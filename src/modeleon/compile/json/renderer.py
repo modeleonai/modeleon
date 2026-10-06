@@ -3,8 +3,8 @@
 
 Exists primarily to prove the :class:`Renderer` seam: writing a second
 renderer is cheap and doesn't require touching the core AST, the walker,
-or any Excel-specific code. Anyone building a web grid, diff view, or
-LLM-consumable formula format can consume these dicts directly.
+or any Excel-specific code. A diff tool, a custom viewer or a formula
+inspector can consume these dicts directly.
 
 Example output for ``a + b * 2``::
 
@@ -36,6 +36,7 @@ from ...core.expr import (
     RollingAggregate,
     SelfRef,
     Subscript,
+    TimeRef,
     UnaryOp,
     VarRef,
 )
@@ -60,7 +61,12 @@ class JsonRenderer:
         return {"kind": "literal", "value": node.value}
 
     def render_varref(self, node: VarRef, ctx: RenderCtx) -> Dict[str, Any]:
+        if isinstance(node.var._expr, TimeRef) and node.var._owner is None:
+            return self.render_timeref(node.var._expr, ctx)
         return {"kind": "varref", "path": node.var.id}
+
+    def render_timeref(self, node: TimeRef, ctx: RenderCtx) -> Dict[str, Any]:
+        return {"kind": "time", "field": node.field}
 
     # ─── Structural ────────────────────────────────────────────
 
@@ -133,8 +139,8 @@ class JsonRenderer:
             "func": node.func,
             "args": [self.walker.render(a, ctx) for a in node.args],
         }
-        # Surface backend-specific hints so downstream tooling (LLM
-        # formula explainers, graph views, diff tools) knows this
+        # Surface backend-specific hints so downstream tooling (formula
+        # explainers, graph views, diff tools) knows this
         # function is native only to certain targets. Emit each field
         # only when non-``None`` to keep universal functions terse.
         if node.render_backends is not None:
@@ -188,8 +194,8 @@ def to_json(expr: Expr) -> Any:
     """Convenience one-shot: render an ``Expr`` tree as a JSON-ready dict.
 
     Mirrors :meth:`ExcelTranslator.translate` but for the JSON
-    renderer. Useful for diff views, AI / LLM formula inspection, and
-    web-grid rendering.
+    renderer. Useful for diff tools, custom viewers and formula
+    inspection.
     """
     renderer = JsonRenderer()
     walker = Walker(renderer)

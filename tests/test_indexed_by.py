@@ -458,7 +458,7 @@ class TestRank1Guards:
     with no error; lag shifted across coordinates and dropped
     indexed_by. Every time-coupled operation refuses axised operands."""
 
-    def _axised(self, display_name='Сценарии'):
+    def _axised(self, display_name='Scenarios'):
         scenarios = mo.Variable(['Bear', 'Bull'])
         return mo.Variable([10.0, 20.0], indexed_by=[scenarios],
                            display_name=display_name)
@@ -493,8 +493,8 @@ class TestRank1Guards:
     def test_recurrence_refuses_axised_driver(self):
         with pytest.raises(ValueError, match="finite axis"):
             mo.recurrence(
-                start=0.0, formula="{prev} + {доход}",
-                variables={"доход": self._axised()}, periods=4,
+                start=0.0, formula="{prev} + {income}",
+                variables={"income": self._axised()}, periods=4,
             )
 
     def test_sum_refuses(self):
@@ -515,7 +515,7 @@ class TestRank1Guards:
             m.c = mo.cumsum(m.x)
         assert m.s._value == 10.0
         assert m.c._value == [1.0, 3.0, 6.0, 10.0]
-        # Календарные кварталы: Q1 = янв+фев+мар, Q2 = апр.
+        # Calendar quarters: Q1 = Jan+Feb+Mar, Q2 = Apr.
         assert m.x.at('quarter')._value == [6.0, 4.0]
 
 

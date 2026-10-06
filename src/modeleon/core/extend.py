@@ -4,8 +4,8 @@
 A partial series is legal when its author DECLARES what lies beyond the
 values given. One word resolves the trilemma a bare prefix cannot:
 
-    капекс = mo.Variable([500, 500, 500], extend=mo.zero())   # a flow
-    ставка = mo.Variable([0.10, 0.10, 0.12], extend=mo.hold())  # a rate
+    capex = mo.Variable([500, 500, 500], extend=mo.zero())    # a flow
+    rate = mo.Variable([0.10, 0.10, 0.12], extend=mo.hold())  # a rate
 
 ``zero`` — the quantity is absent beyond its values (flows, one-time
 items). ``hold`` — the last value stays in force (rates, levels).

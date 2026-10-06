@@ -28,7 +28,8 @@ every line you might have written.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from datetime import date, datetime
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from ..core.expr import Expr
@@ -301,9 +302,12 @@ def _render_expr_qualified(
 
 def _render_value(value: object) -> str:
     """Reproduce ``value`` as a Python literal. Lists are rendered as
-    bracketed forms; scalars via :func:`repr`."""
+    bracketed forms; a date as ``mo.DATE(y, m, d)`` (no datetime import);
+    other scalars via :func:`repr`."""
     if isinstance(value, list):
         return "[" + ", ".join(_render_value(v) for v in value) + "]"
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return f"mo.DATE({value.year}, {value.month}, {value.day})"
     return repr(value)
 
 
@@ -417,6 +421,20 @@ def _default_lhs(obj: "Variable | MultiVariableBase") -> str:
     return obj.python_name or obj.path.leaf
 
 
+def _unit_source(unit: Any) -> str:
+    """The source that rebuilds ``unit``: the quoted string for a
+    dimension or a conventional word (``'USD m'``, ``'%'``), the
+    classmethod for a declared label — whose string would read back as a
+    dimension."""
+    from ..core.unit import Unit
+    label = getattr(unit, "_display_symbol", None)
+    if getattr(unit, "_unit_components", None) or label in Unit._DIMENSIONLESS_SYMBOLS:
+        return repr(str(unit))
+    if label:
+        return f"mo.Unit.dimensionless({label!r})"
+    return "mo.Unit.dimensionless()"
+
+
 def _render_kwargs(obj: "Variable | MultiVariableBase") -> str:
     """Emit each explicitly-set kwarg as ``, key=repr(value)``.
 
@@ -443,10 +461,7 @@ def _render_kwargs(obj: "Variable | MultiVariableBase") -> str:
             parts.append(f"display_name={label!r}")
     unit = getattr(obj, "_unit", None)
     if unit is not None:
-        # ``_unit`` is a Unit object; its ``str()`` is the canonical
-        # textual form. ``repr(str(unit))`` quotes it as a Python
-        # string literal.
-        parts.append(f"unit={str(unit)!r}")
+        parts.append(f"unit={_unit_source(unit)}")
     keys = getattr(obj, "_keys", None)
     if keys is not None:
         parts.append(f"keys={list(keys)!r}")

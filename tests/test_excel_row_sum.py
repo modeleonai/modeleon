@@ -27,7 +27,7 @@ def _windowed():
     m = mo.Model("m", display_name="M")
     m.default_start, m.default_grain, m.default_periods = "2026-01", "month", 3
     m.default_excel_view = mo.ExcelView(
-        meta={"fields": [("row_sum", "Итого")]}
+        meta={"fields": [("row_sum", "Total")]}
     )
     return m
 
@@ -48,21 +48,21 @@ class TestRowSumColumn:
     def test_flagged_row_gets_a_live_sum(self):
         m = _windowed()
         with m:
-            m.план = mo.MultiVariable("План", excel_props={"tab": True})
-            with m.план as p:
-                p.доля = mo.Variable(
+            m.plan = mo.MultiVariable("Plan", excel_props={"tab": True})
+            with m.plan as p:
+                p.allocation = mo.Variable(
                     [1.0, 0.5, 0.0],
-                    display_name="Доля",
+                    display_name="Allocation",
                     excel_props={"row_sum": True},
                 )
-        ws = _sheet(m, "План")
+        ws = _sheet(m, "Plan")
         # Caption heads the projected column; the row carries =SUM.
         grid = [
             [ws.cell(r, c).value for c in range(1, 7)]
             for r in range(1, ws.max_row + 1)
         ]
         flat = [x for row in grid for x in row if x is not None]
-        assert "Итого" in flat
+        assert "Total" in flat
         sums = [x for x in flat if isinstance(x, str) and x.startswith("=SUM(")]
         assert len(sums) == 1
         assert ":" in sums[0]
@@ -70,10 +70,10 @@ class TestRowSumColumn:
     def test_unflagged_row_leaves_the_column_empty(self):
         m = _windowed()
         with m:
-            m.план = mo.MultiVariable("План", excel_props={"tab": True})
-            with m.план as p:
-                p.вес = mo.Variable([0.5, 0.5, 0.5], display_name="Вес")
-        ws = _sheet(m, "План")
+            m.plan = mo.MultiVariable("Plan", excel_props={"tab": True})
+            with m.plan as p:
+                p.weight = mo.Variable([0.5, 0.5, 0.5], display_name="Weight")
+        ws = _sheet(m, "Plan")
         flat = [
             ws.cell(r, c).value
             for r in range(1, ws.max_row + 1)
@@ -88,21 +88,21 @@ class TestRowSumColumn:
         # is noise), and an all-blank row must not total a fabricated 0.
         m = _windowed()
         with m:
-            m.план = mo.MultiVariable("План", excel_props={"tab": True})
-            with m.план as p:
-                p.ставка = mo.Variable(
-                    500_000, display_name="Ставка",
+            m.plan = mo.MultiVariable("Plan", excel_props={"tab": True})
+            with m.plan as p:
+                p.fee = mo.Variable(
+                    500_000, display_name="Fee",
                     excel_props={"row_sum": True},
                 )
-                p.пусто = mo.Variable(
-                    [None, None, None], display_name="Пусто",
+                p.blank = mo.Variable(
+                    [None, None, None], display_name="Blank",
                     excel_props={"row_sum": True},
                 )
-                p.живая = mo.Variable(
-                    [1.0, 0.5, None], display_name="Живая",
+                p.live = mo.Variable(
+                    [1.0, 0.5, None], display_name="Live",
                     excel_props={"row_sum": True},
                 )
-        ws = _sheet(m, "План")
+        ws = _sheet(m, "Plan")
         sums = [
             ws.cell(r, c).value
             for r in range(1, ws.max_row + 1)
@@ -110,4 +110,4 @@ class TestRowSumColumn:
             if isinstance(ws.cell(r, c).value, str)
             and ws.cell(r, c).value.startswith("=SUM(")
         ]
-        assert len(sums) == 1  # только «Живая»
+        assert len(sums) == 1  # only "Live"

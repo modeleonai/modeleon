@@ -64,6 +64,11 @@ def lag(
         raise TypeError("lag(..., periods=) must be an int") from None
 
     fill_is_var = isinstance(fill, Variable)
+    if fill_is_var and fill._forward_of is not None:
+        raise TypeError(
+            f"lag(..., fill={fill._forward_of[1]}): the fill is assigned "
+            f"further down — assign it above this line."
+        )
     if fill_is_var and isinstance(fill._value, list):
         raise TypeError(
             "lag(..., fill=) must be a number or a SCALAR Variable — "
@@ -71,20 +76,37 @@ def lag(
         )
     fill_value = fill._value if fill_is_var else fill
 
+    from ..core.regrain import hole_value
+    # A lagged blank reads as 0, as Excel's =previous_cell does - kept
+    # blank only in a line of dates or words, which has no zero.
+    blank = hole_value(source._value)
+
     def _shift(values: list) -> list:
         if n > 0:
             k = min(n, len(values))
-            return [fill_value] * k + values[: len(values) - k]
-        if n < 0:
+            out = [fill_value] * k + values[: len(values) - k]
+        elif n < 0:
             k = min(-n, len(values))
-            return values[k:] + [fill_value] * k
-        return list(values)
+            out = values[k:] + [fill_value] * k
+        else:
+            out = list(values)
+        return [blank if v is None else v for v in out]
 
     from ..core.tracks import TrackValues
-    if isinstance(source._value, TrackValues):
+    shifted: object
+    if source._forward_of is not None:
+        # A row read before its line (a loop, see ``core.loops``): the
+        # shifted values are provisional until the loop closes. Hold the
+        # fill in every period so they carry its type — a loop of dates
+        # stays dates for the date functions built on it.
+        n_periods = len(source._value)
+        if isinstance(fill_value, date):
+            source._value = [fill_value] * n_periods
+        shifted = [fill_value] * n_periods
+    elif isinstance(source._value, TrackValues):
         # Rank lifting: the shift applies per track coordinate —
         # plan shifts within plan, actuals within actuals.
-        shifted: object = TrackValues.lift(
+        shifted = TrackValues.lift(
             lambda track: _shift(track) if isinstance(track, list) else track,
             source._value,
         )

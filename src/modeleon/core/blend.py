@@ -3,8 +3,8 @@
 
 A doctrine-free SPLICE-AND-CONTINUE rule over declared tracks:
 
-    tracks=mo.Tracks('факт', 'бюджет',
-                     blend=mo.blend(given='факт', follow='бюджет',
+    tracks=mo.Tracks('actual', 'budget',
+                     blend=mo.blend(given='actual', follow='budget',
                                     until='2026-02'))
 
 ``given`` names the track whose DATA anchors the synthesized series up
@@ -18,9 +18,15 @@ cell it leaves empty. That is the honest shape when the given track is
 typed as events arrive — irregular, incomplete, out of order — instead
 of being closed period by period. With a boundary, the only difference
 is AFTER it, where the preference flips to ``follow``; before it the
-rule is already «given where present, follow otherwise», so a
+rule is already "given where present, follow otherwise", so a
 boundary-less spec is not a weaker guarantee — it is the same rule
 without a date to maintain.
+
+"Carries a value" means ENTERED. A track typed by hand is entered where
+it is not blank. A track computed by a formula (the actual of a sum is
+the sum of the actuals) is a number even over months nobody entered - a
+blank counts as zero, as in Excel - so it is entered in a month where any
+of the entries it is built from is (``modeleon.core.entries``).
 
 The synthesized series is a real track in the value layer, so the
 broadcast law and the rank-lifting protocol carry it through formulas
@@ -29,8 +35,8 @@ with the output splice, stateful lines (recurrence / cumsum / lag)
 re-anchor because their chains roll over the operands' live flows: one
 law, three behaviors.
 
-The engine attaches no finance meaning to any of it — «given» is not
-«actuals» unless code built on top explicitly marks it so. ``until``
+The engine attaches no finance meaning to any of it — "given" is just
+the track the splice prefers up to ``until``. ``until``
 is a period label of the model grain (the close date under a neutral
 name); moving it re-splices every live series on the next run.
 """
@@ -88,7 +94,7 @@ def blend(given: str, follow: str, until: Optional[str] = None,
     """Build the splice-and-continue spec for ``mo.Tracks(blend=...)``.
 
     Omit ``until`` for the BOUNDARY-LESS form: ``given`` wins in every
-    period where it carries a value, ``follow`` fills the rest. Use it
+    period where it was entered, ``follow`` fills the rest. Use it
     when the given track arrives irregularly — a register typed cell by
     cell as events land, rather than closed period by period.
     """

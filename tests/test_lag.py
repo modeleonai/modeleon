@@ -96,6 +96,81 @@ class TestLagExcel:
         assert cells[f"C{prior_row}"] == f"=B{flow_row}"
         assert cells[f"D{prior_row}"] == f"=C{flow_row}"
 
+    def test_lag_of_an_unnamed_expression_reads_it_a_period_back(self, tmp_path):
+        model = mo.MultiVariable("m")
+        model.s = mo.MultiVariable("S", excel_props={"tab": True})
+        with model.s as s:
+            s.x = mo.Variable([1.0, 2.0, 3.0], display_name="X")
+            s.y = mo.Variable([10.0, 20.0, 30.0], display_name="Y")
+            s.prior = mo.lag(s.x + s.y, display_name="Prior")
+            s.seeded = mo.lag(s.x * 2, fill=5, display_name="Seeded")
+
+        path = tmp_path / "lag_unnamed.xlsx"
+        model.to_excel(path)
+        cells = self._formulas(path, "S")
+        x, y = self._row(cells, "X"), self._row(cells, "Y")
+        prior, seeded = self._row(cells, "Prior"), self._row(cells, "Seeded")
+        # Once every cell was the fill (=0, =5): the book showed 0 where
+        # the model had 11 and 22.
+        assert cells[f"B{prior}"] == "=0"
+        assert cells[f"C{prior}"] == f"=B{x} + B{y}"
+        assert cells[f"D{prior}"] == f"=C{x} + C{y}"
+        assert cells[f"B{seeded}"] == "=5"
+        assert cells[f"C{seeded}"] == f"=B{x} * 2"
+
+    def test_a_lagged_expression_stays_one_operand(self, tmp_path):
+        model = mo.MultiVariable("m")
+        model.s = mo.MultiVariable("S", excel_props={"tab": True})
+        with model.s as s:
+            s.x = mo.Variable([1.0, 2.0, 3.0], display_name="X")
+            s.y = mo.Variable([10.0, 20.0, 30.0], display_name="Y")
+            s.times = mo.lag(s.x + s.y) * 2
+            s.neg = -mo.lag(s.x - s.y)
+
+        path = tmp_path / "lag_operand.xlsx"
+        model.to_excel(path)
+        cells = self._formulas(path, "S")
+        x, y = self._row(cells, "X"), self._row(cells, "Y")
+        assert cells[f"C{self._row(cells, 'Times')}"] == f"=(B{x} + B{y}) * 2"
+        assert cells[f"C{self._row(cells, 'Neg')}"] == f"=-(B{x} - B{y})"
+
+    def test_a_lead_past_the_end_is_its_fill_on_every_track(self, tmp_path):
+        m = mo.Model("m", tracks=mo.Tracks("plan", "actual"), default_grain="month",
+                     default_start="2026-01", default_periods=3)
+        m.s = mo.MultiVariable("S", excel_props={"tab": True})
+        with m.s as s:
+            s.d = mo.Variable(plan=[1.0, 2.0, 3.0], actual=[10.0, 20.0, 30.0],
+                              display_name="D")
+            s.nxt = mo.lag(s.d * 2, -1, fill=5.0, display_name="Next")
+
+        path = tmp_path / "lead_tracks.xlsx"
+        m.to_excel(path)
+        ws = load_workbook(path)["S"]
+        rows = [[c.value for c in r if c.value is not None] for r in ws.iter_rows()
+                if str(r[0].value or "").startswith("Next")]
+        assert len(rows) == 2 and all(row[-1] == "=5.0" for row in rows), rows
+
+    def test_lag_of_an_unnamed_running_total_carries_its_values(self, tmp_path):
+        """A running total's formula reads the row it is written in; moved
+        a period back it would read the lag row instead. Those cells carry
+        the computed values."""
+        model = mo.MultiVariable("m")
+        model.s = mo.MultiVariable("S", excel_props={"tab": True})
+        with model.s as s:
+            s.flow = mo.Variable([10.0, 20.0, 30.0], display_name="Flow")
+            s.prior = mo.lag(mo.recurrence(1.0, "{prev} + {f}", f=s.flow),
+                             display_name="Prior")
+
+        path = tmp_path / "lag_running.xlsx"
+        model.to_excel(path)
+        cells = self._formulas(path, "S")
+        prior = self._row(cells, "Prior")
+        assert [cells[f"{c}{prior}"] for c in "CD"] == s.prior.value[1:]
+
+    @staticmethod
+    def _row(cells, label):
+        return next(coord for coord, v in cells.items() if v == label)[1:]
+
     def test_variable_fill_emits_cell_reference(self, tmp_path):
         model = mo.MultiVariable("m")
         model.s = mo.MultiVariable("S", excel_props={"tab": True})

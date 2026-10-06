@@ -30,6 +30,10 @@ from ..renderer import RenderCtx
 from .renderer import ExcelRenderer, _strip_outer_parens
 from ..walker import Walker
 
+#: Excel keeps at most 8192 characters of one formula, the ``=`` among
+#: them; a longer one sends the whole book to repair.
+_MAX_FORMULA_CHARS = 8192
+
 
 class ExcelTranslator:
     """Translate Modeleon ``Expr`` trees to Excel formula strings.
@@ -44,9 +48,10 @@ class ExcelTranslator:
         addresses: Dict[str, VariableAddresses],
         var_to_sheet: Optional[Dict[str, str]] = None,
         identity_cells: Optional[Dict[int, "tuple[str, int]"]] = None,
+        time: Optional[Any] = None,
     ):
         self.renderer = ExcelRenderer(addresses, var_to_sheet,
-                                      identity_cells=identity_cells)
+                                      identity_cells=identity_cells, time=time)
         self.walker = Walker(self.renderer)
 
     # Back-compat shims — some callers read these through the
@@ -100,6 +105,7 @@ class ExcelTranslator:
             self_address=self_address,
             self_var=self_var,
             track_role=track_role,
+            own_chain=expr,
         )
         emitted = self.walker.render(expr, ctx)
         # A lossy positional collapse (see RenderCtx.lossy_inline) —
@@ -115,7 +121,12 @@ class ExcelTranslator:
         # parens; drop them before prefixing ``=`` so the cell reads
         # ``=x + 1`` not ``=(x + 1)``.
         emitted = _strip_outer_parens(emitted)
-        return emitted if emitted.startswith("=") else f"={emitted}"
+        formula = emitted if emitted.startswith("=") else f"={emitted}"
+        if len(formula) > _MAX_FORMULA_CHARS:
+            raise ValueError(
+                f"the formula is {len(formula):,} characters, past Excel's "
+                f"limit of {_MAX_FORMULA_CHARS:,}")
+        return formula
 
 
 def identity_cells_for(

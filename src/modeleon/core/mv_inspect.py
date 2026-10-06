@@ -104,8 +104,13 @@ class _MVInspect:
         cycle (``cycle[0] == cycle[-1]``).
         """
         variables = self._collect_variables()
+        # A read through ``lag`` crosses a period boundary and breaks a
+        # loop rather than closing one, so it is not an edge here.
+        from .loops import same_period_refs
         graph: Dict[str, List[str]] = {
-            vid: [ref.id for ref in var._dependency_refs]
+            vid: [ref.id for ref in (same_period_refs(var._expr)
+                                     if var._expr is not None
+                                     else var._dependency_refs)]
             for vid, var in variables.items()
         }
 
@@ -171,9 +176,11 @@ class _MVInspect:
             if isinstance(comp, MultiVariableBase):
                 components_data[name] = comp.to_dict()
             elif isinstance(comp, Variable):
+                pending = bool(comp._awaits) or comp._forward_of is not None
                 components_data[name] = {
                     'id': comp.id,
-                    'values': comp._value,
+                    # A row waiting on an open loop has no values yet.
+                    'values': None if pending else comp._value,
                     'formula': comp.formula,
                 }
 

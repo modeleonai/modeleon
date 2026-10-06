@@ -28,7 +28,7 @@ directly.
 """
 
 from collections import namedtuple
-from typing import Optional, Set, Any, Dict, List, Sequence, Tuple, TYPE_CHECKING
+from typing import Optional, Set, Any, Dict, List, Sequence, Tuple, TYPE_CHECKING, Self
 
 from .humanize import humanize_identifier
 from .component import Component
@@ -42,12 +42,53 @@ from .variable_ops import _VariableArithmetic
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from .unit import Unit
+
+    from .loops import Dependents
+
     from .multi_variable import MultiVariableBase
 
 
 #: A Variable's native time location — ``(start, grain)`` — or ``None`` when
-#: time-agnostic. Returned by :attr:`Variable.time`.
-TimeLoc = namedtuple('TimeLoc', ['start', 'grain'])
+#: time-agnostic. Returned by :attr:`Variable.time`. ``first_day`` is the
+#: day a short first period starts on (a quarter / year window started
+#: inside its first period), ``None`` when the first period is whole.
+TimeLoc = namedtuple('TimeLoc', ['start', 'grain', 'first_day'], defaults=(None,))
+
+
+def is_typed_date(var: object) -> bool:
+    """``mo.DATE(2026, 1, 1)`` of three whole numbers: a date the author
+    typed. As a line of its own it is an input, as
+    ``mo.Variable(date(2026, 1, 1))`` is; inside a formula it stays the
+    ``DATE(...)`` call it reads as."""
+    from .expr import FuncCall, Literal
+    expr = getattr(var, '_expr', None)
+    return (isinstance(expr, FuncCall) and expr.func == 'DATE' and len(expr.args) == 3
+            and all(isinstance(a, Literal) and type(a.value) is int for a in expr.args))
+
+
+def _TrackValuesType() -> type:
+    from .tracks import TrackValues
+    return TrackValues
+
+
+def _typed_dates_line(var: "Variable") -> bool:
+    """A line whose formula is only typed dates: one ``mo.DATE`` of
+    numbers, or a list of them (``[mo.DATE(2026, 1, 1), ...]``) beside
+    plain values - never a reference to another line."""
+    from .expr import ListExpr, Literal, VarRef
+    if is_typed_date(var):
+        return True
+    expr = getattr(var, '_expr', None)
+    if not isinstance(expr, ListExpr):
+        return False
+    typed = 0
+    for item in expr.items:
+        if isinstance(item, VarRef) and item.var._owner is None and is_typed_date(item.var):
+            typed += 1
+        elif not isinstance(item, Literal):
+            return False
+    return typed > 0
 
 
 class Variable(_VariableInit, _VariableArithmetic, Component):
@@ -57,6 +98,24 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
     # identity-based hashing so Variables can be members of sets,
     # WeakSets, and dict keys.
     __hash__ = object.__hash__
+
+    # Forward references (see :mod:`modeleon.core.loops`): a placeholder
+    # for a row read before it is assigned carries ``(owner, name)`` and
+    # the Variables built on it; a Variable computed from a placeholder
+    # carries the set of placeholders it waits on.
+    _forward_of: Optional[Tuple[Any, str]] = None
+    # The day a short first period starts on, for a row located at its own
+    # window (``mo.time`` rows, re-grained series); see ``TimeLoc``.
+    _first_day: Any = None
+    _forward_dependents: Optional['Dependents'] = None
+    _forward_horizon: Optional[int] = None
+    _forward_site: Optional[Tuple[str, int]] = None
+    _forward_abandoned: bool = False
+    _awaits: Optional[Set['Variable']] = None
+    _loop_error: Optional[str] = None
+    #: Does this value depend on ``mo.time`` (itself, or through the
+    #: unnamed intermediates it is built from)? Set with the expression.
+    _reads_time: bool = False
 
     """
     Pure variable - computation logic only
@@ -104,9 +163,13 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
         # Layout: this row's VALUES print on its parent section's
         # header row — the financial-statement subtotal-on-header form.
         'header_row',
-        # The row's article number («1.1») — data, not label text; the
+        # The row's article number ("1.1") — data, not label text; the
         # view decides whether it renders as a lead column or inline.
         'article',
+        # The line is its block's RESULT — what a calculation block
+        # computes, as opposed to the steps and links above it. A mark,
+        # not a look: the view's ``bands['result']`` says how it shows.
+        'result',
         # Cell-type colouring — cascades to descendants. ``True`` for the
         # default palette, or a dict ``{'input'|'formula'|'reference': hex}``.
         'format_by_type',
@@ -293,6 +356,10 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
         # than a live property so callers don't re-walk the tree on every read.
         self._dependency_refs: List['Variable'] = []
         self._unit = self._resolve_unit(unit)
+        # A unit the author declares (``unit=`` / ``set_unit``) is kept as
+        # given; one the arithmetic derives may be derived again (a loop's
+        # rows, built on placeholders, are).
+        self._unit_declared = self._unit is not None
         self._keys, self._keys_source = self._resolve_keys(keys)
 
         # --- dispatch to the mode that was requested ---
@@ -415,6 +482,7 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
             # declares its own.
             if self._unit is None and getattr(value, '_unit', None) is not None:
                 self._unit = value._unit
+                self._unit_declared = getattr(value, '_unit_declared', False)
         if (start is None) != (grain is None):
             raise ValueError(
                 "A located Variable needs both `start` and `grain` (or neither, "
@@ -509,7 +577,7 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
         if self._indexed_by:
             return None
         if self._grain is not None:
-            return TimeLoc(self._start, self._grain)
+            return TimeLoc(self._start, self._grain, self._first_day)
         # Only list-valued (time-series) Variables inherit an ancestor's
         # default grain; a scalar constant is time-agnostic — it broadcasts
         # unchanged into any projection — regardless of a model default.
@@ -527,7 +595,9 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
             seen.add(id(node))
             grain = getattr(node, 'default_grain', None)
             if grain is not None:
-                return TimeLoc(getattr(node, 'default_start', None), grain)
+                slots = node.__dict__ if hasattr(node, '__dict__') else {}
+                return TimeLoc(getattr(node, 'default_start', None), grain,
+                               slots.get('_default_first_day'))
             node = getattr(node, '_owner', None) or getattr(node, '_parent', None)
         return None
 
@@ -550,10 +620,29 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
         Idempotent; a no-op while the window is unresolvable (floating
         subtrees get their check at crystallization).
         """
-        from .time import resolve_default_window, _period_labels
+        from .time import resolve_default_window, section_window_refusal, _period_labels
         owner = getattr(self, '_owner', None) or getattr(self, '_parent', None)
         if owner is None:
             return
+        if not isinstance(self._value, _TrackValuesType()) and _typed_dates_line(self):
+            # ``inputs.close = mo.DATE(2026, 1, 1)``: the line is a date
+            # typed in, written to the book as its value - not a formula.
+            self.expr = None
+            self._source_code = None
+            self.value_type = 'datetime'
+        # Only a series that takes its periods from the section is placed
+        # by its window: a scalar, or a line located on its own (an
+        # ``.at()`` copy, ``start=``), takes nothing from it.
+        from .tracks import TrackValues as _TrackValues
+        _v = self._value
+        if getattr(self, '_grain', None) is None and (
+                isinstance(_v, list)
+                or (isinstance(_v, _TrackValues) and _v.time_length is not None)):
+            refusal = section_window_refusal(owner, reads_time=False)
+            if refusal is not None:
+                label = (self._display_name or getattr(self, '_python_name', None)
+                         or 'A line')
+                raise ValueError(f"{label!r} joins a section whose window is not whole: {refusal}")
         window = resolve_default_window(owner)
         # Scalar track coordinates need no window (time lives INSIDE a
         # track; an all-scalar TrackValues is time-agnostic), so the
@@ -1009,6 +1098,14 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
                             f"slice explicitly: .at(track='...')."
                         )
                     ov = ov[role]
+                if self.track_expr(role) is not None:
+                    # The track refers to that line (``actual=s.raw``): a
+                    # formula, so a blank reads as 0 - kept blank in a
+                    # line of dates or words.
+                    from .regrain import hole_value
+                    hole = hole_value(ov)
+                    ov = ([hole if v is None else v for v in ov]
+                          if isinstance(ov, list) else (hole if ov is None else ov))
                 new_tracks[role] = (
                     list(ov) if isinstance(ov, list) else ov
                 )
@@ -1027,6 +1124,30 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
         self._roles_materialized = True
         if self._value.time_length is not None:
             self.var_type = 'list'
+
+    def _entered_mask(self, role, periods: int, shown: bool = False):
+        """Per period, was track ``role`` - a formula - entered? None when
+        its own blanks answer (a track entered by hand) or it reads no
+        entries. A formula is a number even over months nobody entered (a
+        blank counts as zero), so it is asked of the entries it is built
+        from (``core.entries``). ``shown``: read through a lag as well — the mask
+        a derived line keeps as ``_blend_entered``."""
+        from .tracks import TrackValues
+        tv = self._value
+        if (not isinstance(role, str) or not isinstance(tv, TrackValues)
+                or role not in tv.roles or not isinstance(tv[role], list)):
+            return None
+        authored = self.track_expr(role)
+        if authored is None and role in (self._role_kwargs or {}):
+            return None
+        expr = authored if authored is not None else self._expr
+        if expr is None:
+            return None
+        from .entries import entered_mask, entry_lines, shown_entered_mask
+        if shown:
+            return shown_entered_mask(expr, role, periods, own=authored is not None)
+        entries = entry_lines(expr, role, own=authored is not None)
+        return entered_mask(entries, periods) if entries else None
 
     def _synthesize_blend(self, owner, window) -> None:
         """Grow the blend's synthesized track on a DATA line.
@@ -1047,8 +1168,14 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
         from .tracks import TrackValues
         from .tracks_decl import resolve_tracks_decl
 
+        self._blend_entered = None
         tv = self._value
         if not isinstance(tv, TrackValues):
+            return
+        if getattr(self, '_regrained_tracks', False):
+            # A coarser copy: each track, the blend among them, folded on
+            # its own. Spliced again it would be no quarter of actuals, and
+            # its blend is no authored track either.
             return
         label = (self._display_name
                  or getattr(self, '_python_name', None) or 'variable')
@@ -1072,6 +1199,13 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
         is_data_line = (self._role_kwargs is not None
                         or self._expr is None)
         if not is_data_line:
+            # A derived line computes its live value from its operands'
+            # live values; its actual is still a formula that shows 0 over
+            # months nobody entered; this mask records which were entered.
+            given0 = tv[b.given] if b.given in tv.roles else None
+            if isinstance(given0, list):
+                self._blend_entered = self._entered_mask(b.given, len(given0),
+                                                         shown=True)
             # A DERIVED line normally inherits live through the
             # broadcast — but one computed inside a CLASS BODY ran
             # before its operands had live (provisional
@@ -1101,7 +1235,7 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
                     if isinstance(n, SelfRef):
                         return True
                     if isinstance(n, FuncCall) and getattr(
-                            n, 'name', '').lower() in ('lag', 'lead'):
+                            n, 'func', '').lower() in ('lag', 'lead'):
                         return True
                     if isinstance(n, MethodCall) and getattr(
                             n, 'method', '').lower() in (
@@ -1211,13 +1345,34 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
                 return track[t] if t < len(track) else None
             return track                # scalar splices as a constant
 
+        def _entered(role, series):
+            """Per period: was this side entered? (``_entered_mask``)"""
+            if series is None:
+                return None
+            return self._entered_mask(role, len(labels))
+
+        from .regrain import hole_value
+        blank = hole_value(tv)
+        masks = {
+            'given': _entered(b.given, given),
+            'follow': (None if follow is prior_live
+                       else _entered(b.follow, follow)),
+        }
+        # Per period, was the given side - a formula - entered? Kept as
+        # ``_blend_entered``: the formula's number alone cannot tell an
+        # entered zero from a month nobody entered.
+        self._blend_entered = masks['given']
         live = []
         for t in range(len(labels)):
-            first, second = ((given, follow) if before_boundary[t]
-                             else (follow, given))
+            if before_boundary[t]:
+                first, second, mask = given, follow, masks['given']
+            else:
+                first, second, mask = follow, given, masks['follow']
             cell = _cell(first, t)
-            if cell is None:
+            if cell is None or (mask is not None and not mask[t]):
                 cell = _cell(second, t)
+            if cell is None:
+                cell = blank            # neither side: the formula's 0, as in the book
             live.append(cell)
         merged = tv.as_dict()
         merged[b.name] = live
@@ -1282,8 +1437,8 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
             ])
         if not isinstance(operand, Variable):
             return None
-        if operand._expr is None and operand._owner is None:
-            return None
+        if operand._owner is None and (operand._expr is None or is_typed_date(operand)):
+            return None                 # a typed value - a date typed with mo.DATE too
         return VarRef(operand)
 
     def shown_track_expr(self) -> Expr | None:
@@ -1347,6 +1502,25 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
         roles = list(value.roles)
         return blend_name if blend_name in roles else roles[0]
 
+    def _carry_presentation(self, result: 'Variable') -> 'Variable':
+        """The line's unit, number format and note on its coarser copy, so a
+        year sheet built from ``.at('year')`` shows the line's numbers as its
+        month sheet does. The format is the line's own, worn only where the
+        copy's sheet says none (``resolve_number_format``); the rest of the
+        line's ``excel_props`` - hidden, a header row, an article number, a
+        result's look - belongs to where the line stands, not to its copy."""
+        if self._unit is not None and (result._unit is None
+                                       or getattr(self, '_unit_declared', False)):
+            result._unit = self._unit
+            result._unit_declared = getattr(self, '_unit_declared', False)
+        own = (self._excel_props or {}).get('number_format') or getattr(
+            self, '_carried_number_format', None)
+        if own:
+            result._carried_number_format = own
+        if self._description and not result._description:
+            result._description = self._description
+        return result
+
     def at(self, grain: Optional[str] = None, *,
            track: Optional[str] = None) -> 'Variable':
         """Polymorphic restrict/re-grain.
@@ -1361,6 +1535,7 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
         is a no-op copy. A located Variable needs a ``regrain=`` rule;
         grain-frozen series refuse.
         """
+        self._refuse_pending()
         from .tracks import TrackValues
         label = self._display_name or self.id
         if track is not None:
@@ -1397,6 +1572,7 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
             sliced._regrain = self._regrain
             sliced._start = self._start
             sliced._grain = self._grain
+            sliced._first_day = self._first_day
             # Keep the ambient chain reachable for .time/regrain on the
             # slice even before adoption.
             if getattr(self, '_owner', None) is not None:
@@ -1415,22 +1591,33 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
             # Track-wise re-grain: each track projects by this
             # line's own rule (slice-then-regrain per role); the tracks
             # axis passes through unchanged.
+            from .regrain import hole_value
+            line_blank = hole_value(self._value)
             projected = {}
             p_start = None
             for role in self._value.roles:
-                p = self.at(track=role).at(grain)
+                sliced = self.at(track=role)
+                # What a hole counts as is the whole line's, not one
+                # track's: actuals not entered yet in a line of dates.
+                sliced._hole_value = line_blank
+                p = sliced.at(grain)
                 projected[role] = p._value
                 if p_start is None:
                     p_start = p._start
             out = Variable(display_name=self._display_name)
             out._value = TrackValues(projected)
+            # Each track - the blend among them - folded on its own: the
+            # book must not splice the folded tracks again, a quarter of
+            # actuals entered through February is no quarter of actuals.
+            out._regrained_tracks = True
             out.var_type = (
                 'list' if out._value.time_length is not None else 'scalar'
             )
             out._unit = self._unit
             out._grain = grain
             out._start = p_start
-            return out
+            out._first_day = getattr(p, '_first_day', None) if p is not None else None
+            return self._carry_presentation(out)
         if self._indexed_by:
             # Rank-1 guard: without it, ``time`` resolving to None
             # would silently COPY the axised variable through the
@@ -1488,15 +1675,21 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
         from .time import bucket_ranges
         n = len(self._value) if isinstance(self._value, list) else 1
         ranges = bucket_ranges(loc.grain, grain, loc.start, n)
-        labels, values = regrain_series(self._value, loc.grain, grain, loc.start, rule)
+        from .regrain import LINE_UNKNOWN
+        labels, values = regrain_series(self._value, loc.grain, grain, loc.start, rule,
+                                        loc.first_day,
+                                        blank=getattr(self, '_hole_value', LINE_UNKNOWN))
         result = Variable(values, display_name=self._display_name,
                           start=labels[0], grain=grain, regrain=spec)
+        # A first bucket that starts inside its coarse period is short.
+        from .time import coarse_first_day
+        result._first_day = coarse_first_day(loc.start, loc.grain, loc.first_day, grain)
         # Live formula: each target cell renders as a reducer over the source's
         # native cells (=SUM(range) / period-end cell), falling back to the
         # inlined value when the source has no address in the workbook.
         result._set_expr(Regrain(source=self, buckets=[(lo, hi) for _, lo, hi in ranges],
                                  recipe=rule, fill_values=list(values)))
-        return result
+        return self._carry_presentation(result)
 
     def set_regrain(self, spec: 'RegrainSpec') -> 'Variable':
         """Attach a re-grain rule to an operator-built Variable (chainable).
@@ -1567,7 +1760,15 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
         serializers, inspection tools) should use ``variable.value``.
         Internal engine code uses ``_value`` for directness.
         """
+        self._refuse_pending()
         return self._value
+
+    def _refuse_pending(self) -> None:
+        """A value computed from a row that is not assigned yet is
+        provisional — refuse to hand it out (see :mod:`modeleon.core.loops`)."""
+        if self._awaits or self._forward_of is not None:
+            from .loops import pending_message
+            raise ValueError(pending_message(self))
 
     @property
     def formula(self) -> Optional[str]:
@@ -1659,6 +1860,7 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
         self._expr = value
         if value is None:
             self._dependency_refs = []
+            self._reads_time = False
             return
         seen = set()
         refs: List['Variable'] = []
@@ -1667,6 +1869,29 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
                 seen.add(id(var))
                 refs.append(var)
         self._dependency_refs = refs
+        from .expr import Regrain, TimeRef
+        # A re-grained value is computed FOR its own window — whatever time
+        # its native source read lives in the source's window.
+        self._reads_time = isinstance(value, TimeRef) or (
+            not isinstance(value, Regrain)
+            and any(getattr(r, '_reads_time', False) for r in refs))
+        # A formula over a row that is not assigned yet computes a
+        # provisional value: remember what it waits on, and let the
+        # placeholder find it when the loop closes.
+        awaits = None
+        for var in refs:
+            if var._forward_of is not None:
+                awaits = awaits or set()
+                awaits.add(var)
+            elif var._awaits:
+                awaits = awaits or set()
+                awaits.update(var._awaits)
+        self._awaits = awaits
+        if awaits:
+            for placeholder in awaits:
+                dependents = placeholder._forward_dependents
+                if dependents is not None:
+                    dependents.append(self)
 
     def _set_expr(self, expr: Expr) -> None:
         """Thin delegate to the :attr:`expr` setter. Kept for the many
@@ -1771,6 +1996,7 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
         result.var_type = self.var_type
         result.value_type = self.value_type
         result._unit = self._unit
+        result._unit_declared = getattr(self, '_unit_declared', False)
         result._keys = list(self._keys) if self._keys is not None else None
         result._keys_source = self._keys_source
         result._excel_props = dict(self._excel_props)
@@ -1779,6 +2005,7 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
         # copy, so losing these would silently strip a line's grain / rule).
         result._start = self._start
         result._grain = self._grain
+        result._first_day = self._first_day
         result._regrain = self._regrain
         # Pending adoption-time state must survive too: an unmaterialized
         # schedule / extension / role stash would otherwise be silently
@@ -1818,7 +2045,15 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
             return unit_arg
         if isinstance(unit_arg, str):
             return Unit(unit_arg)
-        return None
+        from .multi_variable import MultiVariableBase
+        if isinstance(unit_arg, MultiVariableBase):
+            # A container passed as the unit carries no unit: the row
+            # keeps none (lenient, rather than a TypeError).
+            return None
+        raise TypeError(
+            f"a unit is a string (a dimension: 'USD m') or a Unit "
+            f"(mo.Unit.dimensionless('factor')); got {type(unit_arg).__name__}."
+        )
     
     @property
     def unit(self):
@@ -1826,9 +2061,23 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
         return self._unit
     
     @unit.setter
-    def unit(self, value: "str | None") -> None:
+    def unit(self, value: "str | Unit | None") -> None:
         self._unit = self._resolve_unit(value)
-    
+        self._unit_declared = self._unit is not None
+
+    def set_unit(self, unit: "str | Unit | None") -> "Self":
+        """Set the measurement unit and return ``self`` for chaining —
+        beside ``set_display_name`` / ``set_description`` / ``set_style``,
+        so a line reads as one expression::
+
+            fin.interest = (fin.opening * a.rate).set_unit('EUR').set_display_name('Interest')
+
+        A string is a dimension; a word that labels a pure number is a
+        ``mo.Unit.dimensionless('factor')``, passed as the object.
+        """
+        self.unit = unit
+        return self
+
     @property
     def keys(self):
         """Named index labels for list values, or None."""
@@ -1882,6 +2131,11 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
             shifted = self._value[n:] + [fill_value] * n
         else:
             shifted = list(self._value)
+        # A shifted blank reads as 0, as Excel's =previous_cell does -
+        # kept blank only in a line of dates or words.
+        from .regrain import hole_value
+        blank = hole_value(self._value)
+        shifted = [blank if v is None else v for v in shifted]
 
         # Build AST: shift(periods)  OR  shift(periods, fill_value=<...>)
         # Store the raw, typed fill value (already unwrapped from any
@@ -1907,6 +2161,7 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
     def __index__(self) -> int:
         """Allow Variable to be used where Python expects an integer (range(), slicing, etc.).
         Only works for scalar Variables with integer-compatible values."""
+        self._refuse_pending()
         v = self._value
         if isinstance(v, list):
             if len(v) == 1:
@@ -1920,12 +2175,14 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
         return int(v)
 
     def __int__(self) -> int:
+        self._refuse_pending()
         v = self._value
         if isinstance(v, list):
             v = v[0] if len(v) == 1 else v
         return int(v)
 
     def __float__(self) -> float:
+        self._refuse_pending()
         v = self._value
         if isinstance(v, list):
             v = v[0] if len(v) == 1 else v
@@ -1949,6 +2206,7 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
         List-valued Variables refuse, pandas/numpy-style: the truth of
         many values at once is genuinely ambiguous.
         """
+        self._refuse_pending()
         if isinstance(self._value, list):
             label = self.display_name or "Variable"
             raise ValueError(
@@ -2085,6 +2343,7 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
             for s in scalar:  # Iterates once, yields 100
                 print(s)
         """
+        self._refuse_pending()
         if isinstance(self._value, list):
             return iter(self._value)
         else:
@@ -2101,6 +2360,8 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
         three / last one with an ellipsis.
         """
         v = self._value
+        if self._awaits or self._forward_of is not None:
+            return "<pending>"
         if v is None:
             return "None"
         if isinstance(v, list):

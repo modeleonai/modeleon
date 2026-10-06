@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "modeleon"
-version = "0.2.0"
+version = "0.2.1"
 description = "Financial Model Engineering — Python code compiles to live Excel formulas"
 requires-python = ">=3.12"
 license = "Apache-2.0"
@@ -64,7 +64,7 @@ packages = ["src/modeleon"]
 
 # Sdist contents — keep README, LICENSE, NOTICE, CHANGELOG,
 # CONTRIBUTING, pyproject.toml, src/, tests/, examples/. Exclude
-# internal docs (CLAUDE.md), notebooks (large + non-essential for
+# assistant notes (CLAUDE.md), notebooks (large + non-essential for
 # distribution), build artifacts, and any stray xlsx outputs.
 [tool.hatch.build.targets.sdist]
 exclude = [

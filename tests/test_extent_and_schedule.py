@@ -90,38 +90,38 @@ class TestExtentLaw:
         m = _model()
         with pytest.raises(ValueError, match="24-period window"):
             with m:
-                m.короткий = mo.Variable([1.0, 2.0, 3.0])
+                m.short = mo.Variable([1.0, 2.0, 3.0])
 
     def test_full_length_scalar_and_len1_pass(self):
         m = _model(4)
         with m:
-            m.полный = mo.Variable([1.0, 2.0, 3.0, 4.0])
-            m.скаляр = mo.Variable(0.2)
-            m.один = mo.Variable([5.0])
-        assert m.полный._value == [1.0, 2.0, 3.0, 4.0]
+            m.full = mo.Variable([1.0, 2.0, 3.0, 4.0])
+            m.scalar = mo.Variable(0.2)
+            m.single = mo.Variable([5.0])
+        assert m.full._value == [1.0, 2.0, 3.0, 4.0]
 
     def test_own_location_exempts(self):
         # Declared partial: its own start= anchors it — the law's
         # explicit escape hatch for genuinely partial series.
         m = _model()
         with m:
-            m.свой = mo.Variable([1.0, 2.0], start='2025-03', grain='month')
-        assert m.свой.time.start == '2025-03'
+            m.own = mo.Variable([1.0, 2.0], start='2025-03', grain='month')
+        assert m.own.time.start == '2025-03'
 
     def test_keyed_list_exempts(self):
         # A labeled list (dict sugar) is not a time series.
         m = _model()
         with m:
-            m.кейсы = mo.Variable({'Bear': 1.0, 'Base': 2.0, 'Bull': 3.0})
-        assert m.кейсы._keys == ['Bear', 'Base', 'Bull']
+            m.cases = mo.Variable({'Bear': 1.0, 'Base': 2.0, 'Bull': 3.0})
+        assert m.cases._keys == ['Bear', 'Base', 'Bull']
 
     def test_axised_exempts(self):
         # Coordinates, not periods — the rank-1 guard owns that story.
         m = _model()
-        сценарии = mo.Variable(['Bear', 'Bull'])
+        scenarios = mo.Variable(['Bear', 'Bull'])
         with m:
-            m.осевой = mo.Variable([1.0, 2.0], indexed_by=[сценарии])
-        assert m.осевой.time is None
+            m.axised = mo.Variable([1.0, 2.0], indexed_by=[scenarios])
+        assert m.axised.time is None
 
     def test_windowless_model_is_untouched(self):
         with mo.Model('w') as m:
@@ -140,57 +140,57 @@ class TestSchedule:
     def test_materializes_on_adoption(self):
         m = _model()
         with m:
-            m.параметры = mo.MultiVariable()
-            m.параметры.ндс = mo.schedule(
-                {'2025-01': 0.12, '2026-01': 0.16}
+            m.params = mo.MultiVariable()
+            m.params.tax_rate = mo.schedule(
+                {'2025-01': 0.15, '2026-01': 0.17}
             )
-        v = m.параметры.ндс._value
+        v = m.params.tax_rate._value
         assert len(v) == 24
-        assert v[0] == 0.12 and v[11] == 0.12
-        assert v[12] == 0.16 and v[23] == 0.16
+        assert v[0] == 0.15 and v[11] == 0.15
+        assert v[12] == 0.17 and v[23] == 0.17
 
     def test_formula_over_schedule(self):
         m = _model()
         with m:
-            m.ставка = mo.schedule({'2025-01': 0.10, '2026-01': 0.20})
-            m.цена = mo.Variable([100.0] * 24)
-            m.итог = m.цена * (1 + m.ставка)
-        assert m.итог._value[0] == pytest.approx(110.0)
-        assert m.итог._value[12] == pytest.approx(120.0)
+            m.rate = mo.schedule({'2025-01': 0.10, '2026-01': 0.20})
+            m.price = mo.Variable([100.0] * 24)
+            m.total = m.price * (1 + m.rate)
+        assert m.total._value[0] == pytest.approx(110.0)
+        assert m.total._value[12] == pytest.approx(120.0)
 
     def test_default_regrain_is_mean(self):
         # A rate re-grains by mean, never by sum.
         m = _model(12)
         with m:
-            m.ставка = mo.schedule({'2025-01': 0.12})
-        q = m.ставка.at('quarter')
-        assert q._value == pytest.approx([0.12, 0.12, 0.12, 0.12])
+            m.rate = mo.schedule({'2025-01': 0.20})
+        q = m.rate.at('quarter')
+        assert q._value == pytest.approx([0.20, 0.20, 0.20, 0.20])
 
     def test_step_off_boundary_dies(self):
         m = _model()
         with pytest.raises(ValueError, match="boundary"):
             with m:
-                m.ндс = mo.schedule({'2025-01': 0.12, '2026-02-15': 0.16})
+                m.tax_rate = mo.schedule({'2025-01': 0.15, '2026-02-15': 0.17})
 
     def test_window_start_uncovered_dies(self):
         m = _model()
         with pytest.raises(ValueError, match="window start"):
             with m:
-                m.ндс = mo.schedule({'2025-06': 0.12})
+                m.tax_rate = mo.schedule({'2025-06': 0.20})
 
     def test_step_beyond_window_is_legal(self):
         # The law only binds steps INSIDE the window span; a future
         # change beyond it simply doesn't materialize.
         m = _model(12)
         with m:
-            m.ндс = mo.schedule({'2025-01': 0.12, '2027-01': 0.20})
-        assert m.ндс._value == [0.12] * 12
+            m.tax_rate = mo.schedule({'2025-01': 0.20, '2027-01': 0.25})
+        assert m.tax_rate._value == [0.20] * 12
 
     def test_empty_or_bad_keys_die(self):
         with pytest.raises(TypeError, match="non-empty"):
             mo.schedule({})
         with pytest.raises(TypeError, match="ISO period labels"):
-            mo.schedule({2025: 0.12})
+            mo.schedule({2025: 0.20})
 
 
 class TestExtend:
@@ -200,8 +200,8 @@ class TestExtend:
     def test_zero_pads_a_flow(self):
         m = _model()
         with m:
-            m.капекс = mo.Variable([500.0, 500.0, 500.0], extend=mo.zero())
-        v = m.капекс._value
+            m.capex = mo.Variable([500.0, 500.0, 500.0], extend=mo.zero())
+        v = m.capex._value
         assert len(v) == 24
         assert v[:3] == [500.0, 500.0, 500.0]
         assert v[3:] == [0.0] * 21
@@ -209,8 +209,8 @@ class TestExtend:
     def test_hold_carries_a_rate(self):
         m = _model()
         with m:
-            m.ставка = mo.Variable([0.10, 0.10, 0.12], extend=mo.hold())
-        v = m.ставка._value
+            m.rate = mo.Variable([0.10, 0.10, 0.12], extend=mo.hold())
+        v = m.rate._value
         assert len(v) == 24
         assert v[2] == 0.12 and v[23] == 0.12
 
@@ -223,9 +223,9 @@ class TestExtend:
     def test_extended_series_computes_downstream(self):
         m = _model(6)
         with m:
-            m.поток = mo.Variable([100.0, 100.0], extend=mo.zero())
-            m.итог = mo.cumsum(m.поток)
-        assert m.итог._value == [100.0, 200.0, 200.0, 200.0, 200.0, 200.0]
+            m.flow = mo.Variable([100.0, 100.0], extend=mo.zero())
+            m.total = mo.cumsum(m.flow)
+        assert m.total._value == [100.0, 200.0, 200.0, 200.0, 200.0, 200.0]
 
     def test_bad_extend_value_dies(self):
         with pytest.raises(TypeError, match="mo.zero"):
@@ -276,6 +276,7 @@ class TestWrappedPendingSource:
         cells = _written(m, tmp_path, 'P')['S (%)']
         assert {c.number_format for c in cells} == {'0.0%'}
 
+    @pytest.mark.slow
     def test_formula_over_it_references_its_cells(self, tmp_path):
         m = self._wrapped()
         assert m.p.f._value == pytest.approx([10.0, 10.0, 20.0])
@@ -314,6 +315,7 @@ class TestWrappedPendingSource:
         assert [c.value for c in rows['Bare']] == [0.1, 0.1, 0.2]
         assert [c.value for c in rows['Wrap']] == [0.1, 0.1, 0.1]
 
+    @pytest.mark.slow
     def test_wrapped_partial_series_writes_its_extension(self, tmp_path):
         m = _model(4)
         with m:
@@ -336,7 +338,7 @@ class TestWrappedPendingSource:
         m = mo.Model(
             'm', default_grain='month', default_start='2025-01',
             default_periods=3,
-            tracks=mo.Tracks(actual='fact', plan='plan'),
+            tracks=mo.Tracks(actual='Actual', plan='plan'),
         )
         with m:
             m.p = mo.MultiVariable('P', excel_props={'tab': True})
@@ -375,6 +377,7 @@ class TestWrappedPendingSource:
         rows = _written(m, tmp_path, 'P')
         assert [c.value for c in rows['W']] == ['=B2', '=C2', '=D2']
 
+    @pytest.mark.slow
     def test_extension_declared_over_a_formula_writes_its_values(
             self, tmp_path):
         # ``Z * 2`` covers only Z's two periods; the wrapper's extend=

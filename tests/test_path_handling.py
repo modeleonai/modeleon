@@ -48,6 +48,7 @@ class TestTrickyFilenames:
     def test_unicode_filename(self, tmp_path):
         # Finance teams globally — Cyrillic, Chinese, emoji surrogates
         # all get hit in the wild. Bare minimum: non-ASCII basename.
+        # The Cyrillic word ("model") is deliberate: it is the point.
         _tiny_model().to_excel(tmp_path / "модель.xlsx")
         out = tmp_path / "модель.xlsx"
         assert out.exists()

@@ -405,10 +405,16 @@ class TestWeightedRecipes:
         assert apply_recipe([0.01, -1.0, 0.02], 'geometric') == '#NUM!'
         assert apply_recipe([0.01, -1.5], 'geometric') == '#NUM!'
 
-    def test_error_token_absorbs_through_any_recipe(self):
+    def test_error_token_absorbs_through_an_aggregating_recipe(self):
         from modeleon.core.regrain import apply_recipe
         assert apply_recipe([1, '#DIV/0!', 3], 'sum') == '#DIV/0!'
-        assert apply_recipe(['#VALUE!', 2], 'last', [31, 29]) == '#VALUE!'
+        assert apply_recipe([2, '#VALUE!'], 'last', [31, 29]) == '#VALUE!'
+
+    def test_a_positional_recipe_reads_only_its_own_period_error(self):
+        # ``=D5`` in the book shows D5, whatever stands in B5 and C5.
+        from modeleon.core.regrain import apply_recipe
+        assert apply_recipe(['#VALUE!', 2], 'last', [31, 29]) == 2
+        assert apply_recipe([1, '#N/A'], 'first') == 1
 
     def test_zero_total_weight_mean_is_div0(self):
         from modeleon.core.regrain import apply_recipe
@@ -496,6 +502,62 @@ class TestProjectionAt:
         assert q.price._display_name == 'Price'
         assert 'recurrence' in (q.price._source_code or '')
         assert 'grain-frozen' in q.price._regrain_error
+
+    def test_a_sheet_of_years_does_not_stop_a_quarterly_projection(self):
+        # Years cannot become quarters: the sheet's lines are the error
+        # rows that say so, and the monthly sheet beside it projects - the
+        # whole quarterly projection failed, and every quarterly subtotal
+        # lost its formula with it.
+        m = mo.Model('m', default_grain='month', default_start='2026-01', default_periods=6)
+        with m:
+            m.ops = mo.MultiVariable('Ops')
+            with m.ops as o:
+                o.vol = mo.Variable([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], regrain=mo.up('sum'))
+            m.years = mo.MultiVariable('Years', default_grain='year', default_start='2026',
+                                       default_periods=1)
+            with m.years as y:
+                y.vol = m.ops.vol.at('year')
+        from modeleon.core.projection import project_model
+        q = project_model(m, 'quarter', on_error='absorb')
+        assert q.ops.vol._value == [6.0, 15.0]
+        assert q.years.vol._value == '#VALUE!'
+        assert 'coarsens only' in q.years.vol._regrain_error
+        with pytest.raises(ValueError, match='coarsens only'):
+            project_model(m, 'quarter')
+
+    def test_a_tree_asked_at_a_finer_grain_still_refuses_as_a_whole(self):
+        # Only a container INSIDE the tree keeps no window of its own; the
+        # tree asked as a whole refuses, or a workbook written at a finer
+        # grain came back as a book of '#VALUE!' with no time axis.
+        m = mo.Model('m', default_grain='year', default_start='2026', default_periods=3)
+        with m:
+            m.capex = mo.Variable([100.0, 200.0, 300.0], regrain=mo.up('sum'))
+        from modeleon.core.projection import project_model
+        with pytest.raises(ValueError, match='coarsens only'):
+            project_model(m, 'quarter', on_error='absorb')
+
+    def test_a_line_that_cannot_change_grain_beside_a_sections_own_blend(self):
+        # A section with tracks and a blend of its own, and in it a line of
+        # recurrences that cannot change grain: its error row keeps every
+        # track - the blend among them - as the error. That row read as
+        # authoring the blend, and the whole projection failed.
+        m = mo.Model('m', default_grain='month', default_start='2026-01', default_periods=6)
+        with m:
+            m.a = mo.MultiVariable('A', tracks=mo.Tracks(
+                'plan', 'actual', blend=mo.blend(given='actual', follow='plan')),
+                default_grain='month', default_start='2026-01', default_periods=6)
+            with m.a as a:
+                a.x = mo.Variable(plan=[1.0] * 6, actual=[2.0] + [None] * 5,
+                                  regrain=mo.up('sum'))
+                a.lib = mo.Variable(plan=mo.recurrence(0.0, '{prev} + 1', periods=6),
+                                    actual=[0] + [None] * 5)
+        from modeleon.core.projection import project_model
+        q = project_model(m, 'quarter', on_error='absorb')
+        lib = q.a.lib._value
+        assert {r: lib[r] for r in lib.roles} == {
+            'plan': '#VALUE!', 'actual': '#VALUE!', 'live': '#VALUE!'}
+        assert q.a.lib._regrain_error.startswith("'lib' has no re-grain rule")
+        assert q.a.x._value['live'] == [4.0, 3.0]
 
     def test_cumsum_check_row_regrains(self):
         # debt − (loan − cumsum(principal)) — a standard debt check
@@ -675,23 +737,52 @@ class TestAliasProjection:
 
 
 class TestHoleAbsorption:
-    """A ``None`` in a bucket is an un-entered period — absence, not
-    failure. The coarse cell is a hole until every native period in it
-    is known; no recipe may crash on one."""
+    """A ``None`` in a bucket is an un-entered period, a blank cell in the
+    book: it counts as zero, as the book's subtotal formula counts a blank
+    cell, and no recipe may crash on one."""
 
-    def test_any_hole_makes_an_aggregate_a_hole(self):
+    def test_a_hole_counts_as_zero(self):
         from modeleon.core.regrain import apply_recipe
-        for recipe in ('sum', 'mean', 'min', 'max', 'geometric'):
-            assert apply_recipe([1.0, None, 3.0], recipe) is None
+        assert apply_recipe([1.0, None, 3.0], 'sum') == 4.0
+        assert apply_recipe([0.1, None, 0.1], 'geometric') == pytest.approx(1.1 * 1.1 - 1)
+
+    def test_mean_min_and_max_skip_holes_as_excel_skips_blank_cells(self):
+        # A price entered for January and March averages to that price -
+        # AVERAGE skips a blank cell; a zero there would dilute it.
+        from modeleon.core.regrain import apply_recipe
+        assert apply_recipe([3.0, None, 3.0], 'mean') == 3.0
+        assert apply_recipe([2.0, None, 4.0], 'mean', [31, 28, 30]) == pytest.approx(
+            (2 * 31 + 4 * 30) / 61)
+        assert apply_recipe([5.0, None, 3.0], 'min') == 3.0
+        assert apply_recipe([-5.0, None, -3.0], 'max') == -3.0
+
+    def test_a_bucket_of_holes_is_zero(self):
+        from modeleon.core.regrain import apply_recipe
+        for recipe in ('sum', 'mean', 'min', 'max', 'geometric', 'first', 'last'):
+            assert apply_recipe([None, None, None], recipe) == 0, recipe
 
     def test_positional_recipes_read_only_their_own_period(self):
-        # first/last emit a positional cell reference in Excel — value
-        # and formula must agree, so only THAT period's hole matters.
+        # first/last emit a positional cell reference in Excel - value
+        # and formula agree: a blank cell there shows 0.
         from modeleon.core.regrain import apply_recipe
         assert apply_recipe([None, None, 130.0], 'last') == 130.0
-        assert apply_recipe([1.0, 2.0, None], 'last') is None
+        assert apply_recipe([1.0, 2.0, None], 'last') == 0
         assert apply_recipe([1.0, None, None], 'first') == 1.0
-        assert apply_recipe([None, 2.0, 3.0], 'first') is None
+        assert apply_recipe([None, 2.0, 3.0], 'first') == 0
+
+    def test_a_line_of_dates_or_words_keeps_its_blanks(self):
+        # A blank has no zero there: date serial 0 is 1899-12-30.
+        from datetime import date
+
+        from modeleon.core.regrain import apply_recipe
+        from modeleon.core.time import regrain_series
+        d = date(2026, 1, 15)
+        assert apply_recipe([d, None, None], 'last') is None
+        assert apply_recipe([d, None, None], 'first') == d
+        assert apply_recipe(['open', None], 'last') is None
+        _, vals = regrain_series([d, d, None, None, None, None], 'month', 'quarter',
+                                 '2026-01', 'last')
+        assert vals == [None, None]
 
     def test_all_known_bucket_still_reduces(self):
         from modeleon.core.regrain import apply_recipe
@@ -706,4 +797,79 @@ class TestHoleAbsorption:
         _, vals = regrain_series(
             [10.0, 20.0, 30.0, None, None, None], 'month', 'quarter',
             '2026-01', 'sum')
-        assert vals == [60.0, None]
+        assert vals == [60.0, 0]
+
+
+class TestACoarserCopyKeepsTheLinesLook:
+    """``.at('year')`` is the same line on a coarser grain: its unit, number
+    format and note come along - a year sheet built from it showed 'General'
+    instead of the line's format. Only the numbers' look travels: where the
+    copy stands decides the rest, and its sheet's own format wins."""
+
+    def _model(self):
+        m = mo.Model('m', default_grain='month', default_start='2026-01', default_periods=12)
+        with m:
+            m.rev = mo.Variable([100.0] * 12, unit='USD', regrain=mo.up('sum'),
+                                description='Sales booked in the month',
+                                excel_props={'number_format': '#,##0', 'article': '1.1',
+                                             'hidden': True})
+        return m
+
+    def test_unit_format_and_note_survive(self):
+        from modeleon.compile.excel.writer import resolve_number_format
+
+        y = self._model().rev.at('year')
+        assert str(y._unit) == 'USD'
+        assert resolve_number_format(y) == '#,##0'
+        assert y.description == 'Sales booked in the month'
+        assert y.value == [1200.0]
+
+    def test_where_the_copy_stands_decides_the_rest(self):
+        # Hidden, the article number, a header row: the line's place, not
+        # its copy's - a roll-up of a hidden helper was hidden on the year
+        # sheet, and a header row's copy took another section's header.
+        y = self._model().rev.at('year')
+        assert not (y._excel_props or {})
+
+    def test_the_copys_sheet_format_wins(self):
+        from modeleon.compile.excel.writer import resolve_number_format
+
+        m = self._model()
+        with m:
+            m.years = mo.MultiVariable('Years', excel_props={'number_format': '#,##0,'})
+            with m.years as y:
+                y.rev = m.rev.at('year')
+        assert resolve_number_format(m.years.rev) == '#,##0,'
+
+    def test_a_mark_that_hides_the_number_does_not_travel(self):
+        # A flag shown as a bar ('"X";;') sums to a count on the year sheet:
+        # the count stays readable, as a row total of a bar row does.
+        from modeleon.compile.excel.writer import resolve_number_format
+
+        m = mo.Model('m', default_grain='month', default_start='2026-01', default_periods=12)
+        with m:
+            m.on = mo.Variable([1.0] * 12, regrain=mo.up('sum'),
+                               excel_props={'number_format': '"X";;'})
+        assert resolve_number_format(m.on.at('year')) != '"X";;'
+
+    def test_on_a_line_with_tracks_too(self):
+        from modeleon.compile.excel.writer import resolve_number_format
+
+        m = mo.Model('m', default_grain='month', default_start='2026-01', default_periods=12,
+                     tracks=mo.Tracks('plan', 'actual'))
+        with m:
+            m.rev = mo.Variable(plan=[100.0] * 12, actual=[90.0] * 12, unit='USD',
+                                regrain=mo.up('sum'), excel_props={'number_format': '#,##0'})
+        y = m.rev.at('year')
+        assert resolve_number_format(y) == '#,##0'
+        assert str(y._unit) == 'USD'
+
+    def test_a_track_slice_is_another_line(self):
+        # A slice placed as a row of its own must not repeat the line's
+        # article number.
+        m = mo.Model('m', default_grain='month', default_start='2026-01', default_periods=2,
+                     tracks=mo.Tracks('plan', 'actual'))
+        with m:
+            m.rev = mo.Variable(plan=[1.0, 2.0], actual=[1.0, 2.0],
+                                excel_props={'article': '1.1'})
+        assert not m.rev.at(track='actual')._excel_props

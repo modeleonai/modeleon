@@ -146,7 +146,8 @@ class TestDuplicateSheetNameQualification:
         assert q["B1"] == "Q1 2024"
         assert q["C1"] == "Q2 2024"
         assert q["B2"] == "=Saas!D2"               # seats, up('last') -> Q-end
-        assert q["B3"] == "=AVERAGE(Saas!B3:D3)"   # price, up('mean')
+        # price, up('mean'): weighted by the months' days, as the engine's
+        assert q["B3"] == "=(Saas!B3*31+Saas!C3*29+Saas!D3*31)/91"
         assert q["B4"] == "=SUM(Saas!B4:D4)"       # revenue, up('sum') -> Q1
         assert q["C4"] == "=SUM(Saas!E4:G4)"       # revenue, up('sum') -> Q2
 

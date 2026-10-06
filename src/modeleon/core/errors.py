@@ -7,7 +7,7 @@ search term when a traceback or a deprecation-style message surfaces.
 """
 
 import warnings
-from typing import List
+from typing import List, Optional
 
 
 class CircularDependencyError(ValueError):
@@ -23,6 +23,30 @@ class CircularDependencyError(ValueError):
         self.cycle = cycle
         path = " -> ".join(cycle)
         super().__init__(f"Circular dependency detected: {path}")
+
+
+class SamePeriodCycleError(ValueError):
+    """Rows that read each other within ONE period — no order computes
+    them, only a fixed point would. ``rows`` are the named rows of the
+    cycle; ``nodes`` every Variable on it, the unnamed intermediates
+    between operators included. A loop across periods (every round trip
+    through ``mo.lag``) is fine; see :mod:`modeleon.core.loops`.
+    """
+
+    def __init__(self, rows: list, message: str, nodes: Optional[list] = None):
+        self.rows = rows
+        self.nodes = nodes if nodes is not None else list(rows)
+        super().__init__(message)
+
+    def __reduce__(self):
+        return (type(self), (self.rows, str(self), self.nodes))
+
+
+class ForwardReferenceError(AttributeError):
+    """A row a loop container read before its line was never assigned, or
+    was assigned something that cannot be that row. See
+    :mod:`modeleon.core.loops`.
+    """
 
 
 class CrossScopeReferenceWarning(UserWarning):

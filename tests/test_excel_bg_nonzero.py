@@ -34,14 +34,14 @@ class TestBgNonzero:
     def test_a_conditional_rule_covers_the_value_cells(self):
         m = _windowed()
         with m:
-            m.план = mo.MultiVariable("План", excel_props={"tab": True})
-            with m.план as p:
-                p.полоса = mo.Variable(
+            m.plan = mo.MultiVariable("Plan", excel_props={"tab": True})
+            with m.plan as p:
+                p.band = mo.Variable(
                     [0.0, 1.0, 1.0],
-                    display_name="Полоса",
+                    display_name="Band",
                     excel_props={"bg_nonzero": "1C9499"},
                 )
-        ws = _sheet(m, "План")
+        ws = _sheet(m, "Plan")
         rules = [
             (str(rng), rule)
             for rng in ws.conditional_formatting
@@ -51,7 +51,7 @@ class TestBgNonzero:
         sqref, rule = rules[0]
         # All three value cells are covered (row 2: B..D under the header).
         assert "B2" in sqref and "D2" in sqref
-        # Numbers only: CellIs «notEqual 0» painted error tokens and
+        # Numbers only: CellIs "notEqual 0" painted error tokens and
         # any text — the band marks nonzero NUMBERS only.
         assert rule.formula == ["AND(ISNUMBER(B2),B2<>0)"]
         assert rule.dxf.fill.bgColor.rgb.endswith("1C9499")
@@ -59,8 +59,8 @@ class TestBgNonzero:
     def test_no_rule_without_the_prop(self):
         m = _windowed()
         with m:
-            m.план = mo.MultiVariable("План", excel_props={"tab": True})
-            with m.план as p:
-                p.выручка = mo.Variable([1, 2, 3], display_name="Выручка")
-        ws = _sheet(m, "План")
+            m.plan = mo.MultiVariable("Plan", excel_props={"tab": True})
+            with m.plan as p:
+                p.revenue = mo.Variable([1, 2, 3], display_name="Revenue")
+        ws = _sheet(m, "Plan")
         assert len(list(ws.conditional_formatting)) == 0

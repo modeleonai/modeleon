@@ -360,7 +360,7 @@ def _var_row(var, ctx: Optional[_Ctx]) -> Optional[int]:
 #   - B5               (local cell or range, no sheet prefix)
 # Range form is captured via the optional ``:colN rowN`` tail.
 _CELL_REF = re.compile(
-    r"(?:'(?P<qsheet>[^']+)'|(?P<sheet>[A-Za-z_]\w*))!"
+    r"(?:'(?P<qsheet>(?:[^']|'')+)'|(?P<sheet>[A-Za-z_]\w*))!"
     r"(?P<col1>[A-Z]+)(?P<row1>\d+)"
     r"(?::(?P<col2>[A-Z]+)(?P<row2>\d+))?"
     r"|(?P<lcol1>[A-Z]+)(?P<lrow1>\d+)"
@@ -415,7 +415,9 @@ def _extract_precedent_cells(formula: str, current_sheet: str) -> list[str]:
     out: list[str] = []
     for m in _CELL_REF.finditer(formula or ""):
         if m.group("col1") is not None:
-            sheet = m.group("qsheet") or m.group("sheet") or current_sheet
+            qsheet = m.group("qsheet")
+            sheet = (qsheet.replace("''", "'") if qsheet else None) \
+                or m.group("sheet") or current_sheet
             col1, row1 = m.group("col1"), int(m.group("row1"))
             col2 = m.group("col2") or col1
             row2 = int(m.group("row2") or row1)
@@ -950,6 +952,9 @@ def _collect_rows(mv, direct_only: bool = False) -> tuple[list, int]:
         if isinstance(comp, Variable):
             label = _label_with_unit(comp)
             values = comp._value if isinstance(comp._value, list) else [comp._value]
+            if comp._awaits or comp._forward_of is not None:
+                # A row waiting on an open loop: no values yet.
+                values = ["pending"] * len(values)
             max_cols = max(max_cols, len(values))
             rows.append(('var', label, comp, values))
         elif isinstance(comp, MultiVariableBase):

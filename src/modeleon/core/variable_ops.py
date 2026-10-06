@@ -42,6 +42,9 @@ _ONE_DAY = timedelta(days=1)
 _COMPARISON_SYMBOLS = frozenset({'==', '!=', '<', '<=', '>', '>='})
 
 
+#: A blank compares as "" against text, as Excel's ``A1=""`` does.
+_COMPARISONS = frozenset(('==', '!=', '<', '<=', '>', '>='))
+
 def _to_serial(x: Any) -> Any:
     """A date as Excel's serial number; a timedelta as its days.
 
@@ -137,6 +140,134 @@ def _date_serial_op(a: Any, b: Any, op: Any, op_symbol: Optional[str]) -> Any:
         return '#VALUE!'
 
 
+def _provisional_unit(unit_fn: Any, left: Any, right: Any, *operands: Any) -> Any:
+    """``unit_fn(left, right)`` — except over a row whose loop has not
+    closed (see :mod:`modeleon.core.loops`): its unit is not known yet,
+    so a mismatch is not an error here; the loop derives every unit
+    again when it closes, and reports a real mismatch there."""
+    if any(getattr(v, '_awaits', None) or getattr(v, '_forward_of', None) is not None
+           for v in operands):
+        try:
+            return unit_fn(left, right)
+        except ValueError:
+            return None
+    return unit_fn(left, right)
+
+
+_GRAIN_ORDER = {'day': 0, 'month': 1, 'quarter': 2, 'year': 3}
+
+
+def _mixed_first_periods(left: Any, lt: Any, right: Any, rt: Any) -> str:
+    """The refusal when two series start the same-named periods on
+    different days: one window's first period is short (it starts inside
+    its quarter or year), the other's is not or starts on another day."""
+    def name(v: Any) -> str:
+        label = v._display_name or getattr(v, '_python_name', None)
+        if label:
+            return repr(label)
+        formula = getattr(v, 'formula', None)
+        return f"the line {formula}" if formula else "an unnamed line"
+
+    def first(v: Any, t: Any) -> str:
+        if t.first_day is not None:
+            return (f"{name(v)} starts its first period, {t.start}, on "
+                    f"{t.first_day.isoformat()}")
+        return f"{name(v)} starts with the whole period {t.start}"
+    return (
+        f"{name(left)} and {name(right)} do not line up: {first(left, lt)}; "
+        f"{first(right, rt)}. Periods of the same name would hold different "
+        f"days - build both in the same window."
+    )
+
+
+def _mixed_grains(left: Any, left_grain: str, right: Any, right_grain: str) -> str:
+    """Two lines of different grains in one formula: name both, their
+    grains, and the re-grain that joins them."""
+    adjective = {'day': 'daily', 'month': 'monthly', 'quarter': 'quarterly',
+                 'year': 'yearly'}
+
+    def describe(v: Any, grain: str) -> str:
+        label = (getattr(v, '_display_name', None)
+                 or getattr(v, '_python_name', None))
+        return f"{label!r} ({grain}s)" if label else f"a {adjective.get(grain, grain)} line"
+
+    finer = left if _GRAIN_ORDER.get(left_grain, 0) < _GRAIN_ORDER.get(right_grain, 0) else right
+    coarse = right_grain if finer is left else left_grain
+    code = getattr(finer, '_python_name', None)
+    hint = f"{code}.at('{coarse}')" if code else f".at('{coarse}')"
+    return (
+        f"{describe(left, left_grain)} and {describe(right, right_grain)} meet "
+        f"in one formula at different grains. Re-grain the finer line first: "
+        f"{hint} gives it in {coarse}s (date alignment only aligns within one "
+        f"grain)."
+    )
+
+
+#: Unit words read as a year or a month, for the per-period hint.
+_YEAR_WORDS = frozenset({"year", "years", "yr", "yrs", "y", "год", "года", "лет"})
+_MONTH_WORDS = frozenset({"month", "months", "mo", "mon", "мес", "месяц", "месяца"})
+
+
+def _incompatible_units(left: Any, right: Any) -> str:
+    """Why two units do not add — and, when one side is the other times a
+    word or two, that those words are dimensions: a string unit always
+    is, and a word that labels a pure number is declared as one."""
+    lc, rc = left._unit_components, right._unit_components
+    if str(left) == str(right) and bool(lc) != bool(rc):
+        def what(u: Any) -> str:
+            return "a dimension" if u._unit_components else "a labelled pure number"
+        pair = f"{left} ({what(left)}) and {right} ({what(right)})"
+    else:
+        pair = f"{left} and {right}"
+    message = f"Cannot add/subtract values with incompatible units: {pair}."
+    # One side is the other times words, each to the first power: what is
+    # left of each side once the other's symbols (at the same exponent) are
+    # taken away is empty on one side and plain words on the other.
+    left_over = {k: v for k, v in lc.items() if rc.get(k) != v}
+    right_over = {k: v for k, v in rc.items() if lc.get(k) != v}
+    smaller, larger = ((lc, right_over) if not left_over else
+                       (rc, left_over) if not right_over else (None, None))
+    if (smaller and larger and all(v == 1 for v in larger.values())
+            and not set(larger) & set(smaller)):
+        words = sorted(larger)
+        named = " and ".join(f"'{w}'" for w in words)
+        verb = "is a dimension" if len(words) == 1 else "are dimensions"
+        example = words[0]
+        message += (
+            f" {named} {verb} here: a string unit always is. If it labels a "
+            f"pure number (a factor, a share, a flag), declare it once - "
+            f"{example.upper() if example.isidentifier() else 'NAME'} = "
+            f"mo.Unit.dimensionless('{example}') - and set that object as the "
+            f"unit of the lines that carry it."
+        )
+    elif (smaller and larger and all(v == -1 for v in larger.values())
+            and not set(larger) & set(smaller)):
+        words = sorted(larger)
+        named = " and ".join(f"'{w}'" for w in words)
+        message += (f" One side is per {named}: it becomes an amount once "
+                    f"multiplied by a quantity in {named}")
+        word = words[0]
+        if len(words) == 1 and word.lower() in _YEAR_WORDS:
+            message += (
+                f" - the share of the year a period covers: "
+                f"year_share = (mo.time.months / 12).set_unit('{word}') for a "
+                f"fee or a salary, (mo.time.days / 365) for interest by the "
+                f"day - then rate * year_share."
+            )
+        elif len(words) == 1 and word.lower() in _MONTH_WORDS:
+            message += (
+                f" - the months a period covers: "
+                f"mo.time.months.set_unit('{word}'), then rate * that."
+            )
+        else:
+            message += "."
+    return message + (
+        " Otherwise convert one side to the other's unit before the "
+        "operation, or drop the unit on one side if the arithmetic is "
+        "intentional."
+    )
+
+
 class _VariableArithmetic:
     """Operator-overloading mixin for :class:`Variable`.
 
@@ -209,13 +340,15 @@ class _VariableArithmetic:
                 return a
             if _is_excel_error(b):
                 return b
-            # A HOLE is absence, not failure: an un-entered
-            # fact month propagates as a hole, so a formula over it
-            # reads "not known yet" — a blank cell — instead of
-            # filling every later period with #VALUE!. Genuine
-            # failures still absorb into an error token below.
-            if a is None or b is None:
-                return None
+            # A blank counts as zero, as in Excel: a formula over a
+            # month nobody entered computes over 0 (blank + 5 = 5,
+            # 5 / blank = #DIV/0!). Only an input cell stays blank;
+            # whether an actual was entered is the blend's question,
+            # asked of its entries (``core.entries``).
+            if a is None:
+                a = '' if isinstance(b, str) and op_symbol in _COMPARISONS else 0
+            if b is None:
+                b = '' if isinstance(a, str) and op_symbol in _COMPARISONS else 0
             if safe_divide and b == 0:
                 return '#DIV/0!'
             if isinstance(a, (date, timedelta)) or isinstance(b, (date, timedelta)):
@@ -295,16 +428,27 @@ class _VariableArithmetic:
         return None
 
     # ─── Units ──────────────────────────────────────────────────
+    #
+    # A Unit is a value: its algebra always builds a new one and nothing
+    # changes a unit once built. So when the result of ``*`` / ``/`` IS
+    # one operand's unit — the other side is unitless or dimensionless
+    # (``$ * %``, ``$ / 12``) — that operand's own unit is the answer,
+    # exactly as ``+`` / ``-`` already return theirs. Returning it avoids
+    # building an equal copy (and a dimensionless Unit for the bare side)
+    # on every operation; the algebra itself is unchanged.
 
     @staticmethod
     def _unit_mul(left_unit, right_unit):
         """Resulting unit for multiplication."""
         if left_unit is None and right_unit is None:
             return None
-        from .unit import Unit
-        lu = left_unit if left_unit is not None else Unit.dimensionless()
-        ru = right_unit if right_unit is not None else Unit.dimensionless()
-        result = lu * ru
+        left_c = left_unit._unit_components if left_unit is not None else None
+        right_c = right_unit._unit_components if right_unit is not None else None
+        if not right_c:
+            return left_unit if left_c else None
+        if not left_c:
+            return right_unit
+        result = left_unit * right_unit
         return result if result._unit_components else None
 
     @staticmethod
@@ -312,10 +456,13 @@ class _VariableArithmetic:
         """Resulting unit for division."""
         if left_unit is None and right_unit is None:
             return None
+        left_c = left_unit._unit_components if left_unit is not None else None
+        right_c = right_unit._unit_components if right_unit is not None else None
+        if not right_c:
+            return left_unit if left_c else None
         from .unit import Unit
         lu = left_unit if left_unit is not None else Unit.dimensionless()
-        ru = right_unit if right_unit is not None else Unit.dimensionless()
-        result = lu / ru
+        result = lu / right_unit
         return result if result._unit_components else None
 
     @staticmethod
@@ -330,12 +477,7 @@ class _VariableArithmetic:
             return None
         if left_unit is not None and right_unit is not None:
             if left_unit != right_unit:
-                raise ValueError(
-                    f"Cannot add/subtract values with incompatible units: "
-                    f"{left_unit} and {right_unit}. Either convert one side "
-                    f"to the other's unit before the operation, or drop the "
-                    f"unit on one side if the arithmetic is intentional."
-                )
+                raise ValueError(_incompatible_units(left_unit, right_unit))
             return left_unit
         return left_unit if left_unit is not None else right_unit
 
@@ -398,11 +540,12 @@ class _VariableArithmetic:
                 lv, rv = expanded
             aligned = self._align_by_date(left, right, lv, rv)
             if aligned is not None:
-                lv, rv, _union_start, _union_grain = aligned
+                lv, rv, _union_start, _union_grain, _union_first = aligned
                 # The result is located at the union window explicitly —
                 # downstream alignment then knows where it starts.
                 result._start = _union_start
                 result._grain = _union_grain
+                result._first_day = _union_first
             from .tracks import TrackValues
             if isinstance(lv, TrackValues) or isinstance(rv, TrackValues):
                 # The tracks broadcast law: zip per role;
@@ -419,7 +562,8 @@ class _VariableArithmetic:
                     lv, rv, op_func, safe_divide=safe_divide, op_symbol=op_symbol
                 )
             if unit_fn is not None:
-                result._unit = unit_fn(left._get_unit(), right._get_unit())
+                result._unit = _provisional_unit(
+                    unit_fn, left._get_unit(), right._get_unit(), left, right)
         else:
             from .tracks import TrackValues
 
@@ -446,7 +590,8 @@ class _VariableArithmetic:
             result._value = val
             if unit_fn is not None:
                 # Scalars are treated as dimensionless when computing the output unit
-                result._unit = unit_fn(None, self_u) if reversed else unit_fn(self_u, None)
+                result._unit = _provisional_unit(
+                    unit_fn, *((None, self_u) if reversed else (self_u, None)), self)
 
         if isinstance(result._value, list) and len(result._value) > 1:
             result.var_type = "list"
@@ -485,21 +630,27 @@ class _VariableArithmetic:
         from .variable import Variable
         if not isinstance(left, Variable) or not isinstance(right, Variable):
             return None
+        lt, rt = left.time, right.time
+        if (lt is not None and rt is not None and lt.start is not None
+                and rt.start is not None and lt.grain == rt.grain
+                and lt.first_day != rt.first_day):
+            # One side's first period is short. It may open the combined
+            # window, never sit inside it: on the other side the same
+            # period starts on another day. Tracked lines too.
+            stub, other = (left, right) if lt.first_day is not None else (right, left)
+            st, ot = stub.time, other.time
+            if ot.first_day is not None or st.start >= ot.start:
+                raise ValueError(_mixed_first_periods(left, lt, right, rt))
         if isinstance(lv, TrackValues) or isinstance(rv, TrackValues):
             return None  # tracks share the ambient window by the extent law
         if not isinstance(lv, list) or not isinstance(rv, list):
             return None
-        lt, rt = left.time, right.time
         if lt is None or rt is None or lt.start is None or rt.start is None:
             return None
         if lt.start == rt.start and len(lv) == len(rv):
             return None
         if lt.grain != rt.grain:
-            raise ValueError(
-                f"operands live at different grains ({lt.grain} vs "
-                f"{rt.grain}) — re-grain one side first (.at(grain=...)); "
-                f"date alignment only aligns within one grain."
-            )
+            raise ValueError(_mixed_grains(left, lt.grain, right, rt.grain))
         from .time import _count, _parse
         grain = lt.grain
         la, ra = _parse(lt.start, grain), _parse(rt.start, grain)
@@ -510,8 +661,18 @@ class _VariableArithmetic:
         off_r = 0 if rt.start <= lt.start else _count(la, ra, grain) - 1
         total = max(off_l + len(lv), off_r + len(rv))
         union_start = min(lt.start, rt.start)
+        union_first = lt.first_day if lt.start <= rt.start else rt.first_day
 
         def project(var: "Variable", vals: list, off: int, other: str) -> list:
+            from .expr import TimeRef
+            time_expr = getattr(var, '_expr', None)
+            if isinstance(time_expr, TimeRef):
+                # Time is defined in every period, not only the window's.
+                field = time_expr.field
+                if field == 'index':
+                    return [i - off + 1 for i in range(total)]
+                from .time import time_field_series
+                return time_field_series(field, union_start, grain, total, union_first)
             out = []
             rule = getattr(var, '_extend', None)
             for i in range(total):
@@ -540,7 +701,7 @@ class _VariableArithmetic:
         r_span = f"{len(lv)} period(s) from {lt.start}"
         return (project(left, lv, off_l, l_span),
                 project(right, rv, off_r, r_span),
-                union_start, grain)
+                union_start, grain, union_first)
 
     @staticmethod
     def _expand_axised_operands(left: Any, right: Any, lv: Any, rv: Any):
@@ -683,12 +844,27 @@ class _VariableArithmetic:
     def __neg__(self) -> "Variable":
         """-a (unary negation)"""
         from .variable import Variable
+        from .tracks import TrackValues
         result = Variable()
         result._set_expr(UnaryOp("-", self._as_operand(parenthesize=True)))
-        if isinstance(self._value, list):
-            result._value = [-x for x in self._value]
+
+        def neg(x):
+            if x is None:
+                return 0                # -blank is 0, as in Excel
+            if isinstance(x, str) and x.startswith('#'):
+                return x
+            try:
+                return -x
+            except TypeError:
+                return '#VALUE!'
+
+        def neg_series(v):
+            return [neg(x) for x in v] if isinstance(v, list) else neg(v)
+
+        if isinstance(self._value, TrackValues):
+            result._value = TrackValues.lift(neg_series, self._value)
         else:
-            result._value = -self._value
+            result._value = neg_series(self._value)
         result._unit = self._get_unit()
         result._keys = list(self._keys) if self._keys is not None else None
         result._indexed_by = getattr(self, '_indexed_by', ())

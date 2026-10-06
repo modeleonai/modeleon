@@ -16,7 +16,7 @@ time.
 """
 
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 
 @dataclass
@@ -37,8 +37,13 @@ class VariableAddresses:
                  (``["C4", "D4", "E4", ...]``). For a scalar Variable
                  this is a single-element list; for list Variables, one
                  entry per period.
+        opening: The row's cell in the opening column, just before its
+                 first period (``timeline={'opening': ...}``), or
+                 ``None`` when the sheet has no such column. The time
+                 rows fill it; every other row leaves it empty.
     """
 
     name: str
     formula: str
     values: List[str]
+    opening: Optional[str] = None

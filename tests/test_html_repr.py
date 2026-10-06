@@ -215,3 +215,10 @@ class TestModelHtmlPositional:
             r'<div class="mo-panel-title"[^>]*>([^<]+)</div>', html,
         )
         assert titles == ["Inputs", "Outputs"]
+
+
+class TestPrecedentCells:
+    def test_a_doubled_apostrophe_names_the_sheet(self):
+        from modeleon.display.html import _extract_precedent_cells
+        got = _extract_precedent_cells("='Bob''s time'!B2 * 2 + C3", "PL")
+        assert got == ["Bob's time!B2", "PL!C3"]

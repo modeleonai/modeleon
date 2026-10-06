@@ -13,22 +13,22 @@ from modeleon.compile.excel.view import ExcelView, resolve_excel_view
 
 
 def _model_with_view(view):
-    m = mo.Model("m", tracks=mo.Tracks("plan", "fact"),
+    m = mo.Model("m", tracks=mo.Tracks("plan", "actual"),
                  default_grain="month", default_start="2026-01",
                  default_periods=3)
     m.default_excel_view = view
     m.pnl = mo.MultiVariable(display_name="PnL")
-    m.pnl.revenue = mo.Variable(plan=[100.0] * 3, fact=[110.0, None, None])
+    m.pnl.revenue = mo.Variable(plan=[100.0] * 3, actual=[110.0, None, None])
     return m
 
 
 def test_dict_form_resolves_mode_and_shown():
     m = _model_with_view(ExcelView(
-        tracks={"mode": "blend", "shown": ["fact", "plan"]}
+        tracks={"mode": "blend", "shown": ["actual", "plan"]}
     ))
     rv = resolve_excel_view(m.pnl.revenue)
     assert rv.tracks == "blend"
-    assert rv.tracks_shown == ("fact", "plan")
+    assert rv.tracks_shown == ("actual", "plan")
 
 
 def test_string_form_unchanged_and_shown_stays_none():
@@ -51,7 +51,7 @@ def test_dict_form_emits_like_its_mode(tmp_path):
     # 'shown' is presentation metadata: the workbook is byte-equivalent to the
     # plain mode string — blend prints the single display-default row.
     m = _model_with_view(ExcelView(
-        tracks={"mode": "blend", "shown": ["fact", "plan"]}
+        tracks={"mode": "blend", "shown": ["actual", "plan"]}
     ))
     path = tmp_path / "t.xlsx"
     m.to_excel(str(path))
@@ -60,4 +60,4 @@ def test_dict_form_emits_like_its_mode(tmp_path):
     labels = [c.value for row in ws.iter_rows() for c in row
               if isinstance(c.value, str)]
     # blend mode: no per-track labeled rows
-    assert not any("· plan" in s or "· fact" in s for s in labels)
+    assert not any("· plan" in s or "· actual" in s for s in labels)

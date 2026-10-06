@@ -26,159 +26,159 @@ class TestConstruction:
     def test_tracked_variable(self):
         m = _model()
         with m:
-            m.x = mo.Variable(tracks={'план': [1.0] * 4, 'факт': [2.0] * 4})
+            m.x = mo.Variable(tracks={'plan': [1.0] * 4, 'actual': [2.0] * 4})
         assert isinstance(m.x._value, TrackValues)
-        assert set(m.x._value.roles) == {'план', 'факт'}
+        assert set(m.x._value.roles) == {'plan', 'actual'}
         assert m.x.var_type == 'list'
 
     def test_time_resolves_from_ambient(self):
         m = _model()
         with m:
-            m.x = mo.Variable(tracks={'план': [1.0] * 4})
+            m.x = mo.Variable(tracks={'plan': [1.0] * 4})
         assert m.x.time is not None and m.x.time.grain == 'month'
 
     def test_extent_law_applies_per_track(self):
         m = _model(24)
         with pytest.raises(ValueError, match="24-period window"):
             with m:
-                m.x = mo.Variable(tracks={'план': [1.0, 2.0]})
+                m.x = mo.Variable(tracks={'plan': [1.0, 2.0]})
 
     def test_ragged_tracks_rejected(self):
         with pytest.raises(ValueError, match="one time length"):
-            TrackValues({'план': [1.0, 2.0], 'факт': [1.0]})
+            TrackValues({'plan': [1.0, 2.0], 'actual': [1.0]})
 
     def test_nested_tracks_rejected(self):
         with pytest.raises(TypeError, match="second axis"):
-            TrackValues({'план': {'вложенный': [1.0]}})
+            TrackValues({'plan': {'nested': [1.0]}})
 
     def test_exclusive_with_value_and_indexed_by(self):
         with pytest.raises(ValueError, match="exclusive"):
-            mo.Variable([1.0], tracks={'план': [1.0]})
-        оси = mo.Variable(['a', 'b'])
+            mo.Variable([1.0], tracks={'plan': [1.0]})
+        axis = mo.Variable(['a', 'b'])
         with pytest.raises(ValueError, match="axis budget"):
-            mo.Variable(tracks={'план': [1.0, 2.0]}, indexed_by=[оси])
+            mo.Variable(tracks={'plan': [1.0, 2.0]}, indexed_by=[axis])
 
 
 class TestBroadcast:
     def _rev(self, m):
         with m:
-            m.выручка = mo.Variable(tracks={
-                'план': [100.0, 110.0, 120.0, 130.0],
-                'факт': [95.0, 118.0, 0.0, 0.0],
+            m.revenue = mo.Variable(tracks={
+                'plan': [100.0, 110.0, 120.0, 130.0],
+                'actual': [95.0, 118.0, 0.0, 0.0],
             })
-        return m.выручка
+        return m.revenue
 
     def test_tracked_minus_plain_broadcasts_into_every_role(self):
         m = _model()
         rev = self._rev(m)
         with m:
-            m.косты = mo.Variable([50.0] * 4)
-            m.маржа = rev - m.косты
-        v = m.маржа._value
+            m.costs = mo.Variable([50.0] * 4)
+            m.margin = rev - m.costs
+        v = m.margin._value
         assert isinstance(v, TrackValues)
-        assert v['план'] == [50.0, 60.0, 70.0, 80.0]
-        assert v['факт'] == [45.0, 68.0, -50.0, -50.0]
+        assert v['plan'] == [50.0, 60.0, 70.0, 80.0]
+        assert v['actual'] == [45.0, 68.0, -50.0, -50.0]
 
     def test_tracked_times_scalar(self):
         m = _model()
         rev = self._rev(m)
         with m:
-            m.удвоено = rev * 2
-        assert m.удвоено._value['план'] == [200.0, 220.0, 240.0, 260.0]
+            m.doubled = rev * 2
+        assert m.doubled._value['plan'] == [200.0, 220.0, 240.0, 260.0]
 
     def test_same_roles_zip_per_track(self):
         m = _model()
         with m:
-            m.a = mo.Variable(tracks={'план': [1.0] * 4, 'факт': [2.0] * 4})
-            m.b = mo.Variable(tracks={'план': [10.0] * 4, 'факт': [20.0] * 4})
+            m.a = mo.Variable(tracks={'plan': [1.0] * 4, 'actual': [2.0] * 4})
+            m.b = mo.Variable(tracks={'plan': [10.0] * 4, 'actual': [20.0] * 4})
             m.c = m.a + m.b
-        assert m.c._value['план'] == [11.0] * 4
-        assert m.c._value['факт'] == [22.0] * 4
+        assert m.c._value['plan'] == [11.0] * 4
+        assert m.c._value['actual'] == [22.0] * 4
 
     def test_mismatched_role_sets_die_loudly(self):
         m = _model()
         with m:
-            m.a = mo.Variable(tracks={'план': [1.0] * 4, 'факт': [2.0] * 4})
-            m.b = mo.Variable(tracks={'план': [1.0] * 4, 'база': [9.0] * 4})
+            m.a = mo.Variable(tracks={'plan': [1.0] * 4, 'actual': [2.0] * 4})
+            m.b = mo.Variable(tracks={'plan': [1.0] * 4, 'base': [9.0] * 4})
         with pytest.raises(ValueError, match="never silently intersects"):
             _ = m.a + m.b
 
     def test_comparison_lifts(self):
         m = _model()
         rev = self._rev(m)
-        флаг = rev > 100
-        assert флаг._value['план'] == [False, True, True, True]
+        flag = rev > 100
+        assert flag._value['plan'] == [False, True, True, True]
 
 
 class TestSlice:
     def test_at_basis_returns_the_track(self):
         m = _model()
         with m:
-            m.x = mo.Variable(tracks={'план': [1.0, 2.0, 3.0, 4.0],
-                                      'факт': [9.0] * 4})
-        срез = m.x.at(track='план')
-        assert срез._value == [1.0, 2.0, 3.0, 4.0]
-        assert isinstance(срез._expr, Restrict)
-        assert срез._expr.label == 'план'
+            m.x = mo.Variable(tracks={'plan': [1.0, 2.0, 3.0, 4.0],
+                                      'actual': [9.0] * 4})
+        sliced = m.x.at(track='plan')
+        assert sliced._value == [1.0, 2.0, 3.0, 4.0]
+        assert isinstance(sliced._expr, Restrict)
+        assert sliced._expr.label == 'plan'
 
     def test_variance_is_one_formula(self):
         m = _model()
         with m:
-            m.x = mo.Variable(tracks={'план': [100.0] * 4,
-                                      'факт': [95.0, 118.0, 0.0, 0.0]})
-            m.отклонение = m.x.at(track='факт') - m.x.at(track='план')
-        assert m.отклонение._value == [-5.0, 18.0, -100.0, -100.0]
+            m.x = mo.Variable(tracks={'plan': [100.0] * 4,
+                                      'actual': [95.0, 118.0, 0.0, 0.0]})
+            m.variance = m.x.at(track='actual') - m.x.at(track='plan')
+        assert m.variance._value == [-5.0, 18.0, -100.0, -100.0]
 
     def test_unknown_role_dies_with_the_declared_list(self):
-        x = mo.Variable(tracks={'план': [1.0, 2.0]})
-        with pytest.raises(ValueError, match="план"):
-            x.at(track='факт')
+        x = mo.Variable(tracks={'plan': [1.0, 2.0]})
+        with pytest.raises(ValueError, match="plan"):
+            x.at(track='actual')
 
     def test_at_basis_on_plain_variable_dies(self):
         with pytest.raises(ValueError, match="no track coordinates"):
-            mo.Variable([1.0, 2.0]).at(track='план')
+            mo.Variable([1.0, 2.0]).at(track='plan')
 
     def test_at_needs_something(self):
         with pytest.raises(TypeError, match="grain"):
-            mo.Variable(tracks={'план': [1.0]}).at()
+            mo.Variable(tracks={'plan': [1.0]}).at()
 
 
 class TestLifting:
     def _rev(self, m):
         with m:
-            m.выручка = mo.Variable(tracks={
-                'план': [100.0, 110.0, 120.0, 130.0],
-                'факт': [95.0, 118.0, 0.0, 0.0],
+            m.revenue = mo.Variable(tracks={
+                'plan': [100.0, 110.0, 120.0, 130.0],
+                'actual': [95.0, 118.0, 0.0, 0.0],
             })
-        return m.выручка
+        return m.revenue
 
     def test_lag_shifts_each_track(self):
         m = _model()
         rev = self._rev(m)
-        лаг = mo.lag(rev)
-        assert лаг._value['план'] == [0.0, 100.0, 110.0, 120.0]
-        assert лаг._value['факт'] == [0.0, 95.0, 118.0, 0.0]
+        lagged = mo.lag(rev)
+        assert lagged._value['plan'] == [0.0, 100.0, 110.0, 120.0]
+        assert lagged._value['actual'] == [0.0, 95.0, 118.0, 0.0]
 
     def test_cumsum_accumulates_each_track(self):
         m = _model()
         rev = self._rev(m)
         acc = mo.cumsum(rev)
-        assert acc._value['план'] == [100.0, 210.0, 330.0, 460.0]
-        assert acc._value['факт'] == [95.0, 213.0, 213.0, 213.0]
+        assert acc._value['plan'] == [100.0, 210.0, 330.0, 460.0]
+        assert acc._value['actual'] == [95.0, 213.0, 213.0, 213.0]
 
     def test_sum_reduces_each_track(self):
         m = _model()
         rev = self._rev(m)
-        итог = mo.SUM(rev)
-        assert итог._value['план'] == 460.0
-        assert итог._value['факт'] == 213.0
+        total = mo.SUM(rev)
+        assert total._value['plan'] == 460.0
+        assert total._value['actual'] == 213.0
 
     def test_if_lifts_across_roles(self):
         m = _model()
         rev = self._rev(m)
-        флаг = mo.IF(rev > 100, 1.0, 0.0)
-        assert флаг._value['план'] == [0.0, 1.0, 1.0, 1.0]
-        assert флаг._value['факт'] == [0.0, 1.0, 0.0, 0.0]
+        flag = mo.IF(rev > 100, 1.0, 0.0)
+        assert flag._value['plan'] == [0.0, 1.0, 1.0, 1.0]
+        assert flag._value['actual'] == [0.0, 1.0, 0.0, 0.0]
 
     def test_recurrence_with_tracked_driver_lifts(self):
         # Rank-lifted: one chain per track — see TestRecurrenceLift.
@@ -186,15 +186,15 @@ class TestLifting:
         rev = self._rev(m)
         r = mo.recurrence(start=0.0, formula="{prev} + {r}",
                           variables={"r": rev}, periods=4)
-        assert r._value['план'] == [0.0, 110.0, 230.0, 360.0]
-        assert r._value['факт'] == [0.0, 118.0, 118.0, 118.0]
+        assert r._value['plan'] == [0.0, 110.0, 230.0, 360.0]
+        assert r._value['actual'] == [0.0, 118.0, 118.0, 118.0]
 
 
 class TestGates:
     def _tracked(self):
         m = _model()
         with m:
-            m.x = mo.Variable(tracks={'план': [1.0] * 4, 'факт': [2.0] * 4},
+            m.x = mo.Variable(tracks={'plan': [1.0] * 4, 'actual': [2.0] * 4},
                               display_name='X')
         return m.x
 
@@ -204,12 +204,12 @@ class TestGates:
         m = _model(12)
         with m:
             m.x = mo.Variable(
-                tracks={'план': [1.0] * 12, 'факт': [2.0] * 12},
+                tracks={'plan': [1.0] * 12, 'actual': [2.0] * 12},
                 regrain=mo.up('sum'),
             )
         q = m.x.at('quarter')
-        assert q._value['план'] == [3.0] * 4
-        assert q._value['факт'] == [6.0] * 4
+        assert q._value['plan'] == [3.0] * 4
+        assert q._value['actual'] == [6.0] * 4
 
     def test_whole_cube_without_rule_still_teaches(self):
         with pytest.raises(ValueError, match="re-grain rule"):
@@ -219,10 +219,10 @@ class TestGates:
         m = _model(12)
         with m:
             m.x = mo.Variable(
-                tracks={'план': [1.0] * 12, 'факт': [2.0] * 12},
+                tracks={'plan': [1.0] * 12, 'actual': [2.0] * 12},
                 regrain=mo.up('sum'),
             )
-        q = m.x.at('quarter', track='план')
+        q = m.x.at('quarter', track='plan')
         assert q._value == [3.0, 3.0, 3.0, 3.0]
 
     def test_emission_expands_tracks_into_rows(self):
@@ -234,83 +234,85 @@ class TestGates:
         from openpyxl import load_workbook
         m = _model()
         with m:
-            m.x = mo.Variable(tracks={'план': [1.0] * 4, 'факт': [2.0] * 4},
-                              display_name='Икс')
-        p = os.path.join(tempfile.mkdtemp(), 'т.xlsx')
+            m.x = mo.Variable(tracks={'plan': [1.0] * 4, 'actual': [2.0] * 4},
+                              display_name='Ex')
+        p = os.path.join(tempfile.mkdtemp(), 't.xlsx')
         m.to_excel(p)
         labels = [r[0] for r in load_workbook(p).worksheets[0]
                   .iter_rows(min_row=2, max_row=3, max_col=1,
                              values_only=True)]
-        assert labels[0] == 'Икс'          # default row keeps the name
-        assert 'факт' in (labels[1] or '')  # the other track, labeled
+        assert labels[0] == 'Ex'             # default row keeps the name
+        assert 'actual' in (labels[1] or '')  # the other track, labeled
 
     def test_model_projection_projects_per_track(self):
         from modeleon.core.projection import project_variable
         m = _model(12)
         with m:
             m.x = mo.Variable(
-                tracks={'план': [1.0] * 12, 'факт': [2.0] * 12},
+                tracks={'plan': [1.0] * 12, 'actual': [2.0] * 12},
                 regrain=mo.up('sum'),
             )
         p = project_variable(m.x, 'quarter', {})
-        assert p._value['план'] == [3.0] * 4
-        assert p._value['факт'] == [6.0] * 4
+        assert p._value['plan'] == [3.0] * 4
+        assert p._value['actual'] == [6.0] * 4
 
 
 class TestRecurrenceLift:
     """Recurrence over tracks = N independent chains.
 
-    The план balance rolls over план flows, the факт balance over факт
-    flows. (The re-anchored chain of a blended model's ``live`` track is
-    covered by TestBlendLiveTrack, not this class.)
+    The plan balance rolls over plan flows, the actual balance over
+    actual flows. (The re-anchored chain of a blended model's ``live``
+    track is covered by TestBlendLiveTrack, not this class.)
     """
 
     def test_tracked_driver_rolls_per_track(self):
         m = _model()
         with m:
-            m.поток = mo.Variable(tracks={
-                'план': [100.0, 100.0, 100.0, 100.0],
-                'факт': [95.0, 120.0, 0.0, 0.0],
+            m.flow = mo.Variable(tracks={
+                'plan': [100.0, 100.0, 100.0, 100.0],
+                'actual': [95.0, 120.0, 0.0, 0.0],
             })
-            m.остаток = mo.recurrence(
-                start=1000.0, formula="{prev} + {п}",
-                variables={"п": m.поток},
+            m.balance = mo.recurrence(
+                start=1000.0, formula="{prev} + {f}",
+                variables={"f": m.flow},
             )
-        assert m.остаток._value['план'] == [1000.0, 1100.0, 1200.0, 1300.0]
-        assert m.остаток._value['факт'] == [1000.0, 1120.0, 1120.0, 1120.0]
+        assert m.balance._value['plan'] == [1000.0, 1100.0, 1200.0, 1300.0]
+        assert m.balance._value['actual'] == [1000.0, 1120.0, 1120.0, 1120.0]
 
     def test_tracked_start_spawns_chains(self):
         m = _model(3)
         with m:
-            m.старт = mo.Variable(tracks={'план': 10.0, 'факт': 20.0})
-            m.ряд = mo.recurrence(start=m.старт, formula="{prev} * 2",
-                                  periods=3)
-        assert m.ряд._value['план'] == [10.0, 20.0, 40.0]
-        assert m.ряд._value['факт'] == [20.0, 40.0, 80.0]
+            m.opening = mo.Variable(tracks={'plan': 10.0, 'actual': 20.0})
+            m.chain = mo.recurrence(start=m.opening, formula="{prev} * 2",
+                                    periods=3)
+        assert m.chain._value['plan'] == [10.0, 20.0, 40.0]
+        assert m.chain._value['actual'] == [20.0, 40.0, 80.0]
 
     def test_mismatched_role_sets_die(self):
         m = _model()
         with m:
-            m.а = mo.Variable(tracks={'план': [1.0] * 4, 'факт': [2.0] * 4})
-            m.б = mo.Variable(tracks={'план': [1.0] * 4, 'база': [9.0] * 4})
+            m.a = mo.Variable(tracks={'plan': [1.0] * 4, 'actual': [2.0] * 4})
+            m.b = mo.Variable(tracks={'plan': [1.0] * 4, 'base': [9.0] * 4})
         with pytest.raises(ValueError, match="differ"):
             mo.recurrence(start=0.0, formula="{prev} + {a} + {b}",
-                          variables={"a": m.а, "b": m.б})
+                          variables={"a": m.a, "b": m.b})
 
     def test_lambda_mode_lifts_too(self):
         m = _model(3)
         with m:
-            m.старт = mo.Variable(tracks={'план': 1.0, 'факт': 2.0})
-            m.р = mo.recurrence(start=m.старт,
+            m.opening = mo.Variable(tracks={'plan': 1.0, 'actual': 2.0})
+            m.r = mo.recurrence(start=m.opening,
                                 formula=lambda prev, t: prev + 1, periods=3)
-        assert m.р._value['план'] == [1.0, 2.0, 3.0]
-        assert m.р._value['факт'] == [2.0, 3.0, 4.0]
+        assert m.r._value['plan'] == [1.0, 2.0, 3.0]
+        assert m.r._value['actual'] == [2.0, 3.0, 4.0]
 
 
 class TestCyrillicPlaceholders:
     def test_cyrillic_template_names_substitute(self):
-        # Была ASCII-only регулярка: «{п}» не подставлялся и парсился
-        # как set-литерал. Имена в моделях бывают на любом языке.
+        # The placeholder regex used to be ASCII-only: a Cyrillic "{п}"
+        # was not substituted and parsed as a set literal. Names in a
+        # model can be in any language — the non-Latin name below is
+        # deliberate.
         r = mo.recurrence(start=0.0, formula="{prev} + {доход}",
                           variables={"доход": mo.Variable([1.0, 2.0, 3.0])})
         assert r._value == [0.0, 2.0, 5.0]
@@ -328,21 +330,21 @@ class TestDateAlignment:
     def test_flow_extends_with_zeros(self):
         m = self._m()
         with m:
-            m.выручка = mo.Variable([100.0] * 6)
-            m.бонус = mo.Variable([10.0] * 3, start='2025-04',
+            m.revenue = mo.Variable([100.0] * 6)
+            m.bonus = mo.Variable([10.0] * 3, start='2025-04',
                                   grain='month', extend=mo.zero())
-            m.итого = m.выручка + m.бонус
-        assert m.итого._value == [100.0, 100.0, 100.0, 110.0, 110.0, 110.0]
+            m.total = m.revenue + m.bonus
+        assert m.total._value == [100.0, 100.0, 100.0, 110.0, 110.0, 110.0]
 
     def test_rate_holds_forward_and_backward(self):
         m = self._m()
         with m:
-            m.база = mo.Variable([100.0] * 6)
-            m.ставка = mo.Variable([0.10, 0.12], start='2025-05',
-                                   grain='month', extend=mo.hold())
-            m.налог = m.база * m.ставка
-        # назад — первым значением, вперёд — последним.
-        assert m.налог._value == [10.0, 10.0, 10.0, 10.0, 10.0, 12.0]
+            m.base = mo.Variable([100.0] * 6)
+            m.rate = mo.Variable([0.10, 0.12], start='2025-05',
+                                 grain='month', extend=mo.hold())
+            m.fee = m.base * m.rate
+        # Backward with the first value, forward with the last.
+        assert m.fee._value == [10.0, 10.0, 10.0, 10.0, 10.0, 12.0]
 
     def test_result_is_located_at_the_union(self):
         m = self._m()
@@ -364,7 +366,7 @@ class TestDateAlignment:
                 m.x = m.a + m.b
 
     def test_same_window_stays_positional(self):
-        # Быстрый путь не трогается — байт-в-байт как раньше.
+        # The fast path is untouched — byte-for-byte as before.
         m = self._m()
         with m:
             m.a = mo.Variable([1.0] * 6)
@@ -383,12 +385,12 @@ class TestAggregateLifts:
     def test_max_min_average_reduce_per_track(self):
         m = _model()
         with m:
-            m.x = mo.Variable(tracks={'план': [1.0, 5.0, 3.0, 2.0],
-                                      'факт': [9.0, 0.0, 0.0, 0.0]})
-        assert dict(mo.MAX(m.x)._value.items()) == {'план': 5.0, 'факт': 9.0}
-        assert dict(mo.MIN(m.x)._value.items()) == {'план': 1.0, 'факт': 0.0}
+            m.x = mo.Variable(tracks={'plan': [1.0, 5.0, 3.0, 2.0],
+                                      'actual': [9.0, 0.0, 0.0, 0.0]})
+        assert dict(mo.MAX(m.x)._value.items()) == {'plan': 5.0, 'actual': 9.0}
+        assert dict(mo.MIN(m.x)._value.items()) == {'plan': 1.0, 'actual': 0.0}
         assert dict(mo.AVERAGE(m.x)._value.items()) == {
-            'план': 2.75, 'факт': 2.25,
+            'plan': 2.75, 'actual': 2.25,
         }
 
 
@@ -396,8 +398,8 @@ class TestAggregateLifts:
 
 
 def _declared(periods: int = 6, **decl_labels) -> "mo.Model":
-    labels = decl_labels or {'actual': 'факт', 'plan': 'бюджет'}
-    return mo.Model('м', tracks=mo.Tracks(**labels),
+    labels = decl_labels or {'actual': 'Actual', 'plan': 'Budget'}
+    return mo.Model('m', tracks=mo.Tracks(**labels),
                     default_grain='month', default_start='2025-01',
                     default_periods=periods)
 
@@ -406,27 +408,29 @@ class TestTracksDeclaration:
     def test_declaration_on_model(self):
         m = _declared()
         assert m.tracks.names == ('actual', 'plan')
-        assert m.tracks.label('plan') == 'бюджет'
+        assert m.tracks.label('plan') == 'Budget'
 
     def test_names_are_user_content(self):
         """Any words, any language, any count — the engine attaches no
         semantics to a track name."""
-        d = mo.Tracks('факт', 'бюджет_утв', 'бюджет_корр')
-        assert d.names == ('факт', 'бюджет_утв', 'бюджет_корр')
-        assert d.label('факт') == 'факт'   # positional: name is the label
+        # The non-Latin name is deliberate: a track name may be in any
+        # script.
+        d = mo.Tracks('actual', 'budget_approved', 'бюджет')
+        assert d.names == ('actual', 'budget_approved', 'бюджет')
+        assert d.label('actual') == 'actual'   # positional: name is the label
 
     def test_labeled_spelling(self):
-        d = mo.Tracks('факт', бюджет='Бюджет 2026')
-        assert d.names == ('факт', 'бюджет')
-        assert d.label('бюджет') == 'Бюджет 2026'
+        d = mo.Tracks('actual', budget='Budget 2026')
+        assert d.names == ('actual', 'budget')
+        assert d.label('budget') == 'Budget 2026'
 
     def test_single_track_is_legal(self):
-        m = mo.Model('м', tracks=mo.Tracks('план'),
+        m = mo.Model('m', tracks=mo.Tracks('plan'),
                      default_grain='month', default_start='2025-01',
                      default_periods=3)
         with m:
-            m.x = mo.Variable(план=[1, 2, 3])
-        assert m.x._value['план'] == [1, 2, 3]
+            m.x = mo.Variable(plan=[1, 2, 3])
+        assert m.x._value['plan'] == [1, 2, 3]
 
     def test_empty_declaration_refused(self):
         with pytest.raises(TypeError, match="name them"):
@@ -434,23 +438,23 @@ class TestTracksDeclaration:
 
     def test_declaration_must_be_tracks(self):
         with pytest.raises(TypeError, match="mo.Tracks"):
-            mo.Model('t', tracks={'факт': 'ф'})
+            mo.Model('t', tracks={'actual': 'a'})
 
     def test_labels_are_nonempty_strings(self):
         with pytest.raises(TypeError, match="non-empty"):
-            mo.Tracks(факт='')
+            mo.Tracks(actual='')
 
 
 class TestRoleKwargAuthoring:
     def test_role_lists_materialize(self):
         m = _declared()
         with m:
-            m.выручка = mo.Variable(actual=[1] * 6, plan=[10] * 6)
-        v = m.выручка._value
+            m.revenue = mo.Variable(actual=[1] * 6, plan=[10] * 6)
+        v = m.revenue._value
         assert isinstance(v, TrackValues)
         assert v.roles == ('actual', 'plan')
         assert v['plan'] == [10] * 6
-        assert m.выручка.var_type == 'list'
+        assert m.revenue.var_type == 'list'
 
     def test_arithmetic_broadcasts(self):
         m = _declared()
@@ -461,18 +465,18 @@ class TestRoleKwargAuthoring:
         assert m.b._value['plan'] == [20] * 6
 
     def test_pin_spelling_shared_formula(self):
-        """Positional shared expression + факт override."""
+        """Positional shared expression + actual override."""
         m = _declared()
         with m:
-            m.цена = mo.Variable(10)
-            m.штук = mo.Variable([1, 1, 2, 2, 3, 3])
-            m.доход = mo.Variable(m.цена * m.штук,
-                                  actual=[9, 11, 22, 18, 33, 27])
-        d = m.доход._value
+            m.price = mo.Variable(10)
+            m.units = mo.Variable([1, 1, 2, 2, 3, 3])
+            m.income = mo.Variable(m.price * m.units,
+                                   actual=[9, 11, 22, 18, 33, 27])
+        d = m.income._value
         assert d['plan'] == [10, 10, 20, 20, 30, 30]
         assert d['actual'] == [9, 11, 22, 18, 33, 27]
         # the shared expression stays the canonical formula
-        assert m.доход._expr is not None
+        assert m.income._expr is not None
 
     def test_coordinate_aligned_pull(self):
         """A tracked operand contributes its own same-role track."""
@@ -486,9 +490,9 @@ class TestRoleKwargAuthoring:
     def test_variable_operand_is_dep_edge(self):
         m = _declared()
         with m:
-            m.источник = mo.Variable([5] * 6)
-            m.привязка = mo.Variable(plan=[1] * 6, actual=m.источник)
-        assert m.источник in m.привязка._dependency_refs
+            m.feed = mo.Variable([5] * 6)
+            m.linked = mo.Variable(plan=[1] * 6, actual=m.feed)
+        assert m.feed in m.linked._dependency_refs
 
     def test_slice_after_materialization(self):
         m = _declared()
@@ -499,7 +503,7 @@ class TestRoleKwargAuthoring:
 
 class TestRoleKwargGates:
     def test_no_declaration_teaches(self):
-        m = mo.Model('без', default_grain='month',
+        m = mo.Model('bare', default_grain='month',
                      default_start='2025-01', default_periods=3)
         with pytest.raises(ValueError, match="mo.Tracks"):
             with m:
@@ -529,7 +533,7 @@ class TestRoleKwargGates:
 
     def test_roles_exclusive_with_tracks(self):
         with pytest.raises(ValueError, match="two spellings"):
-            mo.Variable(tracks={'факт': [1]}, actual=[1])
+            mo.Variable(tracks={'plan': [1]}, actual=[1])
 
     def test_roles_exclusive_with_indexed_by(self):
         axis = mo.Variable(['a', 'b'])
@@ -552,12 +556,12 @@ class TestRoleKwargLifecycle:
         list-valued operands crashed, equal scalars dropped the edge."""
         m = _declared()
         with m:
-            m.бюджет = mo.Variable([1.0] * 6)
-            m.леджер = mo.Variable([2.0] * 6)
-            m.выручка = mo.Variable(plan=m.бюджет, actual=m.леджер)
-        refs = m.выручка._dependency_refs
-        assert any(r is m.бюджет for r in refs)
-        assert any(r is m.леджер for r in refs)
+            m.budget = mo.Variable([1.0] * 6)
+            m.ledger = mo.Variable([2.0] * 6)
+            m.revenue = mo.Variable(plan=m.budget, actual=m.ledger)
+        refs = m.revenue._dependency_refs
+        assert any(r is m.budget for r in refs)
+        assert any(r is m.ledger for r in refs)
 
     def test_equal_scalar_operands_keep_both_edges(self):
         m = _declared()
@@ -574,22 +578,22 @@ class TestRoleKwargLifecycle:
         discarded the overrides."""
         m = _declared()
         with m:
-            m.цена = mo.Variable(actual=[10.0] * 6, plan=[10.0] * 6)
-            m.штук = mo.Variable([1.0, 1.0, 2.0, 2.0, 3.0, 3.0])
-            m.доход = mo.Variable(m.цена * m.штук,
-                                  actual=[9.0, 11.0, 22.0, 18.0, 33.0, 27.0])
-        d = m.доход._value
+            m.price = mo.Variable(actual=[10.0] * 6, plan=[10.0] * 6)
+            m.units = mo.Variable([1.0, 1.0, 2.0, 2.0, 3.0, 3.0])
+            m.income = mo.Variable(m.price * m.units,
+                                   actual=[9.0, 11.0, 22.0, 18.0, 33.0, 27.0])
+        d = m.income._value
         assert d['actual'] == [9.0, 11.0, 22.0, 18.0, 33.0, 27.0]
         assert d['plan'] == [10.0, 10.0, 20.0, 20.0, 30.0, 30.0]
 
     def test_tracked_shared_variable_does_not_alias(self):
         m = _declared()
         with m:
-            m.бюджет = mo.Variable(actual=[1.0] * 6, plan=[2.0] * 6)
-            m.версия = mo.Variable(m.бюджет, actual=[9.0] * 6)
-        assert m.версия._value['actual'] == [9.0] * 6
-        assert m.версия._value['plan'] == [2.0] * 6
-        assert m.версия._value is not m.бюджет._value
+            m.budget = mo.Variable(actual=[1.0] * 6, plan=[2.0] * 6)
+            m.revision = mo.Variable(m.budget, actual=[9.0] * 6)
+        assert m.revision._value['actual'] == [9.0] * 6
+        assert m.revision._value['plan'] == [2.0] * 6
+        assert m.revision._value is not m.budget._value
 
     def test_consumer_before_operand_now_works(self):
         """Pure track kwargs materialize AT CONSTRUCTION (from their own
@@ -616,7 +620,7 @@ class TestRoleKwargLifecycle:
         pnl = mo.MultiVariable('pnl', default_grain='month',
                                default_start='2025-01', default_periods=6)
         pnl.rev = mo.Variable(actual=[1.0] * 6, plan=[2.0] * 6)
-        m = mo.Model('м', tracks=mo.Tracks(actual='факт', plan='бюджет'))
+        m = mo.Model('m', tracks=mo.Tracks(actual='Actual', plan='Budget'))
         m.pnl = pnl
         assert isinstance(m.pnl.rev._value, TrackValues)
         assert m.pnl.rev._value['plan'] == [2.0] * 6
@@ -626,7 +630,7 @@ class TestRoleKwargLifecycle:
             'pnl2', default_grain='month', default_start='2025-01',
             default_periods=6,
             rev=mo.Variable(actual=[1.0] * 6, plan=[2.0] * 6))
-        m = mo.Model('м', tracks=mo.Tracks(actual='факт', plan='бюджет'))
+        m = mo.Model('m', tracks=mo.Tracks(actual='Actual', plan='Budget'))
         m.pnl2 = pnl
         assert isinstance(m.pnl2.rev._value, TrackValues)
 
@@ -655,13 +659,13 @@ class TestRoleKwargLifecycle:
     def test_plain_schedule_wrapper_materializes(self):
         m = _declared(periods=3)
         with m:
-            m.ставка = mo.Variable(mo.schedule({'2025-01': 0.12}))
-        assert m.ставка._value == [0.12, 0.12, 0.12]
+            m.rate = mo.Variable(mo.schedule({'2025-01': 0.12}))
+        assert m.rate._value == [0.12, 0.12, 0.12]
 
     def test_windowless_model_scalar_roles_materialize(self):
         """The window gate swallowed role materialization; scalar tracks
         need no window (time lives inside a track)."""
-        m = mo.Model('м', tracks=mo.Tracks(actual='факт', plan='бюджет'))
+        m = mo.Model('m', tracks=mo.Tracks(actual='Actual', plan='Budget'))
         with m:
             m.kpi = mo.Variable(actual=100.0, plan=120.0)
         assert isinstance(m.kpi._value, TrackValues)
@@ -705,19 +709,19 @@ class TestRoleKwargLifecycle:
 
     def test_none_track_rejected_by_value_layer(self):
         with pytest.raises(TypeError, match="None"):
-            TrackValues({'факт': [1.0], 'план': None})
+            TrackValues({'actual': [1.0], 'plan': None})
 
 
 class TestDottedCoordinateRead:
-    """``выручка.факт`` reads a coordinate — sugar over
+    """``revenue.actual`` reads a coordinate — sugar over
     ``.at(track=...)``, real attributes always win (getattr fires only
     on lookup miss)."""
 
     def test_dotted_read_equals_at(self):
         m = _declared()
         with m:
-            m.выручка = mo.Variable(actual=[1.0] * 6, plan=[2.0] * 6)
-        assert m.выручка.actual._value == m.выручка.at(track='actual')._value
+            m.revenue = mo.Variable(actual=[1.0] * 6, plan=[2.0] * 6)
+        assert m.revenue.actual._value == m.revenue.at(track='actual')._value
 
     def test_dotted_read_in_formula(self):
         m = _declared()
@@ -743,22 +747,22 @@ class TestDottedCoordinateRead:
     def test_plain_variable_unchanged(self):
         v = mo.Variable([1.0, 2.0])
         with pytest.raises(AttributeError):
-            v.несуществующее
+            v.nonexistent
 
 
 class TestDottedTrackWrite:
-    """MV-style incremental write — ``выручка.факт = [...]`` as
+    """MV-style incremental write — ``revenue.actual = [...]`` as
     its own statement, after the definition, without rewriting it."""
 
     def test_incremental_authoring(self):
         m = _declared()
         with m:
-            m.выручка = mo.Variable()
-        m.выручка.actual = [1.0] * 6
-        m.выручка.plan = [2.0] * 6
-        assert m.выручка._value['actual'] == [1.0] * 6
-        assert m.выручка._value['plan'] == [2.0] * 6
-        assert m.выручка.var_type == 'list'
+            m.revenue = mo.Variable()
+        m.revenue.actual = [1.0] * 6
+        m.revenue.plan = [2.0] * 6
+        assert m.revenue._value['actual'] == [1.0] * 6
+        assert m.revenue._value['plan'] == [2.0] * 6
+        assert m.revenue.var_type == 'list'
 
     def test_pin_over_shared_formula(self):
         """The line has ONE formula; the actual arrives afterwards, bound
@@ -766,21 +770,21 @@ class TestDottedTrackWrite:
         (given beats derived)."""
         m = _declared()
         with m:
-            m.цена = mo.Variable([10.0] * 6)
-            m.штук = mo.Variable([2.0] * 6)
-            m.доход = mo.Variable(m.цена * m.штук)
-        m.доход.actual = [19.0, 21.0, 20.0, 20.0, 20.0, 18.0]
-        v = m.доход._value
+            m.price = mo.Variable([10.0] * 6)
+            m.units = mo.Variable([2.0] * 6)
+            m.income = mo.Variable(m.price * m.units)
+        m.income.actual = [19.0, 21.0, 20.0, 20.0, 20.0, 18.0]
+        v = m.income._value
         assert v['plan'] == [20.0] * 6                    # formula-derived
         assert v['actual'] == [19.0, 21.0, 20.0, 20.0, 20.0, 18.0]
-        assert m.доход.formula == 'цена * штук'           # ONE formula, intact
+        assert m.income.formula == 'price * units'        # ONE formula, intact
 
     def test_undeclared_name_teaches(self):
         m = _declared()
         with m:
             m.x = mo.Variable(actual=[1.0] * 6, plan=[1.0] * 6)
         with pytest.raises(ValueError, match="declared track"):
-            m.x.буджет = [1.0] * 6      # typo of бюджет
+            m.x.plam = [1.0] * 6      # typo of plan
 
     def test_wrong_length_refused(self):
         m = _declared()
@@ -792,10 +796,10 @@ class TestDottedTrackWrite:
     def test_variable_operand_becomes_dep_edge(self):
         m = _declared()
         with m:
-            m.леджер = mo.Variable([5.0] * 6)
+            m.ledger = mo.Variable([5.0] * 6)
             m.x = mo.Variable(plan=[1.0] * 6)
-        m.x.actual = m.леджер
-        assert any(r is m.леджер for r in m.x._dependency_refs)
+        m.x.actual = m.ledger
+        assert any(r is m.ledger for r in m.x._dependency_refs)
         assert m.x._value['actual'] == [5.0] * 6
 
     def test_floating_binding_stashes_until_adoption(self):
@@ -819,100 +823,100 @@ class TestBlendLiveTrack:
     """The blended ``live`` track is a coordinate of its own, computed
     like any other track. Data lines splice givens; memoryless
     formulas coincide with the splice via broadcast; stateful chains
-    re-anchor because they roll over live operand flows. План is never
-    rewritten."""
+    re-anchor because they roll over live operand flows. The plan (here
+    the budget) is never rewritten."""
 
     def _m(self, until='2025-02', periods=4):
-        return mo.Model('м',
-            tracks=mo.Tracks('факт', 'бюджет',
-                             blend=mo.blend(given='факт', follow='бюджет',
+        return mo.Model('m',
+            tracks=mo.Tracks('actual', 'budget',
+                             blend=mo.blend(given='actual', follow='budget',
                                             until=until)),
             default_grain='month', default_start='2025-01',
             default_periods=periods)
 
     def _flows(self, m):
         with m:
-            m.поток = mo.Variable(факт=[8.0, 7.0, 0.0, 0.0],
-                                  бюджет=[10.0] * 4)
-        return m.поток
+            m.flow = mo.Variable(actual=[8.0, 7.0, 0.0, 0.0],
+                                 budget=[10.0] * 4)
+        return m.flow
 
     def test_data_line_splices_givens(self):
         m = self._m()
-        поток = self._flows(m)
-        v = поток._value
+        flow = self._flows(m)
+        v = flow._value
         assert v['live'] == [8.0, 7.0, 10.0, 10.0]
-        assert v['факт'] == [8.0, 7.0, 0.0, 0.0]      # untouched
-        assert v['бюджет'] == [10.0] * 4              # план inviolable
+        assert v['actual'] == [8.0, 7.0, 0.0, 0.0]    # untouched
+        assert v['budget'] == [10.0] * 4              # the plan is inviolable
 
     def test_memoryless_formula_coincides_with_splice(self):
         m = self._m()
-        поток = self._flows(m)
+        flow = self._flows(m)
         with m:
-            m.двойной = поток * 2
-        assert m.двойной._value['live'] == [16.0, 14.0, 20.0, 20.0]
+            m.doubled = flow * 2
+        assert m.doubled._value['live'] == [16.0, 14.0, 20.0, 20.0]
 
     def test_recurrence_re_anchors(self):
-        """live[t>close] continues LIVE's own past, not план's — the
+        """live[t>close] continues LIVE's own past, not the plan's — the
         whole reason live is a track of its own, not an output splice."""
         m = self._m()
-        поток = self._flows(m)
+        flow = self._flows(m)
         with m:
-            m.остаток = mo.recurrence(start=0.0, formula="{prev} + {п}",
-                                      variables={"п": поток}, periods=4)
-        o = m.остаток._value
-        assert o['бюджет'] == [0.0, 10.0, 20.0, 30.0]  # план from план
-        assert o['факт'] == [0.0, 7.0, 7.0, 7.0]
-        assert o['live'] == [0.0, 7.0, 17.0, 27.0]     # 17 ≠ план's 20
+            m.balance = mo.recurrence(start=0.0, formula="{prev} + {f}",
+                                      variables={"f": flow}, periods=4)
+        o = m.balance._value
+        assert o['budget'] == [0.0, 10.0, 20.0, 30.0]  # plan from plan
+        assert o['actual'] == [0.0, 7.0, 7.0, 7.0]
+        assert o['live'] == [0.0, 7.0, 17.0, 27.0]     # 17 ≠ the plan's 20
         assert o['live'][2] == o['live'][1] + 10.0     # re-anchored
 
     def test_cumsum_re_anchors(self):
         m = self._m()
-        поток = self._flows(m)
-        acc = mo.cumsum(поток)
+        flow = self._flows(m)
+        acc = mo.cumsum(flow)
         assert acc._value['live'] == [8.0, 15.0, 25.0, 35.0]
 
     def test_moving_the_boundary_re_splices(self):
         m = self._m(until='2025-01')
-        поток = self._flows(m)
-        assert поток._value['live'] == [8.0, 10.0, 10.0, 10.0]
+        flow = self._flows(m)
+        assert flow._value['live'] == [8.0, 10.0, 10.0, 10.0]
 
     def test_missing_given_falls_back_to_follow(self):
         m = self._m()
         with m:
-            m.аренда = mo.Variable(бюджет=[50.0] * 4)
-        assert m.аренда._value['live'] == [50.0] * 4
+            m.rent = mo.Variable(budget=[50.0] * 4)
+        assert m.rent._value['live'] == [50.0] * 4
 
     def test_dotted_and_at_slices_reach_live(self):
         m = self._m()
-        поток = self._flows(m)
-        assert поток.live._value == [8.0, 7.0, 10.0, 10.0]
-        assert поток.at(track='live')._value == [8.0, 7.0, 10.0, 10.0]
+        flow = self._flows(m)
+        assert flow.live._value == [8.0, 7.0, 10.0, 10.0]
+        assert flow.at(track='live')._value == [8.0, 7.0, 10.0, 10.0]
 
     def test_dotted_binding_re_splices(self):
         m = self._m()
         with m:
-            m.поток = mo.Variable(бюджет=[10.0] * 4)
-        assert m.поток._value['live'] == [10.0] * 4
-        m.поток.факт = [8.0, 7.0, 0.0, 0.0]
-        assert m.поток._value['live'] == [8.0, 7.0, 10.0, 10.0]
+            m.flow = mo.Variable(budget=[10.0] * 4)
+        assert m.flow._value['live'] == [10.0] * 4
+        m.flow.actual = [8.0, 7.0, 0.0, 0.0]
+        assert m.flow._value['live'] == [8.0, 7.0, 10.0, 10.0]
 
     def test_blend_validates_declared_tracks(self):
         with pytest.raises(ValueError, match="not\\s+declared"):
-            mo.Tracks('факт', blend=mo.blend(given='факт', follow='план',
-                                             until='x'))
+            mo.Tracks('actual', blend=mo.blend(given='actual', follow='plan',
+                                               until='x'))
         with pytest.raises(ValueError, match="same track"):
-            mo.blend(given='факт', follow='факт', until='x')
+            mo.blend(given='actual', follow='actual', until='x')
         with pytest.raises(ValueError, match="collides"):
-            mo.Tracks('факт', 'бюджет', 'live',
-                      blend=mo.blend(given='факт', follow='бюджет',
+            mo.Tracks('actual', 'budget', 'live',
+                      blend=mo.blend(given='actual', follow='budget',
                                      until='x'))
 
     def test_no_blend_no_live(self):
-        m = mo.Model('м', tracks=mo.Tracks('факт', 'бюджет'),
+        m = mo.Model('m', tracks=mo.Tracks('actual', 'budget'),
                      default_grain='month', default_start='2025-01',
                      default_periods=4)
         with m:
-            m.x = mo.Variable(факт=[1.0] * 4, бюджет=[2.0] * 4)
+            m.x = mo.Variable(actual=[1.0] * 4, budget=[2.0] * 4)
         assert 'live' not in m.x._value.roles
 
 
@@ -927,46 +931,46 @@ class TestRoleBoundCompoundLists:
     """
 
     def _m(self):
-        return mo.Model('м',
-            tracks=mo.Tracks('план', 'прогноз', 'факт',
-                             blend=mo.blend(given='факт', follow='прогноз')),
+        return mo.Model('m',
+            tracks=mo.Tracks('plan', 'forecast', 'actual',
+                             blend=mo.blend(given='actual', follow='forecast')),
             default_grain='month', default_start='2026-01',
             default_periods=3)
 
     def test_variable_elements_lower_to_values(self):
         m = self._m()
         with m:
-            m.входы = mo.MultiVariable('Входы')
-            with m.входы as вх:
-                вх.сумма = mo.Variable(10.0)
-            ряд = [mo.Variable(0.0), вх.сумма, mo.Variable(0.0)]
-            m.x = mo.Variable(план=ряд, прогноз=ряд, факт=[None] * 3)
+            m.inputs = mo.MultiVariable('Inputs')
+            with m.inputs as inp:
+                inp.amount = mo.Variable(10.0)
+            row = [mo.Variable(0.0), inp.amount, mo.Variable(0.0)]
+            m.x = mo.Variable(plan=row, forecast=row, actual=[None] * 3)
         v = m.x._value
-        for role in ('план', 'прогноз'):
+        for role in ('plan', 'forecast'):
             assert v[role] == [0.0, 10.0, 0.0]
             assert all(not isinstance(c, mo.Variable) for c in v[role])
-        assert v['факт'] == [None, None, None]
+        assert v['actual'] == [None, None, None]
 
     def test_lowered_elements_keep_dependency_edges(self):
         m = self._m()
         with m:
-            m.входы = mo.MultiVariable('Входы')
-            with m.входы as вх:
-                вх.сумма = mo.Variable(10.0)
-            m.x = mo.Variable(план=[вх.сумма, 0.0, 0.0], факт=[None] * 3)
-        assert any(d is m.входы.сумма for d in m.x._dependency_refs)
+            m.inputs = mo.MultiVariable('Inputs')
+            with m.inputs as inp:
+                inp.amount = mo.Variable(10.0)
+            m.x = mo.Variable(plan=[inp.amount, 0.0, 0.0], actual=[None] * 3)
+        assert any(d is m.inputs.amount for d in m.x._dependency_refs)
 
     def test_valueless_element_is_loud(self):
         m = self._m()
         with m:
-            призрак = mo.Variable(formula='deferred')
-            призрак._value = None
+            ghost = mo.Variable(formula='deferred')
+            ghost._value = None
             with pytest.raises(ValueError):
-                m.x = mo.Variable(план=[призрак, 0.0, 0.0])
+                m.x = mo.Variable(plan=[ghost, 0.0, 0.0])
 
 
 class TestBlendWithoutBoundary:
-    """``mo.blend`` without ``until`` — facts that arrive as events.
+    """``mo.blend`` without ``until`` — actuals that arrive as events.
 
     A boundary is a promise that the given track is complete up to a
     date. Facts entered as they happen make no such promise: they
@@ -977,72 +981,72 @@ class TestBlendWithoutBoundary:
     """
 
     def _m(self, periods=6):
-        return mo.Model('м',
-            tracks=mo.Tracks('план', 'прогноз', 'факт',
-                             blend=mo.blend(given='факт', follow='прогноз')),
+        return mo.Model('m',
+            tracks=mo.Tracks('plan', 'forecast', 'actual',
+                             blend=mo.blend(given='actual', follow='forecast')),
             default_grain='month', default_start='2026-01',
             default_periods=periods)
 
     def test_given_wins_wherever_it_has_a_value(self):
         m = self._m()
         with m:
-            m.поток = mo.Variable(план=[10.0] * 6, прогноз=[9.0] * 6,
-                                  факт=[7.0, None, 0.0, None, 33.0, None])
-        v = m.поток._value
+            m.flow = mo.Variable(plan=[10.0] * 6, forecast=[9.0] * 6,
+                                 actual=[7.0, None, 0.0, None, 33.0, None])
+        v = m.flow._value
         # 0.0 is a FACT ("nothing happened"), not a hole — it must win
         # over the forecast; only None yields.
         assert v['live'] == [7.0, 9.0, 0.0, 9.0, 33.0, 9.0]
-        assert v['факт'] == [7.0, None, 0.0, None, 33.0, None]
-        assert v['план'] == [10.0] * 6        # план inviolable
+        assert v['actual'] == [7.0, None, 0.0, None, 33.0, None]
+        assert v['plan'] == [10.0] * 6        # the plan is inviolable
 
-    def test_a_late_period_fact_is_not_overruled(self):
+    def test_a_late_period_actual_is_not_overruled(self):
         """The difference a boundary makes: past it, the bounded form
-        prefers ``follow`` and a typed fact loses. Without a boundary
-        the fact stands wherever the author put it."""
+        prefers ``follow`` and a typed actual loses. Without a boundary
+        the actual stands wherever the author put it."""
         bounded = mo.Model('b',
-            tracks=mo.Tracks('прогноз', 'факт',
-                             blend=mo.blend(given='факт', follow='прогноз',
+            tracks=mo.Tracks('forecast', 'actual',
+                             blend=mo.blend(given='actual', follow='forecast',
                                             until='2026-01')),
             default_grain='month', default_start='2026-01',
             default_periods=3)
         with bounded:
-            bounded.x = mo.Variable(прогноз=[9.0] * 3,
-                                    факт=[None, 5.0, None])
-        assert bounded.x._value['live'] == [9.0, 9.0, 9.0]   # fact lost
+            bounded.x = mo.Variable(forecast=[9.0] * 3,
+                                    actual=[None, 5.0, None])
+        assert bounded.x._value['live'] == [9.0, 9.0, 9.0]   # actual lost
 
         free = self._m(periods=3)
         with free:
-            free.x = mo.Variable(план=[9.0] * 3, прогноз=[9.0] * 3,
-                                 факт=[None, 5.0, None])
-        assert free.x._value['live'] == [9.0, 5.0, 9.0]      # fact stands
+            free.x = mo.Variable(plan=[9.0] * 3, forecast=[9.0] * 3,
+                                 actual=[None, 5.0, None])
+        assert free.x._value['live'] == [9.0, 5.0, 9.0]      # actual stands
 
     def test_empty_given_leaves_follow_intact(self):
         m = self._m(periods=3)
         with m:
-            m.x = mo.Variable(план=[1.0] * 3, прогноз=[2.0] * 3,
-                              факт=[None, None, None])
+            m.x = mo.Variable(plan=[1.0] * 3, forecast=[2.0] * 3,
+                              actual=[None, None, None])
         assert m.x._value['live'] == [2.0, 2.0, 2.0]
 
     def test_formulas_carry_the_boundary_less_live(self):
         m = self._m(periods=3)
         with m:
-            m.a = mo.Variable(план=[10.0] * 3, прогноз=[9.0] * 3,
-                              факт=[7.0, None, None])
-            m.b = mo.Variable(план=[1.0] * 3, прогноз=[1.0] * 3,
-                              факт=[2.0, None, None])
+            m.a = mo.Variable(plan=[10.0] * 3, forecast=[9.0] * 3,
+                              actual=[7.0, None, None])
+            m.b = mo.Variable(plan=[1.0] * 3, forecast=[1.0] * 3,
+                              actual=[2.0, None, None])
             m.s = mo.Variable(m.a + m.b)
         assert m.s._value['live'] == [9.0, 10.0, 10.0]
 
     def test_repr_omits_the_absent_boundary(self):
-        spec = mo.blend(given='факт', follow='прогноз')
+        spec = mo.blend(given='actual', follow='forecast')
         assert 'until' not in repr(spec)
-        assert repr(mo.blend(given='ф', follow='п', until='2026-01')).count(
+        assert repr(mo.blend(given='a', follow='f', until='2026-01')).count(
             'until') == 1
 
     def test_a_blank_boundary_is_still_a_mistake(self):
         # Omitting the boundary is a choice; spelling it empty is a typo.
         with pytest.raises(TypeError):
-            mo.blend(given='факт', follow='прогноз', until='')
+            mo.blend(given='actual', follow='forecast', until='')
 
 
 class TestBlendHardening:
@@ -1050,11 +1054,11 @@ class TestBlendHardening:
     before its fix."""
 
     def _m(self, until='2025-02', periods=4, name=None):
-        kw = dict(given='факт', follow='бюджет', until=until)
+        kw = dict(given='actual', follow='budget', until=until)
         if name:
             kw['name'] = name
-        return mo.Model('м',
-            tracks=mo.Tracks('факт', 'бюджет', blend=mo.blend(**kw)),
+        return mo.Model('m',
+            tracks=mo.Tracks('actual', 'budget', blend=mo.blend(**kw)),
             default_grain='month', default_start='2025-01',
             default_periods=periods)
 
@@ -1064,31 +1068,31 @@ class TestBlendHardening:
         spelling splices correctly; a malformed one teaches."""
         m = self._m(until='2025-2')     # unpadded February — still February
         with m:
-            m.x = mo.Variable(факт=[8.0, 7.0, 0.0, 0.0],
-                              бюджет=[10.0] * 4)
+            m.x = mo.Variable(actual=[8.0, 7.0, 0.0, 0.0],
+                              budget=[10.0] * 4)
         assert m.x._value['live'] == [8.0, 7.0, 10.0, 10.0]
 
-        m2 = self._m(until='какая-то дата')
+        m2 = self._m(until='some date')
         with pytest.raises(ValueError, match="period label"):
             with m2:
-                m2.x = mo.Variable(факт=[1.0] * 4, бюджет=[2.0] * 4)
+                m2.x = mo.Variable(actual=[1.0] * 4, budget=[2.0] * 4)
 
     def test_scalar_lines_get_live(self):
         """Scalar-per-track assumptions skipped synthesis and broke
         every multiplication via the mismatch law."""
         m = self._m()
         with m:
-            m.объём = mo.Variable(факт=[8.0, 7.0, 0.0, 0.0],
-                                  бюджет=[10.0] * 4)
-            m.цена = mo.Variable(факт=100.0, бюджет=90.0)
-            m.выручка = m.объём * m.цена
-        assert m.цена._value['live'] == [100.0, 100.0, 90.0, 90.0]
-        assert m.выручка._value['live'] == [800.0, 700.0, 900.0, 900.0]
+            m.volume = mo.Variable(actual=[8.0, 7.0, 0.0, 0.0],
+                                   budget=[10.0] * 4)
+            m.price = mo.Variable(actual=100.0, budget=90.0)
+            m.revenue = m.volume * m.price
+        assert m.price._value['live'] == [100.0, 100.0, 90.0, 90.0]
+        assert m.revenue._value['live'] == [800.0, 700.0, 900.0, 900.0]
 
     def test_length_one_track_splices_as_constant(self):
         m = self._m()
         with m:
-            m.y = mo.Variable(факт=[8.0], бюджет=[10.0])
+            m.y = mo.Variable(actual=[8.0], budget=[10.0])
         assert m.y._value['live'] == [8.0, 8.0, 10.0, 10.0]
 
     def test_ragged_track_still_teaches(self):
@@ -1097,33 +1101,33 @@ class TestBlendHardening:
         m = self._m()
         with pytest.raises(ValueError, match="4-period window"):
             with m:
-                m.z = mo.Variable(факт=[8.0, 7.0], бюджет=[10.0, 10.0])
+                m.z = mo.Variable(actual=[8.0, 7.0], budget=[10.0, 10.0])
 
     def test_tracks_dict_authoring_live_is_loud(self):
         m = self._m()
         with pytest.raises(ValueError, match="synthesizes"):
             with m:
                 m.x = mo.Variable(tracks={'live': [1.0] * 4,
-                                          'бюджет': [1.0] * 4})
+                                          'budget': [1.0] * 4})
 
     def test_kwarg_authoring_live_names_the_blend(self):
         m = self._m()
         with pytest.raises(ValueError, match="synthesizes"):
             with m:
-                m.x = mo.Variable(live=[1.0] * 4, бюджет=[1.0] * 4)
+                m.x = mo.Variable(live=[1.0] * 4, budget=[1.0] * 4)
 
     def test_dotted_write_to_live_teaches_sources(self):
         m = self._m()
         with m:
-            m.x = mo.Variable(факт=[1.0] * 4, бюджет=[2.0] * 4)
+            m.x = mo.Variable(actual=[1.0] * 4, budget=[2.0] * 4)
         with pytest.raises(ValueError, match="SYNTHESIZED"):
             m.x.live = [9.0] * 4
 
     def test_blend_without_window_refused_at_declaration(self):
         with pytest.raises(ValueError, match="window"):
-            mo.Model('м', tracks=mo.Tracks(
-                'факт', 'бюджет',
-                blend=mo.blend(given='факт', follow='бюджет',
+            mo.Model('m', tracks=mo.Tracks(
+                'actual', 'budget',
+                blend=mo.blend(given='actual', follow='budget',
                                until='2025-02')))
 
     def test_pin_on_derived_line_continues_inherited_live(self):
@@ -1132,21 +1136,21 @@ class TestBlendHardening:
         what computing live as a track of its own avoids)."""
         m = self._m()
         with m:
-            m.поток = mo.Variable(факт=[8.0, 7.0, 0.0, 0.0],
-                                  бюджет=[10.0] * 4)
-            m.двойной = mo.Variable(m.поток * 2)
-        inherited_tail = m.двойной._value['live'][2:]
-        m.двойной.факт = [16.0, 15.0, 0.0, 0.0]
-        v = m.двойной._value
+            m.flow = mo.Variable(actual=[8.0, 7.0, 0.0, 0.0],
+                                 budget=[10.0] * 4)
+            m.doubled = mo.Variable(m.flow * 2)
+        inherited_tail = m.doubled._value['live'][2:]
+        m.doubled.actual = [16.0, 15.0, 0.0, 0.0]
+        v = m.doubled._value
         assert v['live'][:2] == [16.0, 15.0]          # pinned data
-        assert v['live'][2:] == inherited_tail        # inherited, not бюджет
+        assert v['live'][2:] == inherited_tail        # inherited, not budget
 
     def test_copy_into_blendless_context_sheds_live(self):
         m = self._m()
         with m:
-            m.x = mo.Variable(факт=[1.0] * 4, бюджет=[2.0] * 4)
+            m.x = mo.Variable(actual=[1.0] * 4, budget=[2.0] * 4)
         assert 'live' in m.x._value.roles
-        plain = mo.Model('без', tracks=mo.Tracks('факт', 'бюджет'),
+        plain = mo.Model('plain', tracks=mo.Tracks('actual', 'budget'),
                          default_grain='month', default_start='2025-01',
                          default_periods=4)
         plain.x = m.x                     # ownership change → copy
@@ -1155,16 +1159,16 @@ class TestBlendHardening:
     def test_none_holes_fall_to_follow(self):
         m = self._m()
         with m:
-            m.x = mo.Variable(факт=[8.0, None, 0.0, 0.0],
-                              бюджет=[10.0] * 4)
+            m.x = mo.Variable(actual=[8.0, None, 0.0, 0.0],
+                              budget=[10.0] * 4)
         assert m.x._value['live'][1] == 10.0
 
     def test_own_located_lines_skip_synthesis(self):
         m = self._m()
         with m:
-            m.кв = mo.Variable(tracks={'факт': [1.0], 'бюджет': [2.0]},
+            m.yr = mo.Variable(tracks={'actual': [1.0], 'budget': [2.0]},
                                start='2025-01', grain='year')
-        assert 'live' not in m.кв._value.roles
+        assert 'live' not in m.yr._value.roles
 
 
 class TestExcelViewTracksParam:
@@ -1175,15 +1179,15 @@ class TestExcelViewTracksParam:
     prints at."""
 
     def _m(self, view=None):
-        m = mo.Model('м',
-            tracks=mo.Tracks('факт', 'бюджет',
-                             blend=mo.blend(given='факт', follow='бюджет',
+        m = mo.Model('m',
+            tracks=mo.Tracks('actual', 'budget',
+                             blend=mo.blend(given='actual', follow='budget',
                                             until='2025-02')),
             default_grain='month', default_start='2025-01',
             default_periods=4)
         with m:
-            m.поток = mo.Variable(факт=[8.0, 7.0, 0.0, 0.0],
-                                  бюджет=[10.0] * 4)
+            m.flow = mo.Variable(actual=[8.0, 7.0, 0.0, 0.0],
+                                 budget=[10.0] * 4)
         if view is not None:
             m.default_excel_view = view
         return m
@@ -1192,7 +1196,7 @@ class TestExcelViewTracksParam:
         import os
         import tempfile
         from openpyxl import load_workbook
-        p = os.path.join(tempfile.mkdtemp(), 'т.xlsx')
+        p = os.path.join(tempfile.mkdtemp(), 't.xlsx')
         m.to_excel(p)
         return [r[0] for r in load_workbook(p).worksheets[0]
                 .iter_rows(min_row=2, max_row=4, max_col=1,
@@ -1200,41 +1204,41 @@ class TestExcelViewTracksParam:
 
     def test_rows_is_the_default(self):
         assert self._labels(self._m()) == [
-            'Поток', 'поток · факт', 'поток · бюджет',
+            'Flow', 'flow · actual', 'flow · budget',
         ]
 
     def test_blend_prints_default_rows_only(self):
         labels = self._labels(self._m(mo.ExcelView(tracks='blend')))
-        assert labels[0] == 'Поток' and labels[1] is None
+        assert labels[0] == 'Flow' and labels[1] is None
 
     def test_compare_draws_period_major_column_groups(self):
         # The compare layout: each period is a GROUP of one column per
         # track, the blend column a LIVE splice over its group
-        # neighbours, «откл» a live difference.
+        # neighbours, the deviation ("Var") a live difference.
         import os
         import tempfile
 
         from openpyxl import load_workbook
 
-        p = os.path.join(tempfile.mkdtemp(), 'т.xlsx')
+        p = os.path.join(tempfile.mkdtemp(), 't.xlsx')
         self._m(mo.ExcelView(tracks='compare')).to_excel(p)
         ws = load_workbook(p).worksheets[0]
-        # One row — the line keeps its name; no «· факт» sub-rows.
+        # One row — the line keeps its name; no "· actual" sub-rows.
         labels = [ws.cell(r, 1).value for r in range(1, ws.max_row + 1)]
-        assert 'Поток' in labels
+        assert 'Flow' in labels
         assert not any('·' in str(x) for x in labels if x)
-        row = labels.index('Поток') + 1
+        row = labels.index('Flow') + 1
         # Track words under the period labels, one group per month:
         # given, follow, blend (declared order — no selection given).
         assert [ws.cell(2, c).value for c in range(2, 6)] == [
-            'факт', 'бюджет', 'live', 'откл',
+            'actual', 'budget', 'live', 'Var',
         ]
         assert ws.cell(1, 2).value is not None      # period label
         # The blend column splices its own GROUP NEIGHBOURS, live.
         assert ws.cell(row, 4).value == '=IF(B3="",C3,B3)'
-        # «откл» is a live difference, not a baked number.
+        # The deviation is a live difference, not a baked number.
         assert ws.cell(row, 5).value == '=B3 - C3'
-        # Numbers land per track: факт 8, бюджет 10.
+        # Numbers land per track: actual 8, budget 10.
         assert ws.cell(row, 2).value == 8
         assert ws.cell(row, 3).value == 10
         # The next month's group starts one stride (4) over.
@@ -1255,98 +1259,200 @@ class TestExcelViewTracksParam:
 
         from openpyxl import load_workbook
 
-        m = mo.Model('м', tracks=mo.Tracks('план', 'факт'),
+        m = mo.Model('m', tracks=mo.Tracks('plan', 'actual'),
                      default_grain='month', default_start='2025-01',
                      default_periods=3)
-        m.лист = mo.MultiVariable(display_name='Лист',
-                                  excel_props={'tab': True})
-        m.лист.новые = mo.Variable(tracks={'план': [10.0, 20.0, 30.0],
-                                           'факт': [11.0, 19.0, 0.0]})
-        m.лист.всего = mo.Variable(mo.cumsum(m.лист.новые),
-                                   display_name='Всего')
-        m.свод = mo.MultiVariable(display_name='Свод',
-                                  excel_props={'tab': True})
-        m.свод.итог = mo.Variable(mo.cumsum(m.лист.новые),
-                                  display_name='Итог')
+        m.detail = mo.MultiVariable(display_name='New Clients',
+                                    excel_props={'tab': True})
+        m.detail.new = mo.Variable(tracks={'plan': [10.0, 20.0, 30.0],
+                                           'actual': [11.0, 19.0, 0.0]})
+        m.detail.cumulative = mo.Variable(mo.cumsum(m.detail.new),
+                                          display_name='Cumulative')
+        m.summary = mo.MultiVariable(display_name='Summary',
+                                     excel_props={'tab': True})
+        m.summary.to_date = mo.Variable(mo.cumsum(m.detail.new),
+                                        display_name='To Date')
         m.default_excel_view = mo.ExcelView(tracks='compare')
 
-        p = os.path.join(tempfile.mkdtemp(), 'т.xlsx')
+        p = os.path.join(tempfile.mkdtemp(), 't.xlsx')
         m.to_excel(p)
         wb = load_workbook(p)
-        лист_ws, свод_ws = wb['Лист'], wb['Свод']
-        row = next(r for r in range(1, лист_ws.max_row + 1)
-                   if лист_ws.cell(r, 1).value == 'Всего')
+        detail_ws, summary_ws = wb['New Clients'], wb['Summary']
+        row = next(r for r in range(1, detail_ws.max_row + 1)
+                   if detail_ws.cell(r, 1).value == 'Cumulative')
         # Own sheet: seed reads the input, later periods chain OWN
-        # prev + input, one stride (3: план/факт/откл) apart.
-        assert лист_ws.cell(row, 2).value == '=B3'
-        assert лист_ws.cell(row, 5).value == '=B4 + E3'
-        assert лист_ws.cell(row, 6).value == '=C4 + F3'
+        # prev + input, one stride (3: plan/actual/var) apart.
+        assert detail_ws.cell(row, 2).value == '=B3'
+        assert detail_ws.cell(row, 5).value == '=B4 + E3'
+        assert detail_ws.cell(row, 6).value == '=C4 + F3'
         # Cross-sheet: the input is qualified, the prev is not.
-        srow = next(r for r in range(1, свод_ws.max_row + 1)
-                    if свод_ws.cell(r, 1).value == 'Итог')
-        assert свод_ws.cell(srow, 2).value == "='Лист'!B3"
-        assert свод_ws.cell(srow, 5).value == "=B3 + 'Лист'!E3"
+        srow = next(r for r in range(1, summary_ws.max_row + 1)
+                    if summary_ws.cell(r, 1).value == 'To Date')
+        assert summary_ws.cell(srow, 2).value == "='New Clients'!B3"
+        assert summary_ws.cell(srow, 5).value == "=B3 + 'New Clients'!E3"
         # And nothing anywhere prints the Python spelling.
         for ws in wb.worksheets:
             for r in ws.iter_rows():
                 for c in r:
                     assert '.cumsum()' not in str(c.value)
 
+    def _metrics_book(self, metrics, plan='plan', total='total'):
+        # A metric selection is the caller's: it goes to
+        # ``expand_tracked_tree`` directly (a declared compare view
+        # shows the deviation alone), and the expanded tree is written
+        # as is. Returns the sheet and each emitted line's values by
+        # display name.
+        import os
+        import tempfile
+
+        from openpyxl import load_workbook
+
+        from modeleon.compile.excel.writer import expand_tracked_tree
+
+        m = mo.Model('m', tracks=mo.Tracks(plan, 'actual'),
+                     default_grain='month', default_start='2025-01',
+                     default_periods=2)
+        with m:
+            m.p = mo.MultiVariable('P', excel_props={'tab': True})
+            with m.p as p:
+                p.a = mo.Variable(tracks={plan: [10.0, 20.0],
+                                          'actual': [12.0, 18.0]},
+                                  display_name='A')
+                p.b = mo.Variable(tracks={plan: [30.0, 20.0],
+                                          'actual': [28.0, 22.0]},
+                                  display_name='B')
+                setattr(p, total, mo.Variable(p.a + p.b, display_name='Total'))
+        expanded = expand_tracked_tree(m, mode='compare', metrics=metrics)
+        path = os.path.join(tempfile.mkdtemp(), 't.xlsx')
+        expanded.to_excel(path)
+        values = {v.display_name: v.value
+                  for v in expanded.p._components.values()}
+        return load_workbook(path)['P'], values
+
+    def test_older_metric_spellings_still_select_their_columns(self):
+        # "откл" and "уд.вес" are the older spellings of var and share,
+        # still accepted, and a column is captioned the way it was
+        # spelled. The non-Latin text is deliberate: it is the
+        # compatibility surface under test.
+        old, old_values = self._metrics_book(['откл', 'уд.вес'])
+        new, new_values = self._metrics_book(['var', 'share'])
+        assert [old.cell(2, c).value for c in range(2, 6)] == [
+            'plan', 'actual', 'откл', 'уд. вес',
+        ]
+        assert [new.cell(2, c).value for c in range(2, 6)] == [
+            'plan', 'actual', 'Var', 'Share',
+        ]
+        # The same metrics under either caption: the same live cells.
+        assert old.cell(3, 4).value == '=C3 - B3'
+        assert old.cell(3, 5).value == '=B3 / B5'
+        for c in (4, 5, 8, 9):
+            assert old.cell(3, c).value == new.cell(3, c).value
+        assert old_values['A · откл'] == new_values['A · Var'] == [2.0, -2.0]
+        assert old_values['A · уд. вес'] == new_values['A · Share'] == [0.25, 0.5]
+
+    def test_share_measures_against_total_in_either_spelling(self):
+        # A share's denominator is the section's line named "total" —
+        # or "итого", the older spelling (the non-Latin name is
+        # deliberate). The same model gives the same numbers either way.
+        for total in ('total', 'итого'):
+            ws, values = self._metrics_book(['share'], total=total)
+            rows = {ws.cell(r, 1).value: r for r in range(3, ws.max_row + 1)}
+            assert [ws.cell(2, c).value for c in range(2, 5)] == [
+                'plan', 'actual', 'Share',
+            ]
+            assert ws.cell(rows['A'], 4).value == f"=B{rows['A']} / B{rows['Total']}"
+            assert ws.cell(rows['B'], 4).value == f"=B{rows['B']} / B{rows['Total']}"
+            assert values['A · Share'] == [0.25, 0.5]
+            assert values['B · Share'] == [0.75, 0.5]
+
+    def test_deviation_is_actual_minus_plan_in_either_spelling(self):
+        # The deviation subtracts the track named "plan" — or "план",
+        # the older spelling (the non-Latin name is deliberate). The
+        # plan is declared FIRST, so a positional rule would get the
+        # sign backwards.
+        for plan in ('plan', 'план'):
+            ws, values = self._metrics_book(['var'], plan=plan)
+            assert [ws.cell(2, c).value for c in range(2, 5)] == [
+                plan, 'actual', 'Var',
+            ]
+            assert ws.cell(3, 4).value == '=C3 - B3'
+            assert values['A · Var'] == [2.0, -2.0]
+            assert values['B · Var'] == [-2.0, 2.0]
+
     def test_vocabularies(self):
         with pytest.raises(ValueError, match="blend"):
-            mo.ExcelView(tracks='чушь')
+            mo.ExcelView(tracks='nonsense')
         with pytest.raises(ValueError, match="grain"):
             mo.ExcelView(grain='decade')
 
     def test_resolved_view_carries_fields(self):
         from modeleon.compile.excel.view import resolve_excel_view
         m = self._m(mo.ExcelView(tracks='blend', grain='quarter'))
-        r = resolve_excel_view(m.поток)
+        r = resolve_excel_view(m.flow)
         assert r.tracks == 'blend'
         assert r.grain == 'quarter'
 
 
-class TestHolesArePartialKnowledge:
-    """A hole is ABSENCE, not failure: an un-entered fact month
-    propagates as a hole, so formulas and chains over it go quiet
-    (blank) instead of turning the future into errors. Facts arrive
-    monthly, and the un-entered rest is the normal state, not an
-    error state."""
+class TestABlankCountsAsZero:
+    """As in Excel, a month nobody entered counts as zero in a formula:
+    a balance stays where it was, a profit over blank months is 0. Only
+    an input stays blank. Whether an actual was entered is the blend's
+    question, asked of the entries a formula is built from - a derived
+    line takes its live value from its operands' live values either way."""
 
-    def test_chain_over_none_holes(self):
-        m = mo.Model('м',
-            tracks=mo.Tracks('факт', 'бюджет',
-                             blend=mo.blend(given='факт', follow='бюджет',
+    def test_a_balance_stays_where_it_was(self):
+        m = mo.Model('m',
+            tracks=mo.Tracks('actual', 'budget',
+                             blend=mo.blend(given='actual', follow='budget',
                                             until='2025-02')),
             default_grain='month', default_start='2025-01',
             default_periods=4)
         with m:
-            m.поток = mo.Variable(факт=[8.0, 7.0, None, None],
-                                  бюджет=[10.0] * 4)
-            m.остаток = mo.recurrence(start=0.0, formula="{prev} + {п}",
-                                      variables={"п": m.поток}, periods=4)
-        o = m.остаток._value
-        assert o['факт'] == [0.0, 7.0, None, None]      # quiet, not an error
-        assert o['бюджет'] == [0.0, 10.0, 20.0, 30.0]
+            m.flow = mo.Variable(actual=[8.0, 7.0, None, None],
+                                 budget=[10.0] * 4)
+            m.balance = mo.recurrence(start=0.0, formula="{prev} + {f}",
+                                      variables={"f": m.flow}, periods=4)
+        o = m.balance._value
+        assert o['actual'] == [0.0, 7.0, 7.0, 7.0]
+        assert o['budget'] == [0.0, 10.0, 20.0, 30.0]
         assert o['live'] == [0.0, 7.0, 17.0, 27.0]      # re-anchored, alive
 
-    def test_formula_over_holes_is_blank(self):
-        m = mo.Model('м',
-            tracks=mo.Tracks('факт', 'бюджет',
-                             blend=mo.blend(given='факт', follow='бюджет',
+    def test_a_formula_over_blank_months_is_zero(self):
+        m = mo.Model('m',
+            tracks=mo.Tracks('actual', 'budget',
+                             blend=mo.blend(given='actual', follow='budget',
                                             until='2025-02')),
             default_grain='month', default_start='2025-01',
             default_periods=4)
         with m:
-            m.выручка = mo.Variable(факт=[8.0, 7.0, None, None],
-                                    бюджет=[10.0] * 4)
-            m.расходы = mo.Variable(факт=[6.0, 5.0, None, None],
-                                    бюджет=[7.0] * 4)
-            m.прибыль = mo.Variable(m.выручка - m.расходы)
-        p = m.прибыль._value
-        assert p['факт'] == [2.0, 2.0, None, None]
-        assert p['бюджет'] == [3.0] * 4
+            m.revenue = mo.Variable(actual=[8.0, 7.0, None, None],
+                                    budget=[10.0] * 4)
+            m.expenses = mo.Variable(actual=[6.0, 5.0, None, None],
+                                     budget=[7.0] * 4)
+            m.profit = mo.Variable(m.revenue - m.expenses)
+        p = m.profit._value
+        assert p['actual'] == [2.0, 2.0, 0.0, 0.0]
+        assert p['budget'] == [3.0] * 4
         assert p['live'] == [2.0, 2.0, 3.0, 3.0]
+
+    def test_a_derived_actual_takes_the_forecast_where_nothing_was_entered(self):
+        m = mo.Model('m',
+            tracks=mo.Tracks('plan', 'forecast', 'actual',
+                             blend=mo.blend(given='actual', follow='forecast',
+                                            name='live')),
+            default_grain='month', default_start='2025-01',
+            default_periods=4)
+        with m:
+            m.a = mo.Variable([10.0] * 4, forecast=[11.0] * 4,
+                              actual=[9.0, 8.0, 7.0, None])
+            m.b = mo.Variable([20.0] * 4, forecast=[21.0] * 4,
+                              actual=[19.0, None, None, None])
+            m.total = mo.Variable(m.a + m.b, plan=[30.0] * 4)
+        t = m.total._value
+        assert t['actual'] == [28.0, 8.0, 7.0, 0.0]
+        # Something entered: the actual, its blanks as zeros. Nothing
+        # entered: the forecast.
+        assert t['live'] == [28.0, 8.0, 7.0, 32.0]
 
     def test_genuine_errors_still_absorb(self):
         """Absence is quiet; failure stays loud."""
@@ -1365,77 +1471,77 @@ class TestTracksInsideInstances:
     (splice-equal for per-period formulas)."""
 
     def _model(self):
-        class Проект(mo.MultiVariableClass):
-            def compute(self, ставка=100.0, часы_план=None,
-                        часы_факт=None):
-                self.часы = mo.Variable(план=часы_план, факт=часы_факт)
-                self.выручка = self.часы * ставка
+        class Project(mo.MultiVariableClass):
+            def compute(self, rate=100.0, hours_plan=None,
+                        hours_actual=None):
+                self.hours = mo.Variable(plan=hours_plan, actual=hours_actual)
+                self.revenue = self.hours * rate
 
-        m = mo.Model('м',
-            tracks=mo.Tracks('факт', 'план',
-                             blend=mo.blend(given='факт', follow='план',
+        m = mo.Model('m',
+            tracks=mo.Tracks('actual', 'plan',
+                             blend=mo.blend(given='actual', follow='plan',
                                             until='2025-02')),
             default_grain='month', default_start='2025-01',
             default_periods=4)
         with m:
-            m.альфа = Проект(ставка=100.0, часы_план=[10.0] * 4,
-                             часы_факт=[9.0, 11.0, None, None])
-            m.бета = Проект(ставка=150.0, часы_план=[20.0] * 4,
-                            часы_факт=[18.0, 21.0, None, None])
-            m.портфель = m.альфа.выручка + m.бета.выручка
+            m.alpha = Project(rate=100.0, hours_plan=[10.0] * 4,
+                              hours_actual=[9.0, 11.0, None, None])
+            m.beta = Project(rate=150.0, hours_plan=[20.0] * 4,
+                             hours_actual=[18.0, 21.0, None, None])
+            m.portfolio = m.alpha.revenue + m.beta.revenue
         return m
 
     def test_tracked_field_in_class_body(self):
         m = self._model()
-        v = m.альфа.часы._value
-        assert v['план'] == [10.0] * 4
-        assert v['факт'] == [9.0, 11.0, None, None]
+        v = m.alpha.hours._value
+        assert v['plan'] == [10.0] * 4
+        assert v['actual'] == [9.0, 11.0, None, None]
         assert v['live'] == [9.0, 11.0, 10.0, 10.0]
 
     def test_derived_line_in_class_body_gets_spliced_live(self):
         m = self._model()
-        v = m.альфа.выручка._value
+        v = m.alpha.revenue._value
         assert v['live'] == [900.0, 1100.0, 1000.0, 1000.0]
 
     def test_portfolio_aggregation_across_instances(self):
         m = self._model()
-        p = m.портфель._value
-        assert p['план'] == [4000.0] * 4
-        assert p['факт'][:2] == [3600.0, 4250.0]
+        p = m.portfolio._value
+        assert p['plan'] == [4000.0] * 4
+        assert p['actual'][:2] == [3600.0, 4250.0]
         assert p['live'] == [3600.0, 4250.0, 4000.0, 4000.0]
 
     def test_typo_in_class_body_still_teaches_at_adoption(self):
-        class Кривой(mo.MultiVariableClass):
+        class Broken(mo.MultiVariableClass):
             def compute(self):
-                self.x = mo.Variable(фактт=[1.0] * 4)
+                self.x = mo.Variable(actuall=[1.0] * 4)
 
-        m = mo.Model('м', tracks=mo.Tracks('факт', 'план'),
+        m = mo.Model('m', tracks=mo.Tracks('actual', 'plan'),
                      default_grain='month', default_start='2025-01',
                      default_periods=4)
-        with pytest.raises(ValueError, match="фактт"):
+        with pytest.raises(ValueError, match="actuall"):
             with m:
-                m.к = Кривой()
+                m.k = Broken()
 
     def test_stateful_derived_in_class_body_has_no_live(self):
         """A recurrence inside a class body rolled before its driver
         had live — splicing its output would break the live track's
         rule (a chain must roll over live flows), so live is honestly
         ABSENT and the mismatch law polices any cross-use."""
-        class Накопитель(mo.MultiVariableClass):
-            def compute(self, поток_план=None, поток_факт=None):
-                self.поток = mo.Variable(план=поток_план, факт=поток_факт)
-                self.остаток = mo.cumsum(self.поток)
+        class Accumulator(mo.MultiVariableClass):
+            def compute(self, flow_plan=None, flow_actual=None):
+                self.flow = mo.Variable(plan=flow_plan, actual=flow_actual)
+                self.balance = mo.cumsum(self.flow)
 
-        m = mo.Model('м',
-            tracks=mo.Tracks('факт', 'план',
-                             blend=mo.blend(given='факт', follow='план',
+        m = mo.Model('m',
+            tracks=mo.Tracks('actual', 'plan',
+                             blend=mo.blend(given='actual', follow='plan',
                                             until='2025-02')),
             default_grain='month', default_start='2025-01',
             default_periods=4)
         with m:
-            m.n = Накопитель(поток_план=[10.0] * 4,
-                             поток_факт=[9.0, 11.0, None, None])
-        assert 'live' not in m.n.остаток._value.roles
+            m.n = Accumulator(flow_plan=[10.0] * 4,
+                              flow_actual=[9.0, 11.0, None, None])
+        assert 'live' not in m.n.balance._value.roles
 
 
 class TestScalarBlend:
@@ -1446,14 +1552,14 @@ class TestScalarBlend:
             'm', display_name='M', default_grain='month',
             default_start='2026-01', default_periods=6,
             tracks=mo.Tracks(
-                'план', 'факт',
-                blend=mo.blend(given='факт', follow='план',
-                               until='2026-03', name='прогноз')))
+                'plan', 'actual',
+                blend=mo.blend(given='actual', follow='plan',
+                               until='2026-03', name='forecast')))
         return m
 
     def test_a_scalar_line_blends_to_a_scalar(self):
-        # A record's scalar field — an amount: план 50 000,
-        # факт 52 000.
+        # A record's scalar field — an amount: plan 50,000,
+        # actual 52,000.
         # The time splice used to spread the constant into a full
         # 6-period series — a record field quietly turned temporal.
         m = self._model()
@@ -1461,28 +1567,28 @@ class TestScalarBlend:
             m.p = mo.MultiVariable('P', excel_props={'tab': True})
             m.p._records_container = True  # the records-container contract
             with m.p as p:
-                p.сумма = mo.Variable(план=50000, факт=52000,
-                                      display_name='Сумма')
-        tv = m.p.сумма._value
-        assert tv['прогноз'] == 52000
-        assert not isinstance(tv['прогноз'], list)
+                p.amount = mo.Variable(plan=50000, actual=52000,
+                                       display_name='Amount')
+        tv = m.p.amount._value
+        assert tv['forecast'] == 52000
+        assert not isinstance(tv['forecast'], list)
 
-    def test_fact_absent_the_scalar_forecast_is_the_plan(self):
+    def test_actual_absent_the_scalar_forecast_is_the_plan(self):
         m = self._model()
         with m:
             m.p = mo.MultiVariable('P', excel_props={'tab': True})
             m.p._records_container = True
             with m.p as p:
-                p.срок = mo.Variable(план=12, display_name='Срок')
-        assert m.p.срок._value['прогноз'] == 12
+                p.term = mo.Variable(plan=12, display_name='Term')
+        assert m.p.term._value['forecast'] == 12
 
     def test_temporal_lines_still_splice_per_period(self):
         m = self._model()
         with m:
             m.p = mo.MultiVariable('P', excel_props={'tab': True})
             with m.p as p:
-                p.ряд = mo.Variable(план=[1.0] * 6, display_name='Ряд')
-        assert len(m.p.ряд._value['прогноз']) == 6
+                p.series = mo.Variable(plan=[1.0] * 6, display_name='Series')
+        assert len(m.p.series._value['forecast']) == 6
 
 
 class TestBlendRowIsAlive:
@@ -1503,75 +1609,75 @@ class TestBlendRowIsAlive:
             'm', display_name='M', default_grain='month',
             default_start='2026-01', default_periods=4,
             tracks=mo.Tracks(
-                'план', 'факт',
-                blend=mo.blend(given='факт', follow='план',
+                'plan', 'actual',
+                blend=mo.blend(given='actual', follow='plan',
                                until='2026-02')),
             **view_kw)
         with m:
             m.p = mo.MultiVariable('P', excel_props={'tab': True})
             with m.p as p:
-                p.выручка = mo.Variable(
-                    план=[10.0] * 4, факт=[12.0, 11.0, None, None],
-                    display_name='Выручка')
-                p.налог = p.выручка * 0.1
+                p.revenue = mo.Variable(
+                    plan=[10.0] * 4, actual=[12.0, 11.0, None, None],
+                    display_name='Revenue')
+                p.tax = p.revenue * 0.1
         return m
 
     def test_the_splice_is_a_formula_over_its_subrows(self):
         ws = self._book(self._model())['P']
-        # Blend row 2; план row 3; факт row 4. Before the boundary the
-        # FACT wins with a fallback; after it the PLAN does.
+        # Blend row 2; plan row 3; actual row 4. Before the boundary the
+        # ACTUAL wins with a fallback; after it the PLAN does.
         assert ws['B2'].value == '=IF(B4="",B3,B4)'
         assert ws['C2'].value == '=IF(C4="",C3,C4)'
         assert ws['D2'].value == '=IF(D3="",D4,D3)'
         assert ws['E2'].value == '=IF(E3="",E4,E3)'
 
     def test_a_derived_line_keeps_its_own_formula(self):
-        # налог = выручка × 0.1 — it references the BLEND row (the live
+        # tax = revenue × 0.1 — it references the BLEND row (the live
         # track). Replaying the splice on an output would be wrong.
         ws = self._book(self._model())['P']
         assert ws['B5'].value == '=B2 * 0.1'
 
-    def test_a_computed_plan_with_authored_facts_still_splices(self):
-        # План is a FORMULA (over another row), факт and прогноз are
-        # authored series. The line has both an expression and role
+    def test_a_computed_plan_with_authored_actuals_still_splices(self):
+        # The plan is a FORMULA (over another row), actual and forecast
+        # are authored series. The line has both an expression and role
         # kwargs — the engine calls it a DATA line and splices it, so
         # the workbook must splice it too. Left with its base
-        # expression the file would show ПЛАН where the engine computes
-        # the blend (here the forecast places the amount a month later
-        # than the plan).
+        # expression the file would show the PLAN where the engine
+        # computes the blend (here the forecast places the amount a
+        # month later than the plan).
         m = mo.Model(
             'm', display_name='M', default_grain='month',
             default_start='2026-01', default_periods=4,
             tracks=mo.Tracks(
-                'план', 'прогноз', 'факт',
-                blend=mo.blend(given='факт', follow='прогноз')),
+                'plan', 'forecast', 'actual',
+                blend=mo.blend(given='actual', follow='forecast')),
         )
         with m:
             m.p = mo.MultiVariable('P', excel_props={'tab': True})
             with m.p as p:
-                p.объём = mo.Variable([0.0, 20.0, 0.0, 0.0],
-                                      display_name='Объём')
-                p.выручка = mo.Variable(
-                    p.объём * 1.0,
-                    прогноз=[0.0, 0.0, 20.0, 0.0],
-                    факт=[None, None, None, None],
-                    display_name='Выручка')
+                p.volume = mo.Variable([0.0, 20.0, 0.0, 0.0],
+                                       display_name='Volume')
+                p.revenue = mo.Variable(
+                    p.volume * 1.0,
+                    forecast=[0.0, 0.0, 20.0, 0.0],
+                    actual=[None, None, None, None],
+                    display_name='Revenue')
         ws = self._book(m)['P']
         rows = {ws.cell(r, 1).value: r for r in range(1, ws.max_row + 1)}
-        blend = rows['Выручка']
-        given = rows['Выручка · факт']
-        follow = rows['Выручка · прогноз']
+        blend = rows['Revenue']
+        given = rows['Revenue · actual']
+        follow = rows['Revenue · forecast']
         # Boundary-less: given wins wherever it carries a value.
         assert ws.cell(blend, 2).value == (
             f'=IF(B{given}="",B{follow},B{given})')
-        # …and the splice, not the план formula: February is the
-        # прогноз row's zero, March its 20.
+        # …and the splice, not the plan formula: February is the
+        # forecast row's zero, March its 20.
         assert ws.cell(blend, 4).value == (
             f'=IF(D{given}="",D{follow},D{given})')
 
     def test_the_settled_ink_is_a_rule_not_a_stamp(self):
-        # The blended cell goes blue WHILE a fact stands behind it —
-        # as a conditional rule over the fact cell, so typing a fact
+        # The blended cell goes blue WHILE an actual stands behind it —
+        # as a conditional rule over the actual cell, so typing an actual
         # into the written file colours its own month. A stamped
         # font would freeze provenance at write time, the same
         # dead-values habit the splice formulas exist to kill.
@@ -1581,7 +1687,7 @@ class TestBlendRowIsAlive:
         for rng in rules:
             for rule in rng.rules:
                 by_range[str(rng.sqref)] = rule
-        # Blend row 2, fact row 4: each month keys off ITS fact cell.
+        # Blend row 2, actual row 4: each month keys off ITS actual cell.
         assert by_range['B2'].formula == ['B4<>""']
         assert by_range['C2'].formula == ['C4<>""']
         # Font only — a fill would cut holes in the house style's
@@ -1600,13 +1706,239 @@ class TestBlendRowIsAlive:
         assert not any('·' in str(x) for x in labels if x)  # no subrows
 
 
+class TestADerivedActualAsksWhatWasEntered:
+    """A line can enter its plan and DERIVE its actual: the actual of a
+    sum is the sum of the actuals. Its actual row is then a formula,
+    which Excel computes as 0 over the months nobody entered - where the
+    engine takes the forecast. So the splice asks the rows of entries
+    the formula is built from, as the engine's blend does (nothing
+    entered: the forecast), not ``=""`` of the formula's own cell (the
+    written book showed Q4 revenue as 0 where the engine computed its
+    forecast)."""
+
+    def _model(self):
+        m = mo.Model(
+            'm', display_name='M', default_grain='month',
+            default_start='2026-01', default_periods=4,
+            tracks=mo.Tracks('plan', 'forecast', 'actual',
+                             blend=mo.blend(given='actual', follow='forecast',
+                                            name='live')))
+        with m:
+            m.p = mo.MultiVariable('Projects', excel_props={'tab': True})
+            with m.p as p:
+                p.a = mo.Variable([10.0] * 4, forecast=[11.0] * 4,
+                                  actual=[9.0, 8.0, None, None], display_name='A')
+                p.b = mo.Variable([20.0] * 4, forecast=[21.0] * 4,
+                                  actual=[19.0, 18.0, None, None], display_name='B')
+                p.rate = mo.Variable(0.5, display_name='Rate')
+            m.s = mo.MultiVariable('P and L', excel_props={'tab': True})
+            with m.s as s:
+                s.revenue = mo.Variable(m.p.a + m.p.b, plan=[25.0] * 4,
+                                        display_name='Revenue')
+                s.cost = mo.Variable(m.p.a * m.p.rate, plan=[5.0] * 4,
+                                     display_name='Cost')
+                s.gross = mo.Variable(m.p.a + m.p.b, display_name='Gross')
+                s.margin = mo.Variable(s.gross - s.cost, plan=[20.0] * 4,
+                                       display_name='Margin')
+                s.running = mo.Variable(mo.cumsum(m.p.a), plan=[10.0] * 4,
+                                        display_name='Running')
+        return m
+
+    def _sheet(self, m, tmp_path, name='P and L'):
+        import openpyxl
+
+        path = tmp_path / 'b.xlsx'
+        m.to_excel(str(path))
+        ws = openpyxl.load_workbook(str(path))[name]
+        rows = {ws.cell(r, 1).value: r for r in range(1, ws.max_row + 1)}
+        return ws, rows
+
+    def test_the_splice_asks_the_entries_of_a_sum(self, tmp_path):
+        ws, rows = self._sheet(self._model(), tmp_path)
+        r = rows['Revenue']
+        # March: Projects' March is column E (column B holds its Rate).
+        # COUNTA, not COUNT: an entered error or TRUE/FALSE is an entry.
+        assert ws.cell(r, 4).value == (
+            f"=IF(COUNTA(Projects!E5,Projects!E9)=0,"
+            f"D{rows['Revenue · forecast']},D{rows['Revenue · actual']})")
+
+    def test_a_constant_is_no_months_entry(self, tmp_path):
+        # cost = a × rate: the rate is in every month, so it is no
+        # month's entry - one entry is asked directly.
+        ws, rows = self._sheet(self._model(), tmp_path)
+        assert ws.cell(rows['Cost'], 2).value.startswith(
+            '=IF(Projects!C5="",')
+
+    def test_the_count_reads_through_a_derived_line(self, tmp_path):
+        # margin = gross - cost, both formulas: their own rows are never
+        # blank in Excel, so the count reaches what they are built from.
+        ws, rows = self._sheet(self._model(), tmp_path)
+        assert ws.cell(rows['Margin'], 2).value.startswith(
+            '=IF(COUNTA(Projects!C5,Projects!C9)=0,')
+
+    def test_a_formula_it_cannot_read_keeps_the_blank_test(self, tmp_path):
+        ws, rows = self._sheet(self._model(), tmp_path)
+        r = rows['Running']
+        assert ws.cell(r, 2).value == (
+            f"=IF(B{rows['Running · actual']}=\"\",B{rows['Running · forecast']},"
+            f"B{rows['Running · actual']})")
+
+    def test_the_settled_ink_counts_the_same_entries(self, tmp_path):
+        ws, rows = self._sheet(self._model(), tmp_path)
+        ref = f"B{rows['Revenue']}"
+        formulas = [rule.formula for rng in ws.conditional_formatting
+                    for rule in rng.rules if str(rng.sqref) == ref]
+        assert formulas == [['COUNTA(Projects!C5,Projects!C9)>0']]
+
+    def test_a_sheet_name_with_a_space_is_quoted(self):
+        from modeleon.compile.excel.blend_writer import _qualified
+
+        assert _qualified('C5', 'P and L', 'Totals') == "'P and L'!C5"
+        assert _qualified('C5', "Bob's", 'Totals') == "'Bob''s'!C5"
+        assert _qualified('C5', 'Plan\n', 'Totals') == "'Plan\n'!C5"
+        assert _qualified('C5', 'Projects', 'Totals') == 'Projects!C5'
+        assert _qualified('C5', 'Totals', 'Totals') == 'C5'
+
+    def test_more_entries_than_one_call_takes(self):
+        from modeleon.compile.excel.addresses import VariableAddresses
+        from modeleon.compile.excel.blend_writer import _entered
+
+        rows = [f'r{k}' for k in range(300)]
+        addresses = {r: VariableAddresses(name='A1', formula='B1',
+                                          values=[f'B{k + 1}', f'C{k + 1}'])
+                     for k, r in enumerate(rows)}
+        blank, entered = _entered(rows, 1, 2, addresses, {r: 'S' for r in rows}, 'S')
+        assert blank.count('COUNTA(') == 2
+        assert blank.startswith('COUNTA(C1,') and '+COUNTA(C256,' in blank
+        assert blank.endswith(')=0') and entered.endswith(')>0')
+        # A row laid out on other months makes the test unknowable.
+        addresses['r7'] = VariableAddresses(name='A1', formula='B1', values=['B8'])
+        assert _entered(rows, 1, 2, addresses, {r: 'S' for r in rows}, 'S') is None
+
+    def _partial_model(self):
+        m = mo.Model(
+            'm', display_name='M', default_grain='month',
+            default_start='2026-01', default_periods=4,
+            tracks=mo.Tracks('plan', 'forecast', 'actual',
+                             blend=mo.blend(given='actual', follow='forecast',
+                                            name='live')))
+        with m:
+            m.p = mo.MultiVariable('Projects', excel_props={'tab': True})
+            with m.p as p:
+                # B's actual is in for January only: from February the
+                # sum is A's actual alone, until neither is entered.
+                p.a = mo.Variable([10.0] * 4, forecast=[11.0] * 4,
+                                  actual=[9.0, 8.0, 7.0, None], display_name='A')
+                p.b = mo.Variable([20.0] * 4, forecast=[21.0] * 4,
+                                  actual=[19.0, None, None, None], display_name='B')
+                # An entered error is an entry: it carries on, it does
+                # not give way to the forecast.
+                p.e = mo.Variable([10.0] * 4, forecast=[11.0] * 4,
+                                  actual=['#N/A', 8.0, None, None], display_name='E')
+            m.s = mo.MultiVariable('P and L', excel_props={'tab': True})
+            with m.s as s:
+                s.total = mo.Variable(m.p.a + m.p.b, plan=[30.0] * 4,
+                                      display_name='Total')
+                s.broken = mo.Variable(m.p.e * 2, plan=[20.0] * 4,
+                                       display_name='Broken')
+        return m
+
+    @pytest.mark.slow
+    @pytest.mark.parametrize('which', ['entered', 'partial'])
+    def test_the_book_takes_the_forecast_where_the_engine_does(self, tmp_path, which):
+        import shutil
+        import subprocess
+        from pathlib import Path
+
+        import openpyxl
+
+        soffice = shutil.which('soffice') or shutil.which('libreoffice')
+        mac = Path('/Applications/LibreOffice.app/Contents/MacOS/soffice')
+        if soffice is None and mac.exists():
+            soffice = str(mac)
+        if soffice is None:
+            pytest.skip('LibreOffice is not installed')
+        m = self._model() if which == 'entered' else self._partial_model()
+        lines = ((('Revenue', m.s.revenue), ('Cost', m.s.cost),
+                  ('Margin', m.s.margin)) if which == 'entered' else
+                 (('Total', m.s.total), ('Broken', m.s.broken)))
+        src = tmp_path / 'book.xlsx'
+        m.to_excel(str(src))
+        subprocess.run(
+            [soffice, f"-env:UserInstallation={(tmp_path / 'lo').as_uri()}",
+             '--headless', '--convert-to', 'xlsx', '--outdir',
+             str(tmp_path / 'calc'), str(src)],
+            check=True, capture_output=True, timeout=120)
+        ws = openpyxl.load_workbook(str(tmp_path / 'calc' / 'book.xlsx'),
+                                    data_only=True)['P and L']
+        rows = {ws.cell(r, 1).value: r for r in range(1, ws.max_row + 1)}
+        for label, line in lines:
+            book = [ws.cell(rows[label], c).value for c in range(2, 6)]
+            want = line.value['live']
+            assert [x for x in book if isinstance(x, str)] == [
+                x for x in want if isinstance(x, str)], label
+            assert [x for x in book if not isinstance(x, str)] == pytest.approx(
+                [x for x in want if not isinstance(x, str)]), label
+
+
+class TestAWrapperReferencesAHandTrackedLine:
+    """``mo.Variable(row, plan=[...])`` where ``row`` enters its actual by
+    hand: the row's expression describes its other tracks only, so a copy
+    of it wrote the plan's formula into the wrapper's actual row (a book
+    showed interest as actual for months nobody entered). The wrapper
+    references the row instead."""
+
+    def _book(self, tmp_path):
+        import openpyxl
+
+        m = mo.Model('m', default_grain='month', default_start='2026-01',
+                     default_periods=4,
+                     tracks=mo.Tracks('plan', 'forecast', 'actual',
+                                      blend=mo.blend(given='actual', follow='forecast',
+                                                     name='live')))
+        with m:
+            m.s = mo.MultiVariable('Savings', excel_props={'tab': True})
+            with m.s as s:
+                s.principal = mo.Variable(100000.0, display_name='Principal')
+                s.rate = mo.Variable(0.06, display_name='Rate')
+                s.rev = mo.Variable([s.principal * s.rate / 12 for _ in range(4)],
+                                    actual=[s.principal * s.rate / 12,
+                                            s.principal * s.rate / 12, None, None],
+                                    display_name='Rev')
+            m.p = mo.MultiVariable('PnL', excel_props={'tab': True})
+            with m.p as p:
+                p.x = mo.Variable(m.s.rev, plan=[450.0] * 4, display_name='X')
+        path = tmp_path / 'b.xlsx'
+        m.to_excel(str(path))
+        ws = openpyxl.load_workbook(str(path))['PnL']
+        return m, {ws.cell(r, 1).value: [ws.cell(r, c).value for c in range(2, 6)]
+                   for r in range(1, ws.max_row + 1)}
+
+    def test_the_actual_row_reads_the_lines_actual(self, tmp_path):
+        m, rows = self._book(tmp_path)
+        # Savings: Jan is column C (column B holds the constants); Rev's
+        # actual is its row 7.
+        assert rows['X · actual'] == ['=Savings!C7', '=Savings!D7', '=Savings!E7',
+                                      '=Savings!F7']
+        assert rows['X · forecast'] == ['=Savings!C6', '=Savings!D6', '=Savings!E6',
+                                        '=Savings!F6']
+
+    def test_the_formula_names_the_line(self, tmp_path):
+        m, _ = self._book(tmp_path)
+        assert m.p.x._expr.to_string() == 'rev'
+        # A reference shows a blank as 0, as Excel's =A1 does; nothing
+        # was entered there, so the live row takes the forecast.
+        assert m.p.x.value['actual'][2] == 0
+        assert m.p.x.value['live'][2] == 500.0
+
+
 class TestTrackSubrowsCarryTheirOwnFormula:
     """A DERIVED track explains itself in ITS OWN coordinates.
 
     The blend row has always carried the line's formula over its
-    operands' blend rows. The other subrows got numbers, so «Итого ·
-    план» sat frozen under a row that recomputed — change January's
-    план in the written file and the план total did not move. The
+    operands' blend rows. The other subrows got numbers, so "Total ·
+    plan" sat frozen under a row that recomputed — change January's
+    plan in the written file and the plan total did not move. The
     engine already knows the answer (a derived track's value IS the
     line's expression over the operands' same-track values), so the
     same expression through a per-track address book is the honest
@@ -1618,8 +1950,8 @@ class TestTrackSubrowsCarryTheirOwnFormula:
 
         m = mo.Model(
             "m", display_name="M",
-            tracks=mo.Tracks("план", "факт",
-                             blend=mo.blend(given="факт", follow="план")),
+            tracks=mo.Tracks("plan", "actual",
+                             blend=mo.blend(given="actual", follow="plan")),
             default_grain="month", default_start="2026-01",
             default_periods=2,
             default_excel_view=mo.ExcelView(tracks="rows"),
@@ -1627,12 +1959,12 @@ class TestTrackSubrowsCarryTheirOwnFormula:
         with m:
             m.s = mo.MultiVariable("S", excel_props={"tab": True})
             with m.s as s:
-                s.a = mo.Variable([10.0, 20.0], display_name="А",
-                                  факт=[11.0, None])
-                s.ставка = mo.Variable(0.5, display_name="Ставка")
-                s.derived = mo.Variable(s.a * s.ставка, display_name="Д")
-                s.mixed = mo.Variable(s.a + s.a, display_name="М",
-                                      факт=[99.0, 98.0])
+                s.a = mo.Variable([10.0, 20.0], display_name="A",
+                                  actual=[11.0, None])
+                s.rate = mo.Variable(0.5, display_name="Rate")
+                s.derived = mo.Variable(s.a * s.rate, display_name="Derived")
+                s.mixed = mo.Variable(s.a + s.a, display_name="Mixed",
+                                      actual=[99.0, 98.0])
         path = tmp_path / "b.xlsx"
         m.to_excel(str(path))
         ws = openpyxl.load_workbook(str(path))["S"]
@@ -1648,37 +1980,38 @@ class TestTrackSubrowsCarryTheirOwnFormula:
 
     def test_a_derived_track_reads_its_own_track(self, tmp_path):
         rows = self._book(tmp_path)
-        план = rows["Д · план"][0]
-        факт = rows["Д · факт"][0]
-        assert isinstance(план, str) and план.startswith("=")
-        assert isinstance(факт, str) and факт.startswith("=")
+        plan = rows["Derived · plan"][0]
+        actual = rows["Derived · actual"][0]
+        assert isinstance(plan, str) and plan.startswith("=")
+        assert isinstance(actual, str) and actual.startswith("=")
         # …and they point at DIFFERENT rows — each its own track's.
-        assert план != факт
+        assert plan != actual
 
     def test_an_untracked_operand_keeps_its_single_cell(self, tmp_path):
         rows = self._book(tmp_path)
-        # «Ставка» has no tracks, so every track's formula multiplies by
+        # "Rate" has no tracks, so every track's formula multiplies by
         # the same cell — a constant reads the same from anywhere.
-        план, факт = rows["Д · план"][0], rows["Д · факт"][0]
-        общий = set(re.findall(r"B\d+", план)) & set(re.findall(r"B\d+", факт))
-        assert общий, (план, факт)
+        plan, actual = rows["Derived · plan"][0], rows["Derived · actual"][0]
+        shared = set(re.findall(r"B\d+", plan)) & set(re.findall(r"B\d+", actual))
+        assert shared, (plan, actual)
 
     def test_an_authored_track_stays_data(self, tmp_path):
         rows = self._book(tmp_path)
-        # «А» typed both tracks; «М» typed only факт. Typed series are
-        # data — a formula there would overwrite what the user entered.
-        assert rows["А · план"][0] == 10.0
-        assert rows["А · факт"][0] == 11.0
-        assert rows["М · факт"][0] == 99.0
-        # …while М's план is derived and does get one.
-        assert str(rows["М · план"][0]).startswith("=")
+        # "A" typed both tracks; "Mixed" typed only actual. Typed series
+        # are data — a formula there would overwrite what the user
+        # entered.
+        assert rows["A · plan"][0] == 10.0
+        assert rows["A · actual"][0] == 11.0
+        assert rows["Mixed · actual"][0] == 99.0
+        # …while Mixed's plan is derived and does get one.
+        assert str(rows["Mixed · plan"][0]).startswith("=")
 
     def test_the_blend_row_is_left_to_its_own_writer(self, tmp_path):
         rows = self._book(tmp_path)
         # A spliced line's blend still asks its subrows; a derived
         # line's blend still carries the shared formula.
-        assert str(rows["А"][0]).startswith("=IF(")
-        assert str(rows["Д"][0]).startswith("=")
+        assert str(rows["A"][0]).startswith("=IF(")
+        assert str(rows["Derived"][0]).startswith("=")
 
 
 class TestLoopBuiltIntermediatesReferenceTheirRows:
@@ -1697,24 +2030,24 @@ class TestLoopBuiltIntermediatesReferenceTheirRows:
 
         m = mo.Model(
             "m", display_name="M",
-            tracks=mo.Tracks("план", "факт",
-                             blend=mo.blend(given="факт", follow="план")),
+            tracks=mo.Tracks("plan", "actual",
+                             blend=mo.blend(given="actual", follow="plan")),
             default_grain="month", default_start="2026-01",
             default_periods=2,
         )
         with m:
             m.s = mo.MultiVariable("S", excel_props={"tab": True})
             with m.s as s:
-                s.ставка = mo.Variable(0.1, display_name="Ставка")
-                оклады = [mo.Variable(100.0), mo.Variable(200.0)]
-                налог = [о * s.ставка for о in оклады]
-                чистыми = [о - н for о, н in zip(оклады, налог)]
-                s.оклад = mo.Variable(оклады, display_name="Оклад",
-                                      факт=[None, None])
-                s.налог = mo.Variable(налог, display_name="Налог",
-                                      факт=[None, None])
-                s.чистыми = mo.Variable(чистыми, display_name="Чистыми",
-                                        факт=[None, None])
+                s.rate = mo.Variable(0.1, display_name="Rate")
+                gross = [mo.Variable(100.0), mo.Variable(200.0)]
+                fee = [x * s.rate for x in gross]
+                net = [x - f for x, f in zip(gross, fee)]
+                s.gross = mo.Variable(gross, display_name="Gross",
+                                      actual=[None, None])
+                s.fee = mo.Variable(fee, display_name="Fee",
+                                    actual=[None, None])
+                s.net = mo.Variable(net, display_name="Net",
+                                    actual=[None, None])
         path = tmp_path / "b.xlsx"
         m.to_excel(str(path))
         ws = openpyxl.load_workbook(str(path))["S"]
@@ -1730,17 +2063,35 @@ class TestLoopBuiltIntermediatesReferenceTheirRows:
 
     def test_the_consumer_references_the_intermediate_rows(self, tmp_path):
         rows = self._book(tmp_path)
-        налог = str(rows["Налог · план"][0])
-        чистыми = str(rows["Чистыми · план"][0])
-        # Налог references the оклад subrow's cell, not an unrolled
+        fee = str(rows["Fee · plan"][0])
+        net = str(rows["Net · plan"][0])
+        # Fee references the gross subrow's cell, not an unrolled
         # copy of its expression…
-        assert налог.startswith("=") and "*" in налог
-        # …and Чистыми references BOTH rows by cell: it must contain
+        assert fee.startswith("=") and "*" in fee
+        # …and Net references BOTH rows by cell: it must contain
         # cell refs and no second copy of the multiplication.
-        assert чистыми.startswith("=")
-        assert "*" not in чистыми, чистыми
+        assert net.startswith("=")
+        assert "*" not in net, net
     def test_lengths_stay_flat(self, tmp_path):
         rows = self._book(tmp_path)
         # The unrolled form grew with every hop; the referenced form
         # stays a handful of cells.
-        assert len(str(rows["Чистыми · план"][0])) < 30
+        assert len(str(rows["Net · plan"][0])) < 30
+
+
+
+def test_a_grain_mismatch_names_both_lines():
+    m = mo.Model('Deal', default_grain='year', default_start='2026', default_periods=2)
+    with m:
+        m.ops = mo.MultiVariable('Ops')
+        with m.ops as o:
+            o.cash = mo.Variable([40.0, 40.0], display_name='Cash')
+        m.debt = mo.MultiVariable('Debt', default_grain='quarter', default_start='2026-Q1',
+                                  default_periods=8)
+        with m.debt as d:
+            d.interest = mo.Variable([1.0] * 8, display_name='Interest')
+            with pytest.raises(ValueError) as err:
+                d.left = m.ops.cash - d.interest
+    msg = str(err.value)
+    assert "'Cash' (years)" in msg and "'Interest' (quarters)" in msg
+    assert "interest.at('year')" in msg

@@ -5,10 +5,9 @@
 Thanks for your interest. Modeleon is open-source under the Apache
 License 2.0 and welcomes contributions of every size.
 
-> **A note up front.** Modeleon is currently maintained by one person.
-> I'll do my best to respond, but please expect **weeks, not days** for
-> issue triage and PR reviews. If something feels stuck, a polite
-> nudge in the thread is fine.
+> **A note up front.** Please expect some time for issue triage and PR
+> reviews. If something feels stuck, a polite nudge in the thread is
+> fine.
 
 ## License of contributions
 
@@ -38,11 +37,11 @@ the PR is itself the agreement.
   traceback, your Python version (`python --version`), and your
   modeleon version (`pip show modeleon`).
 - **Question?** Open a
-  [Discussion](https://github.com/modeleonai/modeleon/discussions). I
-  read them when I can — sometimes promptly, sometimes after a while.
-  Other users may help before I get there.
+  [Discussion](https://github.com/modeleonai/modeleon/discussions). We
+  read them when we can — sometimes promptly, sometimes after a while.
+  Other users may help before we get there.
 - **Feature idea?** Open a Discussion first to talk through the use
-  case before opening an issue. I'd rather discuss the problem than
+  case before opening an issue. We'd rather discuss the problem than
   the solution.
 
 ## Submitting a pull request
@@ -62,7 +61,7 @@ The bar for merge:
    cash-flow list in IRR"), first line under 70 chars, longer body
    when the *why* isn't obvious from the diff.
 
-I may not get to your PR right away. That's not a rejection — it's
+We may not get to your PR right away. That's not a rejection — it's
 the realistic pace of a small-team project.
 
 ## Code style

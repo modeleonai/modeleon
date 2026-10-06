@@ -7,13 +7,14 @@ Organized by topic:
 - :mod:`mathfn`       — ``ABS``, ``ROUND``, ``INT``, ``MOD``
 - :mod:`conditional`  — ``IF``, ``AND``, ``OR``, ``NOT``, ``CHOOSE``,
   ``ISBLANK``
-- :mod:`dates`        — ``YEAR``, ``MONTH``, ``DAY``, ``DATE``, ``EDATE``, ``EOMONTH``, ``DAYS360``, ``TODAY``
+- :mod:`dates`        — ``YEAR``, ``MONTH``, ``DAY``, ``DATE``, ``EDATE``, ``EOMONTH``, ``DAYS360``,
+  ``YEARFRAC``, ``DAYS``, ``TODAY``
 - :mod:`text`         — ``LEN``, ``UPPER``, ``LOWER``, ``CONCAT``
 - :mod:`recurrence`   — ``recurrence``, ``recurrence_sum``, ``cumsum``
 - :mod:`lag`          — ``lag``
 - :mod:`schedule`     — ``schedule``
 - :mod:`cohort`       — ``cohort_retention``
-- :mod:`financial`    — ``IRR``, ``NPV``, ``XIRR``, ``PMT``, ``FV``, ``PV``
+- :mod:`financial`    — ``IRR``, ``NPV``, ``XIRR``, ``XNPV``, ``PMT``, ``FV``, ``PV``
 
 The :class:`Unit` type lives in :mod:`modeleon.core.unit` — it's a
 primitive used by :class:`Variable` itself, not a formula helper.
@@ -35,8 +36,8 @@ from ._helpers import pyformula, val
 from .aggregate import AVERAGE, MAX, MIN, SUM
 from .cohort import cohort_retention
 from .conditional import AND, CHOOSE, IF, ISBLANK, NOT, OR
-from .dates import DATE, DAY, DAYS360, EDATE, EOMONTH, MONTH, TODAY, YEAR
-from .financial import FV, IRR, NPV, PMT, PV, XIRR
+from .dates import DATE, DAY, DAYS, DAYS360, EDATE, EOMONTH, MONTH, TODAY, YEAR, YEARFRAC
+from .financial import FV, IRR, NPV, PMT, PV, XIRR, XNPV
 from .mathfn import ABS, INT, MOD, ROUND
 from .lag import lag
 from .schedule import schedule
@@ -53,10 +54,11 @@ __all__ = [
     "IF", "AND", "OR", "NOT", "CHOOSE", "ISBLANK",
     # Dates
     "YEAR", "MONTH", "DAY", "DATE", "EDATE", "EOMONTH", "DAYS360", "TODAY",
+    "YEARFRAC", "DAYS",
     # Text
     "LEN", "UPPER", "LOWER", "CONCAT",
     # Financial
-    "IRR", "NPV", "XIRR", "PMT", "FV", "PV",
+    "IRR", "NPV", "XIRR", "XNPV", "PMT", "FV", "PV",
     # Domain helpers (no Excel equivalent — stay lowercase)
     "cumsum", "lag",
     "schedule", "recurrence", "recurrence_sum", "cohort_retention",

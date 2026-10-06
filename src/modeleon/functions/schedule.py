@@ -5,7 +5,7 @@ A "constant" like a tax rate lives in time and changes at dates the law
 names. Spelling it as N hand-written cells or an ``IF`` chain lies about
 its nature; a schedule states it:
 
-    ндс = mo.schedule({'2025-01': 0.12, '2026-01': 0.16})
+    vat = mo.schedule({'2025-01': 0.15, '2027-07': 0.17})
 
 Dates, not positions — the spelling is grain-agnostic, survives a window
 change, and reads like the regulation it encodes. The value materializes
@@ -47,7 +47,7 @@ def schedule(
     if not isinstance(steps, dict) or not steps:
         raise TypeError(
             "mo.schedule({...}) needs a non-empty {date: value} dict, "
-            "e.g. mo.schedule({'2025-01': 0.12, '2026-01': 0.16})."
+            "e.g. mo.schedule({'2025-01': 0.15, '2027-07': 0.17})."
         )
     for k in steps:
         if not isinstance(k, str) or not k.strip():

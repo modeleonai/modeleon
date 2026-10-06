@@ -10,19 +10,18 @@ ambiently — exactly like the time window:
     )
 
 Track names are USER CONTENT — any words, any language, any count —
-the same way variable names are (``mo.Tracks('факт', 'бюджет')`` works
-the same). A keyword spelling attaches a display label distinct from
-the name (``mo.Tracks(budget='Budget 2026')``); the positional spelling
-uses the name as its own label.
+the same way variable names are (non-Latin ones included:
+``mo.Tracks('réel', '予算')`` works the same). A keyword spelling
+attaches a display label distinct from the name
+(``mo.Tracks(budget='Budget 2026')``); the positional spelling uses
+the name as its own label.
 
 The engine attaches NO semantics to any track name: tracks are parallel
 series inside one Variable — broadcasting arithmetic, slicing, lifts —
 pure mechanism. Even ``blend=`` only splices the tracks it is told to
-name. Financial role BEHAVIORS (which track holds actuals, what a
-scenario may touch, variance sign) are not the engine's business: code
-built on top that needs them assigns a role to a track EXPLICITLY
-(e.g. by marking "this track plays the actuals role"). Declaring tracks
-never requires declaring roles.
+name. Any financial meaning (which track holds actuals, the sign of a
+variance) is left to your own code; the engine never infers it from a
+name. Declaring tracks never requires declaring roles.
 """
 
 from __future__ import annotations

@@ -34,6 +34,7 @@ if TYPE_CHECKING:
         RollingAggregate,
         SelfRef,
         Subscript,
+        TimeRef,
         UnaryOp,
         VarRef,
     )
@@ -85,6 +86,12 @@ class RenderCtx:
     # formula is true now but not stable: a caller that caches formula
     # text must not reuse it across value edits of that operand.
     inlined_value: bool = False
+    # The expression whose previous value THIS row's previous cell holds:
+    # the cell's whole expression (and what a paren or an alias wraps), or
+    # the chain a composition law folds. Only it may chain on "the previous
+    # cell"; a roll-forward inlined anywhere else would read the ENCLOSING
+    # row's previous cell and compute another number.
+    own_chain: Optional[Any] = None
 
 
 class Renderer(Protocol):
@@ -135,6 +142,7 @@ class Renderer(Protocol):
     def render_restrict(
         self, node: "Restrict", ctx: RenderCtx
     ) -> Any: ...
+    def render_timeref(self, node: "TimeRef", ctx: RenderCtx) -> Any: ...
 
 
 _PLACEHOLDER = object()

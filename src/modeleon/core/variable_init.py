@@ -33,6 +33,24 @@ def _plugin_variable_kwargs() -> set:
     return set(get_registry().get("variable_kwargs", {}).keys())
 
 
+
+def _blanks_read_as_zero(value):
+    """A reference to a line shows its blanks as 0, as Excel's ``=A1``
+    does - kept blank in a line of dates or words."""
+    from .regrain import hole_value
+    from .tracks import TrackValues
+    if hole_value(value) is None:
+        return value                    # dates / words: no zero
+
+    def fill(v):
+        if isinstance(v, list):
+            return [0 if x is None else x for x in v]
+        return 0 if v is None else v
+
+    if isinstance(value, TrackValues):
+        return TrackValues.lift(fill, value)
+    return fill(value)
+
 class _VariableInit:
     """Construction mixin: dispatchers for value / formula / pyformula,
     type coercion, auto-detection, and kwarg sorting.
@@ -114,6 +132,13 @@ class _VariableInit:
         """Handle the ``pyformula=`` argument. Returns the updated var_type."""
         from .variable import Variable
         if isinstance(pyformula, Variable):
+            if pyformula._awaits or pyformula._forward_of is not None:
+                # Arbitrary Python cannot be run again when the loop
+                # closes; its value would stay the provisional one.
+                raise ValueError(
+                    "pyformula= over a row whose loop has not closed yet — "
+                    "build this row after the loop's last line."
+                )
             self._value = pyformula._value
             var_type = pyformula.var_type
             self._dependency_refs = [pyformula]
@@ -138,13 +163,22 @@ class _VariableInit:
             # A passed-in Variable is a reference, not a copy of the inputs
             self._value = value._value
             var_type = value.var_type
-            if value._expr is not None:
+            if (getattr(value, '_role_kwargs', None)
+                    and getattr(value, '_owner', None) is not None):
+                # A line with tracks entered by hand (``actual=[...]``):
+                # its expression describes the other tracks only, so a
+                # copy of it would write the plan's formula into the
+                # actual's row. Reference the line itself.
+                self._set_expr(VarRef(value))
+                self._value = _blanks_read_as_zero(value._value)
+            elif value._expr is not None:
                 self._set_expr(value._expr)
             elif value.is_formula:
                 self._raw_formula_str = value.formula
                 self._dependency_refs = list(value._dependency_refs)
             else:
                 self._set_expr(VarRef(value))
+                self._value = _blanks_read_as_zero(value._value)
             if value._source_code is not None:
                 self._source_code = value._source_code
             return var_type, value_type

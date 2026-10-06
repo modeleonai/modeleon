@@ -79,14 +79,15 @@ def _shared_arg_unit(ast_args: list):
     """The single unit shared by every unit-bearing Variable operand
     (top-level VarRef args), else None — never guess."""
     from ..core.expr import VarRef
+    from ..core.unit import unit_key
 
     units = []
     seen = set()
     for node in ast_args:
         var = getattr(node, 'var', None) if isinstance(node, VarRef) else None
         u = getattr(var, '_unit', None) if var is not None else None
-        if u is not None and str(u) not in seen:
-            seen.add(str(u))
+        if u is not None and unit_key(u) not in seen:
+            seen.add(unit_key(u))
             units.append(u)
     return units[0] if len(units) == 1 else None
 
@@ -131,8 +132,8 @@ def make_func_var(
     result.var_type = var_type
     result.value_type = value_type
     # Unit preservation, the generic law: a numeric function over
-    # operands that share ONE unit keeps it — an IF-capped amount stays ₸,
-    # ROUND(₸) is ₸. Functions whose RESULT is a different kind of
+    # operands that share ONE unit keeps it — an IF-capped amount stays $,
+    # ROUND($) is $. Functions whose RESULT is a different kind of
     # number (counts, rates, day-spans) are excluded; mixed or absent
     # units stamp nothing.
     if value_type in ('int', 'float') and func_name not in _UNITLESS_RESULTS:

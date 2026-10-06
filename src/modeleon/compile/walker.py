@@ -24,6 +24,7 @@ from ..core.expr import (
     RollingAggregate,
     SelfRef,
     Subscript,
+    TimeRef,
     UnaryOp,
     VarRef,
 )
@@ -55,6 +56,7 @@ class Walker:
             RollingAggregate: renderer.render_rollingaggregate,
             Regrain:          renderer.render_regrain,
             Restrict:         renderer.render_restrict,
+            TimeRef:          renderer.render_timeref,
         }
 
     def render(self, node: Expr, ctx: "RenderCtx") -> Any:

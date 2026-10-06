@@ -22,19 +22,27 @@ Usage::
     hours = Variable(160, unit='hr')
     rate = revenue / hours          # rate._unit → '$/hr'
 
-``Unit`` inherits from :class:`MultiVariableClass` so unit instances
-can be placed in the model tree as nodes — this keeps the seam open
-for future unit-conversion support (FX rates, hr ↔ day, $ ↔ $K)
-without a breaking refactor. Today ``Unit`` only carries its symbol
-algebra; the MV facilities are unused.
+A string names a dimension: any word the author writes (``'USD m'``,
+``'GWh'``, ``'EUR/kWh'``) is one, and addition holds strictly between
+dimensions. A word that labels a pure number (a discount factor, a
+share, a flag) is declared once as a labelled dimensionless unit and
+passed as the object — it prints its word and is inert in the algebra::
+
+    FACTOR = Unit.dimensionless('factor')
+    df = Variable(0.91, unit=FACTOR)         # prints 'factor'
+    pv = cash * df                           # cash's unit: the label is inert
+
+Four words are labelled pure numbers by convention, as strings:
+``'%'``, ``'x'``, ``'bps'`` and ``'pp'``.
+
+A unit is a plain value: assigned to a model it is an attribute, never
+a row or a section.
 """
 
 from typing import Dict, Optional
 
-from .multi_variable import MultiVariableClass
 
-
-class Unit(MultiVariableClass):
+class Unit:
     """Measurement unit with symbolic algebra.
 
     Internally stores a dict of base symbols to integer exponents::
@@ -43,33 +51,34 @@ class Unit(MultiVariableClass):
         'hr'          → {'hr': 1}
         '$/hr'        → {'$': 1, 'hr': -1}
         '$/(hr * Gb)' → {'$': 1, 'hr': -1, 'Gb': -1}
-        '%'           → {} (dimensionless)
+        '%'           → {} (dimensionless, labelled '%')
 
-    Inherits from :class:`MultiVariableClass` for forward compatibility
-    with unit-conversion (see module docstring); none of the MV
-    machinery is exercised here today.
+    Equality is the dimension alone, so every dimensionless unit equals
+    every other (``'%' + 'pp'`` adds); the label is what prints.
     """
 
-    _DIMENSIONLESS_SYMBOLS = {'%', 'x', 'bps', 'pp'}
+    #: The words a string names as a labelled pure number, not a
+    #: dimension — by convention, the same for every author.
+    _DIMENSIONLESS_SYMBOLS = frozenset({'%', 'x', 'bps', 'pp'})
 
-    def __init__(self, symbol: Optional[str] = None, *, _components: Optional[Dict[str, int]] = None, **kwargs):
+    def __init__(self, symbol: Optional[str] = None, *,
+                 _components: Optional[Dict[str, int]] = None):
         self._unit_components: Dict[str, int] = {}
         self._display_symbol: Optional[str] = None
 
         if _components is not None:
             self._unit_components = {k: v for k, v in _components.items() if v != 0}
         elif symbol is not None:
+            if not isinstance(symbol, str):
+                raise TypeError(
+                    f"Unit takes a unit string ('USD m', '$/hr'); got "
+                    f"{type(symbol).__name__}. A pure number with a label is "
+                    f"Unit.dimensionless('factor')."
+                )
             if symbol in self._DIMENSIONLESS_SYMBOLS:
-                self._unit_components = {}
                 self._display_symbol = symbol
             else:
                 self._unit_components = self._parse(symbol)
-
-        super().__init__(**kwargs)
-
-    def compute(self, **kwargs):
-        from ..core.variable import Variable
-        self.display = Variable(str(self), value_type='string')
 
     @staticmethod
     def _parse(text: str) -> Dict[str, int]:
@@ -124,14 +133,42 @@ class Unit(MultiVariableClass):
         """Parse a unit string and return a Unit instance."""
         if isinstance(text, Unit):
             return text
-        if text in cls._DIMENSIONLESS_SYMBOLS:
-            return cls(text)
         return cls(text)
 
     @classmethod
-    def dimensionless(cls) -> 'Unit':
-        """Return a dimensionless unit (empty components)."""
-        return cls(_components={})
+    def dimensionless(cls, label: Optional[str] = None) -> 'Unit':
+        """A dimensionless unit: a pure number, inert in the algebra.
+
+        With a ``label`` it prints that word — in a workbook's unit
+        column, beside a row's name — and multiplies, divides and adds as
+        the number it is, the way ``'%'`` does::
+
+            FACTOR = Unit.dimensionless('factor')
+            pv = cash * discount       # discount in FACTOR: pv keeps cash's unit
+
+        A string unit is always a dimension (``Unit('factor')`` is one), so
+        a word that labels a pure number is declared with this, once, and
+        the object is passed as the unit. Dimensionless units add to one
+        another, the left label printing (a factor plus a share is a
+        factor); a product of two carries no label, as with ``'%'``.
+        """
+        unit = cls(_components={})
+        if label is None:
+            return unit
+        if not isinstance(label, str):
+            raise TypeError(
+                f"a unit's label is a word (str); got {type(label).__name__}."
+            )
+        word = label.strip()
+        if not word:
+            raise ValueError("a unit's label is a word; got an empty one.")
+        if any(ch in word for ch in '/*^'):
+            raise ValueError(
+                f"a label is one word, not an expression: {label!r}. A unit "
+                f"built of others is a dimension, not a label."
+            )
+        unit._display_symbol = word
+        return unit
 
     def __mul__(self, other):
         if isinstance(other, Unit):
@@ -208,8 +245,22 @@ class Unit(MultiVariableClass):
         return ''
 
     def __repr__(self):
-        return f"Unit('{self}')"
+        # The constructor that rebuilds it: the string for a dimension or a
+        # conventional word, the classmethod for a declared label.
+        if self._unit_components or self._display_symbol in self._DIMENSIONLESS_SYMBOLS:
+            return f"Unit({str(self)!r})"
+        if self._display_symbol:
+            return f"Unit.dimensionless({self._display_symbol!r})"
+        return "Unit.dimensionless()"
 
     def __bool__(self):
         """A Unit is truthy if it has components or a display symbol (e.g. '%')."""
         return bool(self._unit_components) or bool(self._display_symbol)
+
+
+def unit_key(unit: Unit) -> tuple:
+    """A unit as one value for "the same unit": its dimension and, for a
+    pure number, its label. Two lines in ``'%'`` and in ``'x'`` add (both
+    are pure numbers), but an aggregate over them names neither."""
+    components = tuple(sorted(unit._unit_components.items()))
+    return (components, None if components else unit._display_symbol)

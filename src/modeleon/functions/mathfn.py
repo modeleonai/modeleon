@@ -23,10 +23,32 @@ Numeric = Union[Variable, Number]
 
 
 def _apply(py_fn, raw) -> tuple[Any, str]:
-    """Apply ``py_fn`` element-wise over list values, passthrough None."""
+    """Apply ``py_fn`` element-wise over list values, and track by track
+    over a line with tracks. A blank counts as zero (``ROUND`` of a blank
+    cell is 0 in the spreadsheet); an error cell (``'#DIV/0!'``) passes
+    through, as arithmetic already carries one; a zero divisor is
+    ``#DIV/0!``."""
+    from ..core.tracks import TrackValues
+
+    def one(v: Any) -> Any:
+        if isinstance(v, str) and v.startswith("#"):
+            return v
+        try:
+            return py_fn(0 if v is None else v)
+        except ZeroDivisionError:
+            return '#DIV/0!'
+        except TypeError:
+            return '#VALUE!'
+
+    def series(v: Any) -> Any:
+        return [one(x) for x in v] if isinstance(v, list) else one(v)
+
+    if isinstance(raw, TrackValues):
+        return (TrackValues.lift(series, raw),
+                'list' if raw.time_length is not None else 'scalar')
     if isinstance(raw, list):
-        return [py_fn(v) if v is not None else None for v in raw], 'list'
-    return (py_fn(raw) if raw is not None else None), 'scalar'
+        return [one(v) for v in raw], 'list'
+    return one(raw), 'scalar'
 
 
 def ABS(value: Numeric) -> Variable:
@@ -98,7 +120,7 @@ def ROUND(value: Numeric, digits: Numeric = 0) -> Variable:
     """
     raw, expr = operand(value)
     raw_digits, digits_expr = operand(digits)
-    d = int(raw_digits)
+    d = int(raw_digits or 0)            # blank digits read as 0
     calc, var_type = _apply(lambda v: _spreadsheet_round(v, d), raw)
     value_type = value.value_type if isinstance(value, Variable) else 'float'
     return make_func_var(
@@ -127,9 +149,24 @@ def MOD(number: Numeric, divisor: Numeric) -> Variable:
     For the usual case, the ``%`` operator already compiles to ``MOD(...)``.
     Use this when you want the explicit function call form in the Excel output.
     """
+    from ..core.tracks import TrackValues
+    from ..core.variable_ops import _VariableArithmetic
+
     num_val, num_expr = operand(number)
     div_val, div_expr = operand(divisor)
-    calc, var_type = _apply(lambda v: v % div_val, num_val)
+
+    def mod(a: Any, b: Any) -> Any:
+        # Element-wise with broadcasting, as the ``%`` operator: a blank is
+        # 0, a zero divisor #DIV/0!, the result takes the divisor's sign.
+        return _VariableArithmetic._broadcast_operation(
+            a, b, lambda x, y: x % y, safe_divide=True, op_symbol='%')
+
+    if isinstance(num_val, TrackValues) or isinstance(div_val, TrackValues):
+        calc: Any = TrackValues.combine(num_val, div_val, mod)
+        var_type = 'list' if calc.time_length is not None else 'scalar'
+    else:
+        calc = mod(num_val, div_val)
+        var_type = 'list' if isinstance(calc, list) else 'scalar'
     return make_func_var(
         "MOD", [num_expr, div_expr], calc, 'float', var_type,
         source_code=f"MOD({src(number)}, {src(divisor)})",

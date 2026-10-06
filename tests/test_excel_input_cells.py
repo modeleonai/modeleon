@@ -191,7 +191,7 @@ class TestComputedDates:
         m.pick._display_name = "Pick"
         m.first = mo.CHOOSE(1, m.start, m.end)
         m.first._display_name = "First"
-        m.due = mo.Variable(mo.DATE(2024, 5, 1), display_name="Due")
+        m.due = mo.Variable(mo.DATE(mo.YEAR(m.start), 5, 1), display_name="Due")
         cells = _cells(m, tmp_path)
         for label in ("Pick", "First", "Due"):
             (cell,) = cells[label]
@@ -207,6 +207,108 @@ class TestComputedDates:
         (cell,) = _cells(m, tmp_path)["Span"]
         assert cell.value.startswith("=")
         assert "yy" not in cell.number_format
+
+
+class TestTypedDates:
+    """``mo.DATE`` of three numbers is a date the author typed: as a line of
+    its own it is an input - the date written as a value, not
+    ``=DATE(...)`` - while inside a formula it stays the call it reads as."""
+
+    def test_a_typed_date_is_an_input_cell(self, tmp_path):
+        from modeleon.compile.excel.layout import row_kind
+
+        m = mo.Model("Dates")
+        m.close = mo.DATE(2026, 7, 1)
+        m.close._display_name = "Close"
+        m.due = mo.Variable(mo.DATE(2026, 12, 31), display_name="Due")
+        cells = _cells(m, tmp_path)
+        for label, line, day in (("Close", m.close, date(2026, 7, 1)),
+                                 ("Due", m.due, date(2026, 12, 31))):
+            (cell,) = cells[label]
+            assert cell.value == datetime(day.year, day.month, day.day), label
+            assert cell.number_format == "yyyy-mm-dd", label
+            assert not line.is_formula and row_kind(line) == "input", label
+            assert line.value == day and line.value_type == "datetime", label
+
+    def test_inside_a_formula_it_stays_a_date_call(self, tmp_path):
+        m = mo.Model("Dates", default_grain="month", default_start="2026-01",
+                     default_periods=2)
+        with m:
+            m.close = mo.DATE(2026, 2, 1)
+            m.close._display_name = "Close"
+            m.inline = mo.IF(mo.time.start >= mo.DATE(2026, 2, 1), 1, 0)
+            m.inline._display_name = "Inline"
+            m.reads = mo.IF(mo.time.start >= m.close, 1, 0)
+            m.reads._display_name = "Reads"
+        cells = _cells(m, tmp_path)
+        assert all("DATE(2026, 2, 1)" in c.value for c in cells["Inline"])
+        (close,) = cells["Close"]
+        assert all(f"{close.coordinate}" in c.value for c in cells["Reads"])
+        assert m.inline.value == m.reads.value == [0, 1]
+
+    def test_a_date_built_from_another_line_stays_a_formula(self, tmp_path):
+        m = mo.Model("Dates")
+        m.year = mo.Variable(2026, display_name="Year")
+        m.start = mo.DATE(m.year, 1, 1)
+        m.start._display_name = "Start"
+        (cell,) = _cells(m, tmp_path)["Start"]
+        assert cell.value.startswith("=DATE(") and m.start.is_formula
+
+    def test_a_list_of_typed_dates_and_typed_tracks_are_inputs(self, tmp_path):
+        m = mo.Model("Dates", default_grain="month", default_start="2026-01",
+                     default_periods=2, tracks=mo.Tracks("plan", "actual"),
+                     default_excel_view=mo.ExcelView(tracks="rows"))
+        with m:
+            m.paid = mo.Variable([mo.DATE(2026, 1, 15), mo.DATE(2026, 2, 15)],
+                                 display_name="Paid")
+            m.close = mo.Variable(plan=mo.DATE(2026, 2, 1), actual=mo.DATE(2026, 3, 1),
+                                  display_name="Close")
+            m.mixed = mo.Variable(plan=date(2026, 2, 1), actual=mo.DATE(2026, 3, 1),
+                                  display_name="Mixed")
+        cells = _cells(m, tmp_path)
+        assert [c.value for c in cells["Paid"]] == [datetime(2026, 1, 15), datetime(2026, 2, 15)]
+        for label in ("Close", "Close · actual", "Mixed", "Mixed · actual"):
+            (cell,) = cells[label]
+            assert isinstance(cell.value, datetime), (label, cell.value)
+        assert not (m.paid.is_formula or m.close.is_formula or m.mixed.is_formula)
+
+    def test_a_wrapped_typed_date_inside_a_formula_keeps_its_text(self):
+        m = mo.Model("Dates", default_grain="month", default_start="2026-01",
+                     default_periods=2)
+        with m:
+            m.flag = mo.IF(mo.time.start >= mo.Variable(mo.DATE(2026, 2, 1)), 1, 0)
+        assert "DATE(2026, 2, 1)" in m.flag.formula
+        assert m.flag.value == [0, 1]
+
+    def test_a_class_typing_its_date_argument_holds_an_input(self):
+        class Project(mo.MultiVariableClass):
+            def compute(self, start):
+                self.start = mo.Variable(start, display_name="Start")
+                self.end = mo.EDATE(self.start, 3)
+
+        m = mo.Model("Dates")
+        with m:
+            m.p = Project(start=mo.DATE(2026, 5, 1))
+        assert not m.p.start.is_formula and m.p.start.value == date(2026, 5, 1)
+        assert m.p.end.is_formula and m.p.end.value == date(2026, 8, 1)
+
+    def test_the_spelled_code_builds_the_same_inputs_again(self):
+        m = mo.Model("Dates")
+        with m:
+            m.close = mo.DATE(2026, 7, 1)
+            m.paid = mo.Variable([mo.DATE(2026, 1, 15), mo.DATE(2026, 2, 15)])
+        namespace: dict = {"mo": mo}
+        exec(m.code, namespace)
+        again = namespace["dates"] if "dates" in namespace else next(
+            v for v in namespace.values() if isinstance(v, mo.Model))
+        for name in ("close", "paid"):
+            line = getattr(again, name)
+            assert not line.is_formula and line.value == getattr(m, name).value, name
+
+    def test_the_code_spells_it_back_as_mo_date(self):
+        m = mo.Model("Dates")
+        m.close = mo.DATE(2026, 7, 1)
+        assert "mo.DATE(2026, 7, 1)" in m.code and "datetime" not in m.code
 
 
 class TestDurationInputs:
@@ -249,6 +351,7 @@ class TestOtherInputsUnchanged:
 class TestWorkbookComputesWhatPythonComputes:
     """Recalculate the written file and compare with the Python values."""
 
+    @pytest.mark.slow
     def test_comparing_a_date_input(self, tmp_path):
         m = mo.Model("Dates")
         m.start = mo.Variable(date(2024, 1, 15), display_name="Start")
@@ -258,6 +361,7 @@ class TestWorkbookComputesWhatPythonComputes:
         ws = _recalculated(m, tmp_path).active
         assert _row(ws, "Early") == [1]
 
+    @pytest.mark.slow
     def test_adding_a_timedelta_input_to_a_date(self, tmp_path):
         m = mo.Model("Dates")
         m.start = mo.Variable(date(2024, 1, 15), display_name="Start")
@@ -273,6 +377,7 @@ class TestWorkbookComputesWhatPythonComputes:
         assert [_as_date(v) for v in _row(ws, "Later")] == [date(2024, 1, 20)]
         assert _row(ws, "Stamp") == [datetime(2024, 1, 15, 12, 0)]
 
+    @pytest.mark.slow
     def test_per_period_dates_compared_across_sheets(self, tmp_path):
         m = mo.Model("Dates")
         with m:

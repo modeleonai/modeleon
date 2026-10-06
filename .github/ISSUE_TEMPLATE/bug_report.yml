@@ -10,9 +10,7 @@ body:
         info help us diagnose much faster — please fill in the fields
         below.
 
-        Heads up: Modeleon is maintained by one person, so triage
-        timelines are weeks, not days. Issues with full reproducers
-        get attention first.
+        Issues with full reproducers get attention first.
 
   - type: textarea
     id: reproducer

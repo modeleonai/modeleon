@@ -14,6 +14,19 @@ from ..core.variable import Variable
 from ._helpers import make_func_var, operand, text_operand
 
 
+def _is_error(value: Any) -> bool:
+    """An Excel error token (``'#DIV/0!'``, ``'#N/A'``) as arithmetic
+    carries it. The spreadsheet never reads one as TRUE or FALSE: a
+    condition that is an error makes the IF, AND, OR, NOT or CHOOSE that
+    reads it that error (measured in Excel 16.95)."""
+    return isinstance(value, str) and value.startswith('#')
+
+
+def _blank0(value: Any) -> Any:
+    """A formula that lands on a blank cell shows 0, as in Excel."""
+    return 0 if value is None else value
+
+
 def _value_type_of(sample: Any) -> str:
     """Modeleon value-type tag for a computed scalar sample."""
     if isinstance(sample, bool):
@@ -55,11 +68,12 @@ def IF(condition: Any, value_if_true: Any, value_if_false: Any) -> Variable:
         def _tern(c, t, f):
             if isinstance(c, list):
                 return [
-                    (t[i] if isinstance(t, list) else t) if cv
-                    else (f[i] if isinstance(f, list) else f)
+                    cv if _is_error(cv)
+                    else _blank0((t[i] if isinstance(t, list) else t) if cv
+                                 else (f[i] if isinstance(f, list) else f))
                     for i, cv in enumerate(c)
                 ]
-            return t if c else f
+            return c if _is_error(c) else _blank0(t if c else f)
 
         lifted = TrackValues.lift(_tern, cond_value, true_value, false_value)
         result = make_func_var(
@@ -70,16 +84,32 @@ def IF(condition: Any, value_if_true: Any, value_if_false: Any) -> Variable:
 
     if isinstance(cond_value, list):
         value = [
-            (true_value[i] if isinstance(true_value, list) else true_value) if c
-            else (false_value[i] if isinstance(false_value, list) else false_value)
+            c if _is_error(c)
+            else _blank0((true_value[i] if isinstance(true_value, list) else true_value) if c
+                         else (false_value[i] if isinstance(false_value, list) else false_value))
             for i, c in enumerate(cond_value)
         ]
         var_type = 'list'
+    elif _is_error(cond_value):
+        value = cond_value
+        var_type = 'scalar'
     else:
         value = true_value if cond_value else false_value
-        var_type = 'scalar'
+        value = ([_blank0(v) for v in value] if isinstance(value, list)
+                 else _blank0(value))
+        # The branch decides the shape, not the condition: a scalar
+        # condition choosing a SERIES gives a series. Typed as a scalar,
+        # every consumer that dispatches on ``var_type`` (``cumsum``,
+        # ``recurrence`` over the row) would see the whole series in one
+        # period.
+        var_type = 'list' if isinstance(value, list) else 'scalar'
 
-    sample = value[0] if isinstance(value, list) and value else value
+    if isinstance(value, list):
+        sample = next((v for v in value if not _is_error(v)), value[0] if value else None)
+    elif _is_error(value):
+        sample = true_value[0] if isinstance(true_value, list) and true_value else true_value
+    else:
+        sample = value
     if isinstance(sample, bool):
         value_type = 'bool'
     elif isinstance(sample, int):
@@ -96,6 +126,21 @@ def IF(condition: Any, value_if_true: Any, value_if_false: Any) -> Variable:
     )
     result._source_code = result.formula
     return result
+
+
+def _reduce_logical(reduce_fn, values: list) -> Any:
+    """AND / OR over one period's operands: the first error among them is
+    the result, whatever the others say (``AND(FALSE, #DIV/0!)`` is
+    ``#DIV/0!`` in the spreadsheet)."""
+    for v in values:
+        if _is_error(v):
+            return v
+    # A blank operand is skipped, as Excel's AND / OR skip a blank cell;
+    # all blank is #VALUE!.
+    present = [v for v in values if v is not None]
+    if not present:
+        return '#VALUE!'
+    return reduce_fn(bool(v) for v in present)
 
 
 def _logical(func_name: str, reduce_fn, *args: Any) -> Variable:
@@ -120,10 +165,10 @@ def _logical(func_name: str, reduce_fn, *args: Any) -> Variable:
                 return r[i] if i < len(r) else r[-1]
             return r
 
-        value: Any = [reduce_fn(bool(at(r, i)) for r in raws) for i in range(n)]
+        value: Any = [_reduce_logical(reduce_fn, [at(r, i) for r in raws]) for i in range(n)]
         var_type = 'list'
     else:
-        value = reduce_fn(bool(r) for r in raws)
+        value = _reduce_logical(reduce_fn, raws)
         var_type = 'scalar'
 
     result = make_func_var(func_name, exprs, value, 'bool', var_type)
@@ -149,10 +194,10 @@ def NOT(value: Any) -> Variable:
     """Logical NOT (renders ``=NOT(...)``). Element-wise over a list operand."""
     raw, expr = text_operand(value)
     if isinstance(raw, list):
-        calc: Any = [not bool(v) for v in raw]
+        calc: Any = [v if _is_error(v) else not bool(v) for v in raw]
         var_type = 'list'
     else:
-        calc = not bool(raw)
+        calc = raw if _is_error(raw) else not bool(raw)
         var_type = 'scalar'
     result = make_func_var("NOT", [expr], calc, 'bool', var_type)
     result._source_code = result.formula
@@ -165,7 +210,7 @@ def ISBLANK(value: Any) -> Variable:
     The Excel-native way to ask "was this ever filled in?", and the only
     way to write an OPTIONAL date without lying about it. A leaving date
     that has not happened yet has to read as an empty cell — filling it
-    with the end of the window says "dismissed on 31 December", which an
+    with the end of the window says "left on 31 December", which an
     accountant will act on. Element-wise over a list operand.
     """
     raw, expr = text_operand(value)
@@ -184,7 +229,7 @@ def CHOOSE(index: Any, *choices: Any) -> Variable:
     """Pick the ``index``-th value, 1-based (renders ``=CHOOSE(...)``).
 
     The classic scenario/phase switch — ``mo.CHOOSE(scenario, base, bull)``
-    or, element-wise, ``mo.CHOOSE(phase_flag + 1, "Ф", "П")`` where
+    or, element-wise, ``mo.CHOOSE(phase_flag + 1, "A", "F")`` where
     ``phase_flag`` is a per-period Variable. A single index over series
     choices gives a series: each period picks its own value of the chosen
     series. Out-of-range indices yield ``#VALUE!`` (matching Excel).
@@ -195,6 +240,8 @@ def CHOOSE(index: Any, *choices: Any) -> Variable:
     choice_exprs = [p[1] for p in pairs]
 
     def pick(i_val: Any, period: int) -> Any:
+        if _is_error(i_val):
+            return i_val
         try:
             k = int(i_val) - 1
         except (TypeError, ValueError):
@@ -203,8 +250,8 @@ def CHOOSE(index: Any, *choices: Any) -> Variable:
             return '#VALUE!'
         r = choice_raws[k]
         if isinstance(r, list):
-            return r[period] if period < len(r) else r[-1]
-        return r
+            return _blank0(r[period] if period < len(r) else r[-1])
+        return _blank0(r)
 
     if isinstance(idx_raw, list):
         value: Any = [pick(iv, p) for p, iv in enumerate(idx_raw)]

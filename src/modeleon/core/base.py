@@ -52,7 +52,7 @@ class Base:
         # Free-form prose description of this node — what it represents,
         # how it's computed, source of truth notes. Mirrors
         # ``display_name`` as a structured field on the engine; readers
-        # (the Excel writer, any UI or assistant built on the model) show
+        # (the Excel writer, any tool built on the model) show
         # it as a tooltip / cell note / context. Returned by the
         # ``.description`` property below. Default ``None`` — no
         # fallback derivation.
@@ -92,8 +92,8 @@ class Base:
 
         Set via the ``description=`` constructor kwarg (or
         :meth:`~modeleon.core.component.Component.set_description`).
-        Surfaces in Excel exports (as a cell note) and is available to
-        any UI or AI tooling that reads the model. ``None`` when not
+        Surfaces in Excel exports (as a cell note) and to any tool that
+        reads the model. ``None`` when not
         set — there is no fallback derivation.
         """
         return self._description

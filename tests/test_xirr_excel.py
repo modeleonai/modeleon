@@ -7,8 +7,9 @@ The spreadsheet's XIRR finds the rate at which
 
 where ``d_0`` is the FIRST date in the list: a year is 365 days, leap
 years included, every date counts as its whole day (a time of day is
-dropped), and every other date must fall on or after the first one
-(they may come in any order). A 365.25-day year looks harmless but
+dropped), and the other dates may come in any order — even before the
+first one: Excel counts those years as negative (as Excel 16.95
+does). A 365.25-day year looks harmless but
 moves the rate in the fourth decimal on an ordinary schedule, so the
 number Python shows and the number in the written workbook disagree.
 These tests pin the day count and recalculate the written workbook to
@@ -83,15 +84,15 @@ def test_xirr_counts_a_year_as_365_days(name):
     assert _excel_residual(rate, cash_flows, dates) == pytest.approx(0, abs=1e-12)
 
 
-def test_xirr_rejects_a_date_before_the_first():
-    # The first date starts the schedule; a later entry dated before it
-    # is an error in the spreadsheet, so Python refuses it too rather
-    # than show a rate the workbook will not.
-    with pytest.raises(ValueError, match="first date"):
-        mo.XIRR(
-            [-100_000, 30_000, 50_000, 60_000],
-            [date(2024, 6, 1), date(2024, 1, 1), date(2025, 1, 1), date(2025, 6, 1)],
-        )
+def test_xirr_accepts_a_date_before_the_first_as_excel_does():
+    # The first date anchors the year count; a later entry dated before it
+    # counts negative years. Excel 16.95 answers 1.2336099028587344 here;
+    # refusing it showed an error where the workbook shows a rate.
+    rate = mo.XIRR(
+        [-100_000, 30_000, 50_000, 60_000],
+        [date(2024, 6, 1), date(2024, 1, 1), date(2025, 1, 1), date(2025, 6, 1)],
+    ).value
+    assert abs(rate - 1.2336099028587344) <= 1e-7 * abs(rate)
 
 
 def test_xirr_allows_flows_on_the_first_date():
@@ -165,6 +166,7 @@ def recalculated(tmp_path_factory):
 
 
 @pytest.mark.parametrize("name", sorted(SCHEDULES))
+@pytest.mark.slow
 def test_xirr_matches_the_recalculated_workbook(recalculated, name):
     python_rate, workbook_rate = recalculated[name]
     if isinstance(python_rate, Exception):

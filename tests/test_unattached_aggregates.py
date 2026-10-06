@@ -97,6 +97,7 @@ def _model(build, values, *, attached: bool):
 class TestUnattachedListInsideAFormula:
     @pytest.mark.parametrize("name, build, values", _AGGREGATES,
                              ids=[a[0] for a in _AGGREGATES])
+    @pytest.mark.slow
     def test_the_workbook_computes_the_python_values(self, tmp_path, name,
                                                      build, values):
         m, _x = _model(build, values, attached=False)
@@ -134,6 +135,7 @@ class TestUnattachedListInsideAFormula:
 class TestAttachedListKeepsTheRange:
     @pytest.mark.parametrize("name, build, values", _AGGREGATES,
                              ids=[a[0] for a in _AGGREGATES])
+    @pytest.mark.slow
     def test_live_range_formula(self, tmp_path, name, build, values):
         m, _x = _model(build, values, attached=True)
         out = tmp_path / "u.xlsx"
@@ -173,6 +175,7 @@ class TestOtherListsWithNoCells:
         lambda m, x: mo.SUM(x[0:2]) + m.a,
         lambda m, x: mo.SUM(x, m.a) + m.a,
     ], ids=["intermediate", "literal", "slice", "mixed"])
+    @pytest.mark.slow
     def test_the_workbook_computes_the_python_values(self, tmp_path, build):
         m = mo.Model("M")
         m.a = mo.Variable([1, 2, 3], display_name="A")
@@ -214,6 +217,7 @@ class TestScalarOperandsAreUnchanged:
 
 
 class TestTrackedLines:
+    @pytest.mark.slow
     def test_a_track_coordinate_reduces_the_whole_list(self, tmp_path):
         # In the blend view each tracked line is one row of its live
         # values; the SUM inside the plan coordinate is still one number.

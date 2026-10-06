@@ -29,6 +29,7 @@ Tree-walking translators (Python formula → Excel formula) live in
 
 from __future__ import annotations
 
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Optional, TYPE_CHECKING, Union
 
@@ -37,6 +38,11 @@ if TYPE_CHECKING:
 
 
 # ─── Base ────────────────────────────────────────────────────────────
+
+
+#: Variables whose expression is being inlined into a formula string
+#: right now — see :meth:`VarRef.to_string`.
+_INLINING: ContextVar[frozenset] = ContextVar('modeleon_inlining', default=frozenset())
 
 
 class Expr:
@@ -76,6 +82,26 @@ class Literal(Expr):
         return iter(())
 
 
+@dataclass(frozen=True)
+class TimeRef(Expr):
+    """The time of the period a formula is computed for — ``mo.time.days``.
+
+    ``field`` is one of ``'start'``, ``'end'`` (dates), ``'days'`` (the
+    period's calendar day count) and ``'index'`` (its 1-based number).
+    It depends on no Variable: time is the model's window, not a row, so
+    a formula reading it carries no edge. Renderers decide where time
+    lives in their output (see :mod:`modeleon.compile.excel.header`).
+    """
+
+    field: str
+
+    def to_string(self) -> str:
+        return f"time.{self.field}"
+
+    def iter_refs(self) -> Iterator["Variable"]:
+        return iter(())
+
+
 @dataclass
 class VarRef(Expr):
     """Reference to an existing ``Variable``.
@@ -106,8 +132,20 @@ class VarRef(Expr):
         # algebra rather than an opaque floating id. Wrap in parens for
         # precedence safety — the inlined expression may itself be a BinOp.
         inner_expr = getattr(self.var, '_expr', None)
+        if isinstance(inner_expr, TimeRef):
+            return inner_expr.to_string()
         if inner_expr is not None:
-            return f"({inner_expr.to_string()})"
+            # A row of a loop across periods reads itself through ``lag``;
+            # once detached from its container it has no name to stop the
+            # inlining, so a second visit prints its id instead.
+            inlining = _INLINING.get()
+            if id(self.var) in inlining:
+                return self.var.path.leaf
+            token = _INLINING.set(inlining | {id(self.var)})
+            try:
+                return f"({inner_expr.to_string()})"
+            finally:
+                _INLINING.reset(token)
         return self.var.path.leaf
 
     def iter_refs(self) -> Iterator["Variable"]:

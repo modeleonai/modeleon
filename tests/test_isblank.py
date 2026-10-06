@@ -3,7 +3,7 @@
 
 The case it exists for: an OPTIONAL date. A leaving date that hasn't
 happened yet has to read as an empty cell — filling it with the end of
-the window says «уволен 31 декабря», which an accountant will act on.
+the window says "left on 31 December", which an accountant will act on.
 So the emptiness must survive into the workbook as a question Excel
 itself can answer, not as a sentinel value the model invented.
 """
@@ -33,9 +33,9 @@ class TestExcel:
     def test_renders_as_a_live_formula_over_the_cell(self, tmp_path, caplog):
         m = mo.Model("m", display_name="M")
         with m:
-            m.дата = mo.Variable(None, display_name="Дата увольнения")
-            m.работает = mo.ISBLANK(m.дата)
-            m.работает._display_name = "Работает"
+            m.leave_date = mo.Variable(None, display_name="Leaving date")
+            m.employed = mo.ISBLANK(m.leave_date)
+            m.employed._display_name = "Employed"
         path = tmp_path / "o.xlsx"
         with caplog.at_level(logging.WARNING, logger="modeleon"):
             m.to_excel(str(path))
@@ -43,7 +43,7 @@ class TestExcel:
 
         ws = load_workbook(str(path))["M"]
         row = next(
-            r for r in range(1, 5) if ws.cell(r, 1).value == "Работает"
+            r for r in range(1, 5) if ws.cell(r, 1).value == "Employed"
         )
         assert ws.cell(row, 2).value == "=ISBLANK(B1)"
         # The text alone proves nothing: an UNREGISTERED function emits
@@ -65,9 +65,9 @@ class TestUnderACoarserGrain:
 
         m = mo.Model("m", display_name="M", default_grain="month",
                      default_start="2026-01", default_periods=6)
-        m.даты = mo.Variable(["a", "", "b", None, "c", ""],
-                             display_name="Даты", regrain=mo.up("last"))
-        m.пусто = mo.ISBLANK(m.даты)
-        m.пусто._display_name = "Пусто"
+        m.dates = mo.Variable(["a", "", "b", None, "c", ""],
+                              display_name="Dates", regrain=mo.up("last"))
+        m.blank = mo.ISBLANK(m.dates)
+        m.blank._display_name = "Blank"
         with pytest.raises(ValueError, match="re-grain"):
             project_model(m, grain="quarter")
