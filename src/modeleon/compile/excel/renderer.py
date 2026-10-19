@@ -55,6 +55,35 @@ logger = logging.getLogger(__name__)
 # sheet named 'Plan\n' would be written unquoted as ``Plan\n!B2``.
 _UNQUOTED_SHEET_NAME = re.compile(r"[A-Za-z_]\w*\Z")
 
+#: Excel keeps at most 8192 characters of one formula, the ``=`` among
+#: them; a longer one sends the whole book to repair.
+_MAX_FORMULA_CHARS = 8192
+
+# A cell reference on its own — an optional sheet, quoted or bare, and
+# a coordinate: the only term a ``+`` chain may fold into a range.
+_CELL_TERM = re.compile(r"(?:'(?:[^']|'')*'!|[A-Za-z_]\w*!)?[A-Z]{1,3}[1-9]\d*\Z")
+
+
+def _fold_sum(parts: List[str]) -> Optional[str]:
+    """``SUM`` over the runs of a ``+`` chain whose terms are all cells
+    of one sheet, each run its consecutive cells in order — the way a
+    hand-built book writes a long sum. None for any other chain: a
+    minus in it, a term that is not a cell, cells of two sheets."""
+    terms, ops = parts[0::2], parts[1::2]
+    if any(op != "+" for op in ops) or not all(_CELL_TERM.fullmatch(t) for t in terms):
+        return None
+    prefixes = {t.rpartition("!")[0] for t in terms}
+    if len(prefixes) != 1:
+        return None
+    from .totals import compact_refs
+    prefix = prefixes.pop()
+    prefix = f"{prefix}!" if prefix else ""
+    runs = compact_refs([t.rpartition("!")[2] for t in terms])
+    if len(runs) > 255:                # SUM takes at most 255 arguments
+        return None
+    return "SUM({})".format(", ".join(
+        f"{prefix}{first}:{last}" if last else f"{prefix}{first}" for first, last in runs))
+
 
 _PY_TO_EXCEL_OP: Dict[str, str] = {
     "+": "+",
@@ -96,7 +125,10 @@ _CHAIN_LEVELS = (frozenset({"+", "-"}), frozenset({"*", "/"}))
 # The translator renders those args as ranges (``B2:F2``) and leaves
 # scalar VarRefs / literals as normal. Covers classic aggregates (SUM,
 # MAX, MIN, …) and financial-series funcs (IRR, NPV, XIRR) where Excel
-# expects a range for the cash-flow / dates argument.
+# expects a range for the cash-flow / dates argument. ``MIN`` / ``MAX``
+# over two or more operands with a series among them are the exception
+# (``_per_period_call``): one call per period, its operands this
+# period's cells.
 def _contiguous_run(refs: list) -> bool:
     """Do these cell refs sit side by side on one row?
 
@@ -122,7 +154,26 @@ def _contiguous_run(refs: list) -> bool:
 _RANGE_TAKING_FUNCS = {
     "SUM", "AVERAGE", "MIN", "MAX", "COUNT",
     "IRR", "NPV", "XIRR", "XNPV",
+    # What ``SUM(a * b)`` over two rows is written as; its arrays are
+    # ranges only (a comma list would be read as more arrays).
+    "SUMPRODUCT",
 }
+
+
+def _per_period_call(call: FuncCall) -> bool:
+    """``MIN`` / ``MAX`` over two or more operands with a series among
+    them is a cap or a floor, one call per period, not a reduction: its
+    operands are written as this period's cells, never as ranges."""
+    if call.func.upper() not in ("MIN", "MAX") or len(call.args) < 2:
+        return False
+    for arg in call.args:
+        if isinstance(arg, Literal) and isinstance(arg.value, list):
+            return True
+        if isinstance(arg, VarRef):
+            value = getattr(arg.var, "_value", None)
+            if isinstance(value, list) or hasattr(value, "roles"):
+                return True
+    return False
 
 
 # Function names that pass through to Excel unchanged. AST FuncCall nodes
@@ -311,7 +362,34 @@ class ExcelRenderer:
         #: with it the reference resolves to the cell that already
         #: carries the number — the way a human builds the same sheet.
         self.identity_cells = identity_cells or {}
+        #: What the formula being rendered wrote as a number: ``(node,
+        #: literal)`` for each sub-expression inlined into a live formula,
+        #: and the nodes no formula could stand for (the cell then
+        #: carries its value). Per formula — the translator clears both
+        #: before each walk.
+        self.inlined: List[tuple[Expr, str]] = []
+        self.lossy: List[Expr] = []
         self.walker: Any = None  # set by Walker(renderer) constructor
+
+    def _note_inlined(self, node: Expr, literal: str, ctx: RenderCtx) -> str:
+        """``literal`` stands in the text for ``node`` — true now, stale
+        once that operand's value moves (``RenderCtx.inlined_value``)."""
+        ctx.inlined_value = True
+        self.inlined.append((node, literal))
+        return literal
+
+    def _mark_lossy(self, node: Expr, ctx: RenderCtx) -> None:
+        """No formula can stand for ``node`` here: the whole cell carries
+        its computed value (``RenderCtx.lossy_inline``)."""
+        ctx.lossy_inline = True
+        self.lossy.append(node)
+
+    def _ship_value(self, node: Expr, ctx: RenderCtx) -> str:
+        """The cell's own computed value, in place of a formula that
+        cannot be written around ``node``."""
+        self._mark_lossy(node, ctx)
+        return _value_to_excel_literal(
+            _value_at_period(getattr(ctx.self_var, "_value", None), ctx.period_idx))
 
     # ─── Dispatch targets ───────────────────────────────────────
 
@@ -391,9 +469,8 @@ class ExcelRenderer:
             loc = getattr(host, 'time', None)
             if loc is None or loc.start is None or loc.grain not in ('day', 'month',
                                                                      'quarter', 'year'):
-                ctx.inlined_value = True
-                return _value_to_excel_literal(
-                    _value_at_period(getattr(host, '_value', None), i))
+                return self._note_inlined(TimeRef(field), _value_to_excel_literal(
+                    _value_at_period(getattr(host, '_value', None), i)), ctx)
             start = loc.first_day or _first_day(_parse(loc.start, loc.grain), loc.grain)
             return spell_inline(field, i, loc.grain, date_literal(start), loc.first_day)
         assert window is not None
@@ -537,7 +614,7 @@ class ExcelRenderer:
                 or isinstance(getattr(root, '_value', None), list)
             )
             if not root_is_list:
-                ctx.lossy_inline = True
+                self._mark_lossy(node, ctx)
         if node is not ctx.own_chain:
             # A roll-forward inlined into another formula: its "previous
             # cell" would be the ENCLOSING row's — a formula that looks
@@ -549,13 +626,18 @@ class ExcelRenderer:
                 return summed
             if (isinstance(node.var._expr, SelfRef)
                     or getattr(node.var, '_cumsum_source', None) is not None):
-                ctx.lossy_inline = True
+                self._mark_lossy(node, ctx)
                 return _value_to_excel_literal(
                     _value_at_period(node.var._value, ctx.period_idx))
         if node.var._expr is not None:
             return node.var._expr
         _warn_out_of_scope_ref(node.var, ctx)
-        return _value_to_excel_literal(_value_at_period(node.var._value, ctx.period_idx))
+        # The number stands in the text (``check_compat`` lists it) — but
+        # a Variable outside the model has no row in the workbook, so the
+        # number is the formula's for good (no ``inlined_value`` flag).
+        literal = _value_to_excel_literal(_value_at_period(node.var._value, ctx.period_idx))
+        self.inlined.append((node, literal))
+        return literal
 
     @contextlib.contextmanager
     def _chain_passes(self, node: Any, inner: Any, ctx: RenderCtx):
@@ -608,7 +690,7 @@ class ExcelRenderer:
         expr = getattr(twin, '_expr', None)
         if expr is not None and not self._reads_series(expr, set()):
             return self.walker.render(expr, ctx)
-        ctx.lossy_inline = True
+        self._mark_lossy(VarRef(twin), ctx)
         return _value_to_excel_literal(_value_at_period(twin._value, ctx.period_idx))
 
     def _reads_series(self, expr: Any, seen: set) -> bool:
@@ -709,8 +791,7 @@ class ExcelRenderer:
         inlined = self._coord_value(var, role, ctx.period_idx)
         if inlined is None and role not in getattr(var, '_value', {}):
             return None
-        ctx.inlined_value = True
-        return _value_to_excel_literal(inlined)
+        return self._note_inlined(Restrict(VarRef(var), role), _value_to_excel_literal(inlined), ctx)
 
     def render_restrict(self, node: Restrict, ctx: RenderCtx) -> str:
         """``x.at(track='plan')`` — a reference into the coordinate's
@@ -797,7 +878,7 @@ class ExcelRenderer:
                     and self._period_constant(other_side)):
                 return chain_side
             if self._render_running_total(chain_side.var, ctx) is None:
-                ctx.lossy_inline = True
+                self._mark_lossy(chain_side, ctx)
             return None
         return None
 
@@ -842,7 +923,15 @@ class ExcelRenderer:
         for step in reversed(chain):
             parts.append(_PY_TO_EXCEL_OP.get(step.op, step.op))
             parts.append(self._render_operand(step.right, step.op, ctx, side="right"))
-        return " ".join(parts)
+        text = " ".join(parts)
+        # A sum of a thousand rows outgrows Excel's formula: as a run
+        # of cells it is ``SUM(B2:B1001)``, the way a hand-built book
+        # writes it — never any shorter chain, which reads as authored.
+        if len(text) >= _MAX_FORMULA_CHARS:
+            folded = _fold_sum(parts)
+            if folded is not None:
+                return folded
+        return text
 
     def _render_operand(
         self, child: Expr, parent_op: str, ctx: RenderCtx, *, side: str
@@ -915,22 +1004,23 @@ class ExcelRenderer:
 
     def render_subscript(self, node: Subscript, ctx: RenderCtx) -> str:
         if not isinstance(node.base, VarRef):
-            logger.warning(
-                "Subscript on non-variable expression (%s[%r]) has no Excel "
-                "translation — emitting textual fallback.",
-                type(node.base).__name__, node.key,
-            )
-            return f"{self.walker.render(node.base, ctx)}[{node.key}]"
+            # No row holds an element of a bare expression: the whole
+            # cell ships its value.
+            return self._ship_value(node, ctx)
 
         var_id = self._coord_var_id(node.base.var, ctx)
         if var_id is None:
             # No row carries this coordinate: element-wise, the whole
             # cell degrades to its computed value.
-            ctx.lossy_inline = True
-            return self._inline_subscript_value(node.base.var, node.key)
+            return self._ship_value(node, ctx)
         addr_obj = self.addresses.get(var_id)
         if addr_obj is None:
-            return self._inline_subscript_value(node.base.var, node.key)
+            # An address-less intermediate (``(x * 2.0)[1]``, a cumsum's
+            # start): its element's VALUE goes into the text.
+            element = self._inline_subscript_value(node.base.var, node.key, ctx.period_idx)
+            if element is None:
+                return self._ship_value(node, ctx)
+            return self._note_inlined(node, element, ctx)
 
         key = node.key
         if isinstance(key, slice):
@@ -964,18 +1054,17 @@ class ExcelRenderer:
         if keyed_idx is not None:
             return self._maybe_qualify(addr_obj.values[keyed_idx], var_id, ctx.current_sheet)
 
-        if isinstance(key, int) and 0 <= key < len(addr_obj.values):
-            return self._maybe_qualify(addr_obj.values[key], var_id, ctx.current_sheet)
+        if isinstance(key, int):
+            n = len(addr_obj.values)
+            # ``x[-1]`` is the last period, as in Python — on a row whose
+            # cells are its own periods.
+            idx = key + n if key < 0 and self._is_native_row(node.base.var, addr_obj) else key
+            if 0 <= idx < n:
+                return self._maybe_qualify(addr_obj.values[idx], var_id, ctx.current_sheet)
 
-        logger.warning(
-            "Cannot resolve subscript %r on variable %r — emitting textual "
-            "fallback that Excel cannot evaluate. Check that the key exists "
-            "in the variable's keys list or is within its value range.",
-            key, var_id,
-        )
-        if isinstance(key, str):
-            return f'{var_id}["{key}"]'
-        return f"{var_id}[{key}]"
+        # No cell holds this element (a key the row does not carry):
+        # the cell ships its value.
+        return self._ship_value(node, ctx)
 
     def render_methodcall(self, node: MethodCall, ctx: RenderCtx) -> str:
         if node.method == "copy":
@@ -986,18 +1075,11 @@ class ExcelRenderer:
             return self._render_cumsum_chain(node, ctx)
 
         logger.warning(
-            "Method %r on %r has no Excel translation — emitting textual "
-            "fallback that Excel cannot evaluate.",
+            "Method %r on %r has no Excel translation — the cell carries "
+            "its computed value.",
             node.method, type(node.base).__name__,
         )
-        base = self.walker.render(node.base, ctx)
-        parts: List[str] = []
-        for a in node.args:
-            parts.append(self.walker.render(a, ctx) if isinstance(a, Expr) else str(a))
-        for k, v in node.kwargs.items():
-            v_str = self.walker.render(v, ctx) if isinstance(v, Expr) else str(v)
-            parts.append(f"{k}={v_str}")
-        return f"{base}.{node.method}({', '.join(parts)})"
+        return self._ship_value(node, ctx)
 
     def render_funccall(self, node: FuncCall, ctx: RenderCtx) -> str:
         func = node.func.upper()
@@ -1009,12 +1091,16 @@ class ExcelRenderer:
         if node.render_backends is not None and 'excel' not in node.render_backends:
             return self._fallback_funccall(node, ctx)
 
-        if func in _RANGE_TAKING_FUNCS:
+        if func in _RANGE_TAKING_FUNCS and not _per_period_call(node):
             # Reached here, the call is the cell's whole formula (a call
             # inside a larger one is met through its Variable first).
             inlined = self._inline_unlaid_aggregate(node, None, ctx)
             if inlined is not None:
                 return inlined
+            # ``SUM(a * b)`` over laid-out rows is Excel's SUMPRODUCT.
+            ranges = self._product_ranges(node, ctx)
+            if ranges is not None:
+                return f"SUMPRODUCT({', '.join(ranges)})"
             parts = [self._render_range_or_cell(a, ctx, func) for a in node.args]
             return f"{func}({', '.join(parts)})"
 
@@ -1052,7 +1138,7 @@ class ExcelRenderer:
         if owner is not None:
             value = _value_at_period(owner._value, ctx.period_idx)
             if value is not None:
-                return _value_to_excel_literal(value)
+                return self._note_inlined(node, _value_to_excel_literal(value), ctx)
         logger.warning(
             "FuncCall %r declared render_backends=%r (excludes 'excel'); "
             "no value available to inline. Cell will be blank.",
@@ -1107,12 +1193,12 @@ class ExcelRenderer:
 
         var_id = self._coord_var_id(node.source, ctx)
         if var_id is None:
-            ctx.lossy_inline = True
+            self._mark_lossy(node, ctx)
             return _value_to_excel_literal(node.fill)
         addr_obj = self.addresses.get(var_id)
         if addr_obj is None or not addr_obj.values:
             # No cells to take the window over: the cell carries its value.
-            ctx.lossy_inline = True
+            self._mark_lossy(node, ctx)
             return _value_to_excel_literal(node.fill)
 
         start_idx = ctx.period_idx - node.window + 1
@@ -1146,22 +1232,20 @@ class ExcelRenderer:
             return '""'
         var_id = self._coord_var_id(node.source, ctx)
         if var_id is None:
-            ctx.inlined_value = True
-            return _value_to_excel_literal(fill)
+            return self._note_inlined(node, _value_to_excel_literal(fill), ctx)
         addr_obj = self.addresses.get(var_id)
         if (addr_obj is None or not addr_obj.values or i >= len(node.buckets)):
-            return _value_to_excel_literal(fill)
+            return self._note_inlined(node, _value_to_excel_literal(fill), ctx)
         if addr_obj is ctx.self_address or not self._is_native_row(node.source, addr_obj):
             # The cells under the source's id are not its native periods:
             # a projected book keys its rows like the source, so they are
             # this very row or another grain's. The bucket's value is the
             # truth; a range over those cells would read the wrong periods.
-            ctx.inlined_value = True
-            return _value_to_excel_literal(fill)
+            return self._note_inlined(node, _value_to_excel_literal(fill), ctx)
         lo, hi = node.buckets[i]
         n = len(addr_obj.values)
         if lo >= n or hi - 1 >= n:
-            return _value_to_excel_literal(fill)
+            return self._note_inlined(node, _value_to_excel_literal(fill), ctx)
         from .totals import bucket_formula
         # The bucket's own cells, never one range from the first to the
         # last: subtotal columns may stand between them. The engine's
@@ -1249,12 +1333,11 @@ class ExcelRenderer:
         ):
             prev = ctx.self_address.values[ctx.period_idx - 1]
             return f"{prev} + {base}"
-        ctx.lossy_inline = True
-        return f"{base}.cumsum()"
+        return self._ship_value(node, ctx)
 
     def _render_shift(self, node: MethodCall, ctx: RenderCtx) -> str:
         if not isinstance(node.base, VarRef):
-            return f"{self.walker.render(node.base, ctx)}.shift({node.args[0]})"
+            return self._ship_value(node, ctx)
 
         periods = node.args[0] if node.args else 1
         try:
@@ -1269,8 +1352,12 @@ class ExcelRenderer:
             # A Variable-backed fill (``mo.lag(x, fill=opening)``)
             # arrives as an Expr — render it as a reference to the
             # fill cell so the dependency stays live in the workbook.
+            # An unnamed compound fill (``fill=a + b - c``) is inlined,
+            # and the lag reads as ONE operand wherever it sits:
+            # ``x - lag(y, fill=a + b - c)`` is ``B2 - (B1 + B2 - B3)``.
             if isinstance(fill_value, Expr):
-                return self.walker.render(fill_value, ctx)
+                text = self.walker.render(fill_value, ctx)
+                return f"({text})" if self._needs_parens(fill_value) else text
             return _value_to_excel_literal(fill_value)
 
         if target_period < 0:
@@ -1294,8 +1381,7 @@ class ExcelRenderer:
             shifted = self._coord_value(node.base.var, ctx.track_role or "", target_period)
             if shifted is None:
                 return _fill()
-            ctx.inlined_value = True
-            return _value_to_excel_literal(shifted)
+            return self._note_inlined(node, _value_to_excel_literal(shifted), ctx)
         addr_obj = self.addresses.get(cid)
         if addr_obj is None:
             return self._shift_unlaid(node.base.var, target_period, _fill, ctx)
@@ -1317,7 +1403,7 @@ class ExcelRenderer:
         if length is not None and target_period >= length:
             return fill()
         if self._reads_own_cell(base, set()):
-            ctx.lossy_inline = True
+            self._mark_lossy(VarRef(base), ctx)
             return fill()
         here = ctx.period_idx
         ctx.period_idx = target_period
@@ -1361,7 +1447,7 @@ class ExcelRenderer:
                 # A range over a coordinate nothing in the book carries:
                 # a per-period literal is not a range, so the whole
                 # aggregate degrades to its computed value.
-                ctx.lossy_inline = True
+                self._mark_lossy(arg, ctx)
                 return self.walker.render(arg, ctx)
             addr_obj = self.addresses.get(cid)
             if addr_obj is not None and len(addr_obj.values) > 1:
@@ -1390,7 +1476,7 @@ class ExcelRenderer:
         ):
             cid = self._coord_var_id(sub.base.var, ctx)
             if cid is None:
-                ctx.lossy_inline = True
+                self._mark_lossy(arg, ctx)
                 return self.walker.render(arg, ctx)
             addr_obj = self.addresses.get(cid)
             if addr_obj is not None:
@@ -1429,8 +1515,65 @@ class ExcelRenderer:
                 base_id = self._coord_var_id(sub.base.var, ctx)
                 if base_id is None or base_id in self.addresses:
                     continue            # a window of a laid-out row
+            if self._product_ranges(call, ctx) is not None:
+                continue                # SUM of a product of laid-out rows
             return arg
         return None
+
+    def _product_ranges(self, call: FuncCall, ctx: RenderCtx) -> Optional[List[str]]:
+        """``SUM(a * b * …)`` over laid-out rows of one period range: the
+        rows' ranges, in order — Excel's ``SUMPRODUCT`` over them. None
+        for any other call: a scalar factor, a row the book has no cells
+        for or whose cells are not side by side, a product aligned
+        across windows."""
+        if call.func.upper() != "SUM" or len(call.args) != 1:
+            return None
+        arg = call.args[0]
+        if (
+            not isinstance(arg, VarRef)
+            or not isinstance(arg.var._value, list)
+            or getattr(arg.var, "_start", None) is not None
+            or self._coord_var_id(arg.var, ctx) in self.addresses
+        ):
+            return None
+        factors: List[Any] = []
+        if not self._product_factors(arg.var._expr, factors, ctx):
+            return None
+        ranges: List[str] = []
+        widths: set[int] = set()
+        for var in factors:
+            cid = self._coord_var_id(var, ctx)
+            addr = self.addresses.get(cid) if cid is not None else None
+            if (
+                cid is None or addr is None or len(addr.values) < 2
+                or not _contiguous_run(addr.values)
+                or not self._is_native_row(var, addr)
+            ):
+                return None
+            widths.add(len(addr.values))
+            ranges.append(self._resolve_var_range(cid, ctx.current_sheet, ctx, "SUMPRODUCT"))
+        if len(widths) != 1 or len(arg.var._value) not in widths:
+            return None
+        return ranges
+
+    def _product_factors(self, expr: Any, out: List[Any], ctx: RenderCtx) -> bool:
+        """Collect the rows of a ``*`` chain into ``out``; False where a
+        term is anything but a laid-out row or another such product."""
+        if isinstance(expr, Paren):
+            return self._product_factors(expr.inner, out, ctx)
+        if isinstance(expr, BinOp) and expr.op == "*":
+            return (self._product_factors(expr.left, out, ctx)
+                    and self._product_factors(expr.right, out, ctx))
+        if isinstance(expr, VarRef):
+            var = expr.var
+            if self._coord_var_id(var, ctx) in self.addresses:
+                out.append(var)
+                return True
+            inner = getattr(var, "_expr", None)
+            if (isinstance(var._value, list) and inner is not None
+                    and getattr(var, "_start", None) is None):
+                return self._product_factors(inner, out, ctx)
+        return False
 
     def _inline_unlaid_aggregate(
         self, call: FuncCall, owner: Any, ctx: RenderCtx,
@@ -1448,7 +1591,7 @@ class ExcelRenderer:
         of the formula stays live. When the call is the cell's whole
         formula (``owner`` None) the cell carries its computed value.
         """
-        if call.func.upper() not in _RANGE_TAKING_FUNCS:
+        if call.func.upper() not in _RANGE_TAKING_FUNCS or _per_period_call(call):
             return None
         arg = self._unlaid_list_arg(call, ctx)
         if arg is None:
@@ -1459,22 +1602,26 @@ class ExcelRenderer:
                 or hasattr(value, "roles")):
             # No single number stands for the call: the whole cell
             # falls back to its computed value.
-            ctx.lossy_inline = True
-            whole = getattr(ctx.self_var, "_value", None)
-            return _value_to_excel_literal(_value_at_period(whole, ctx.period_idx))
+            return self._ship_value(call, ctx)
         # A number baked into formula text: true now, stale once the
         # list changes — callers that cache formula text must not reuse it.
-        ctx.inlined_value = True
-        return _value_to_excel_literal(value)
+        return self._note_inlined(call, _value_to_excel_literal(value), ctx)
 
-    def _inline_subscript_value(self, base_var: Any, key: Any) -> str:
+    def _inline_subscript_value(self, base_var: Any, key: Any,
+                                period_idx: int) -> Optional[str]:
+        """The element ``base_var[key]`` as a literal — of a window, this
+        period's element — or None when the value holds no such element."""
         value = base_var._value
         keys = getattr(base_var, "_keys", None)
 
         if isinstance(key, slice):
-            if isinstance(value, list):
-                return "[" + ", ".join(_value_to_excel_literal(v) for v in value[key]) + "]"
-            return (base_var.python_name or base_var.path.leaf)
+            # Element-wise, as a window of a laid-out row: this period's
+            # element; a one-element window broadcasts, a longer row
+            # clamps to the last.
+            window = value[key] if isinstance(value, list) else []
+            if not window:
+                return None
+            return _value_to_excel_literal(window[min(period_idx, len(window) - 1)])
 
         if isinstance(key, str) and keys and key in keys:
             return _value_to_excel_literal(value[keys.index(key)])
@@ -1485,13 +1632,9 @@ class ExcelRenderer:
             and key not in range(len(value) if isinstance(value, list) else 1)
         ):
             return _value_to_excel_literal(value[keys.index(key)])
-        if isinstance(key, int) and isinstance(value, list) and 0 <= key < len(value):
+        if isinstance(key, int) and isinstance(value, list) and -len(value) <= key < len(value):
             return _value_to_excel_literal(value[key])
-
-        var_id = (base_var.python_name or base_var.path.leaf)
-        if isinstance(key, str):
-            return f'{var_id}["{key}"]'
-        return f"{var_id}[{key}]"
+        return None
 
     def _lookup_key_index(self, base_var: Any, key: Any, addr_obj: VariableAddresses) -> Optional[int]:
         keys = getattr(base_var, "_keys", None)

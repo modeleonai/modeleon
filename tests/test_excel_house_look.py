@@ -386,10 +386,114 @@ def test_lines_are_numbered_by_section_and_links_keep_none(tmp_path):
     view = mo.ExcelView(meta={**LEAD, "numbering": "section"})
     got = cells(book(_linked(view), tmp_path)["Timing"])
     numbers = {got[f"B{r}"]: got.get(f"A{r}") for r in range(2, 30) if f"B{r}" in got}
+    assert [numbers[s] for s in ("Timeline", "Flags", "Key dates")] == ["1", "2", "3"]
     assert numbers["Period number"] == "1.1" and numbers["Period end"] == "1.3"
     assert numbers["First period flag"] == "2.1"
     assert numbers["Model start"] is None                         # a link has no number
     assert numbers["Financial close"] == "3.1" and numbers["Commercial operation"] == "3.2"
+
+
+def _site(view):
+    """A sheet three levels deep: a site, its blocks, their lines — and a
+    line on the sheet itself."""
+    m = mo.Model("m", default_grain="year", default_start="2026", default_periods=3)
+    with m:
+        m.default_excel_view = view
+        m.ops = mo.MultiVariable("Operations")
+        with m.ops as ops:
+            ops.days = mo.Variable(365.0, display_name="Days in year")
+            ops.site_a = mo.MultiVariable("Site A")
+            with ops.site_a as sa:
+                sa.rev = mo.MultiVariable("Sales")
+                with sa.rev as r:
+                    r.units = mo.Variable([10.0, 20.0, 30.0], display_name="Units")
+                    r.price = mo.Variable(5.0, display_name="Price")
+                    r.total = (r.units * r.price).set_display_name("Revenue")
+                sa.costs = mo.MultiVariable("Operating costs")
+                with sa.costs as c:
+                    c.rev = sa.rev.total.copy().set_display_name("Revenue (link)")
+                    c.opex = (c.rev * 0.1).set_display_name("Opex")
+                sa.margin = (sa.rev.total - sa.costs.opex).set_display_name("EBITDA")
+            ops.other = mo.MultiVariable("Site B", excel_props={"article": "B"})
+            with ops.other as o:
+                o.x = mo.Variable([1.0, 2.0, 3.0], display_name="Other line")
+    return m
+
+
+def _numbers(ws):
+    """Label → the number in column A, for every row with a label."""
+    got = cells(ws)
+    return {got[f"B{r}"]: got.get(f"A{r}") for r in range(2, ws.max_row + 1) if f"B{r}" in got}
+
+
+def test_numbers_follow_the_outline_to_any_depth(tmp_path):
+    # A section takes a number like the lines beside it, and its lines are
+    # numbered one level below it — at every depth, not just the first.
+    view = mo.ExcelView(meta={**LEAD, "numbering": "section"})
+    numbers = _numbers(book(_site(view), tmp_path)["Operations"])
+    assert numbers["Days in year"] == "1"                 # a line on the sheet itself
+    assert numbers["Site A"] == "2"
+    assert numbers["Sales"] == "2.1"
+    assert [numbers[k] for k in ("Units", "Price", "Revenue")] == [
+        "2.1.1", "2.1.2", "2.1.3"]
+    assert numbers["Operating costs"] == "2.2"
+    assert numbers["Revenue (link)"] is None and numbers["Opex"] == "2.2.1"
+    assert numbers["EBITDA"] == "2.3"                     # a line after two sections
+    assert numbers["Site B"] == "B" and numbers["Other line"] == "B.1"
+
+
+def test_a_sections_number_wears_its_heading_look(tmp_path):
+    view = mo.ExcelView(meta={**LEAD, "numbering": "section"},
+                        bands={"section": {"bold": True, "bg": "#D9E2F3"}})
+    ws = book(_site(view), tmp_path)["Operations"]
+    row = next(r for r in range(1, ws.max_row + 1) if ws.cell(r, 2).value == "Site A")
+    number = ws.cell(row, 1)
+    assert number.value == "2" and number.font.b
+    assert number.fill.fgColor.rgb == "FFD9E2F3"
+
+
+def test_a_row_riding_another_or_a_table_takes_one_number_or_none(tmp_path):
+    # A total printed on its section's own row is that row: it takes no
+    # number of its own. A table of records is one item, and the rows of
+    # a matrix of instances are numbered like lines.
+    m = mo.Model("m", default_grain="year", default_start="2026", default_periods=2)
+    with m:
+        m.default_excel_view = mo.ExcelView(meta={**LEAD, "numbering": "section"})
+        m.book = mo.MultiVariable("Book")
+        with m.book as b:
+            b.charges = mo.MultiVariable("Charges")
+            with b.charges as c:
+                c.rent = mo.Variable([5.0, 5.0], display_name="Rent")
+                c.power = mo.Variable([3.0, 3.0], display_name="Power")
+                c.total = mo.Variable(c.rent + c.power, excel_props={"header_row": True})
+            b.staff = mo.MultiVariable("Staff", excel_props={"orient": "records"})
+            with b.staff as s:
+                s.e1 = mo.MultiVariable("Employee 1")
+                s.e1.salary = mo.Variable(100.0, display_name="Salary")
+                s.e2 = mo.MultiVariable("Employee 2")
+                s.e2.salary = mo.Variable(200.0, display_name="Salary")
+            b.board = mo.MultiVariable("Board", excel_props={"orient": "columns"})
+            with b.board as d:
+                d.p1 = mo.MultiVariable("Plant 1")
+                d.p1.capacity = mo.Variable(10.0, display_name="Capacity")
+                d.p1.capex = mo.Variable(50.0, display_name="Capex")
+                d.p2 = mo.MultiVariable("Plant 2")
+                d.p2.capacity = mo.Variable(20.0, display_name="Capacity")
+                d.p2.capex = mo.Variable(90.0, display_name="Capex")
+            b.after = mo.Variable([1.0, 1.0], display_name="After the tables")
+    ws = book(m, tmp_path)["Book"]
+    numbers = _numbers(ws)
+    assert numbers["Charges"] == "1"
+    assert numbers["Rent"] == "1.1" and numbers["Power"] == "1.2"
+    assert numbers["Staff"] == "2"
+    assert numbers["Employee 1"] is None and numbers["Employee 2"] is None
+    assert numbers["Board"] == "3"
+    assert numbers["Capacity"] == "3.1" and numbers["Capex"] == "3.2"
+    assert numbers["After the tables"] == "4"
+    # Nothing else in the number column: no field of the table numbered
+    # onto its caption row.
+    assert sorted(v for v in numbers.values() if v) == sorted(
+        ["1", "1.1", "1.2", "2", "3", "3.1", "3.2", "4"])
 
 
 def test_row_totals_follow_what_a_line_is(tmp_path):

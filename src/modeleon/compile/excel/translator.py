@@ -27,12 +27,8 @@ from typing import Any, Dict, Iterable, Optional
 from .addresses import VariableAddresses
 from ...core.expr import Expr
 from ..renderer import RenderCtx
-from .renderer import ExcelRenderer, _strip_outer_parens
+from .renderer import _MAX_FORMULA_CHARS, ExcelRenderer, _strip_outer_parens
 from ..walker import Walker
-
-#: Excel keeps at most 8192 characters of one formula, the ``=`` among
-#: them; a longer one sends the whole book to repair.
-_MAX_FORMULA_CHARS = 8192
 
 
 class ExcelTranslator:
@@ -107,6 +103,12 @@ class ExcelTranslator:
             track_role=track_role,
             own_chain=expr,
         )
+        # What stands behind the two flags below, filled as the walk
+        # goes: ``(node, literal)`` for each sub-expression written as a
+        # number inside the formula, and the nodes no formula could be
+        # written around (``check_compat`` lists them per cell).
+        self.last_render_inlined_terms = self.renderer.inlined = []
+        self.last_render_lossy_terms = self.renderer.lossy = []
         emitted = self.walker.render(expr, ctx)
         # A lossy positional collapse (see RenderCtx.lossy_inline) —
         # surfaced to the caller so the cell can carry the VALUE

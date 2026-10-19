@@ -5,6 +5,10 @@
 they compile to (``=SUM(B2:F2)``, ``=AVERAGE(B2:F2)``) and all variadic like
 Excel: ``SUM(a, b, c)``, ``SUM(range)``, ``SUM(1, 2, 3)`` all work.
 
+``MIN`` / ``MAX`` over two or more operands with a series among them are
+not a reduction but one call per period — the cap and the floor a
+workbook writes in every column (``=MIN(C2, C3)``); see :func:`MIN`.
+
 **Invariant:** every call returns a :class:`Variable` with a tracked
 formula — even when all operands are plain numbers. ``mo.SUM(1, 2, 3)``
 produces ``=SUM(1, 2, 3)`` in Excel, not a bare ``6``. The formula is
@@ -18,7 +22,7 @@ from typing import Any, List, Union
 
 from ..core.expr import Literal, VarRef
 from ..core.variable import Variable
-from ._helpers import make_func_var, src
+from ._helpers import make_func_var, operand, src
 
 Number = Union[int, float]
 AggOperand = Union[Variable, Number, List[Number]]
@@ -82,17 +86,80 @@ def _common_unit(args: tuple):
     return None
 
 
-def _aggregate(func_name: str, args: tuple, value: Any, value_type: str) -> Variable:
-    _, ast_args = _flatten_args(args, func_name)
+def _result(func_name: str, args: tuple, ast_args: list, value: Any,
+            value_type: str, var_type: str) -> Variable:
     source_code = f"{func_name}({', '.join(src(a) for a in args)})"
     out = make_func_var(
-        func_name, ast_args, value, value_type, 'scalar',
+        func_name, ast_args, value, value_type, var_type,
         source_code=source_code,
     )
     unit = _common_unit(args)
     if unit is not None:
         out._unit = unit
     return out
+
+
+def _aggregate(func_name: str, args: tuple, value: Any, value_type: str) -> Variable:
+    _, ast_args = _flatten_args(args, func_name)
+    return _result(func_name, args, ast_args, value, value_type, 'scalar')
+
+
+def _is_series(a: Any) -> bool:
+    """A period-shaped operand: a list, or a Variable holding one (a row,
+    or a row per track)."""
+    from ..core.tracks import TrackValues
+    if isinstance(a, Variable):
+        return isinstance(a._value, (list, TrackValues))
+    return isinstance(a, list)
+
+
+def _per_period(values: List[Any], excel: Any) -> Any:
+    """``excel`` over the operands of one period at a time; a scalar or
+    a one-value series stands in every period, as the operators
+    broadcast it. Scalars only: one call."""
+    lists = [v for v in values if isinstance(v, list)]
+    if not lists:
+        return excel(values)
+    n = builtins.max(len(v) for v in lists)
+    for v in lists:
+        if len(v) not in (1, n):
+            raise ValueError(
+                f"Cannot broadcast lists of different lengths: {len(v)} vs {n}. "
+                f"Element-wise ops need equal lengths, or one side of length 1 "
+                f"which broadcasts over the other."
+            )
+
+    def at(v: Any, i: int) -> Any:
+        if isinstance(v, list):
+            return v[i] if len(v) == n else v[0]
+        return v
+
+    return [excel([at(v, i) for v in values]) for i in range(n)]
+
+
+def _elementwise(func_name: str, args: tuple, reduce: Any) -> Variable:
+    """``MIN`` / ``MAX`` over two or more operands with a series among
+    them: one call per period, so the cell per period is ``=MIN(C2,
+    C3)``. Tracks lift per coordinate, as under the operators."""
+    from ..core.shape import reject_axised
+    from ..core.tracks import TrackValues
+    raws: List[Any] = []
+    ast_args: list = []
+    for a in args:
+        if isinstance(a, Variable):
+            reject_axised(a, func_name)
+        raw, node = operand(a)
+        raws.append(raw)
+        ast_args.append(node)
+    excel = _excel_reduce(reduce)
+    if any(isinstance(r, TrackValues) for r in raws):
+        value: Any = TrackValues.lift(lambda *fibers: _per_period(list(fibers), excel), *raws)
+        var_type = 'list' if value.time_length else 'scalar'
+    else:
+        value = _per_period(raws, excel)
+        var_type = 'list'
+    return _result(func_name, args, ast_args, value,
+                   _first_variable_value_type(args, 'float'), var_type)
 
 
 def _lifted_reduce(func_name: str, var: Variable, reducer) -> Variable:
@@ -161,7 +228,17 @@ def SUM(*args: AggOperand) -> Variable:
 
 
 def MAX(*args: AggOperand) -> Variable:
-    """Maximum across Variables, scalars, or lists (renders ``=MAX(...)``)."""
+    """Maximum (renders ``=MAX(...)``).
+
+    Over ONE operand, the largest value of the row: ``mo.MAX(revenue)``
+    → ``=MAX(B2:F2)``. Over two or more operands with a series among
+    them, the larger PER PERIOD — a floor — with scalars broadcast as
+    ``a + b`` broadcasts them: ``mo.MAX(cash, inp.min_cash)`` →
+    ``=MAX(C4, Inputs!B2)`` in every column, inside a loop container
+    too. Over scalars only, one number: ``mo.MAX(a, b)`` → ``=MAX(B2, B3)``.
+    """
+    if len(args) >= 2 and any(_is_series(a) for a in args):
+        return _elementwise("MAX", args, builtins.max)
     from ..core.tracks import TrackValues
     if (len(args) == 1 and isinstance(args[0], Variable)
             and isinstance(args[0]._value, TrackValues)):
@@ -172,7 +249,17 @@ def MAX(*args: AggOperand) -> Variable:
 
 
 def MIN(*args: AggOperand) -> Variable:
-    """Minimum across Variables, scalars, or lists (renders ``=MIN(...)``)."""
+    """Minimum (renders ``=MIN(...)``).
+
+    Over ONE operand, the smallest value of the row: ``mo.MIN(cash)`` →
+    ``=MIN(B2:F2)``. Over two or more operands with a series among them,
+    the smaller PER PERIOD — a cap — with scalars broadcast as ``a + b``
+    broadcasts them: ``mo.MIN(sweep, balance)`` → ``=MIN(C2, C3)`` in
+    every column, inside a loop container too. Over scalars only, one
+    number: ``mo.MIN(a, b)`` → ``=MIN(B2, B3)``.
+    """
+    if len(args) >= 2 and any(_is_series(a) for a in args):
+        return _elementwise("MIN", args, builtins.min)
     from ..core.tracks import TrackValues
     if (len(args) == 1 and isinstance(args[0], Variable)
             and isinstance(args[0]._value, TrackValues)):

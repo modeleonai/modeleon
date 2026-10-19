@@ -21,6 +21,7 @@ Typical caller path::
 from __future__ import annotations
 
 import logging
+import numbers
 import re
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -34,10 +35,17 @@ from openpyxl.utils.cell import coordinate_to_tuple
 from openpyxl.utils.indexed_list import IndexedList
 from openpyxl.worksheet.worksheet import Worksheet
 
+from .cached_values import remember, remember_reference, save_workbook
 from .translator import ExcelTranslator
-from .layout import LayoutEngine, effective_hidden, row_kind, sheet_name_for
+from .layout import (
+    LayoutEngine,
+    effective_hidden,
+    hidden_key_caption_rows,
+    row_kind,
+    sheet_name_for,
+)
 from .addresses import VariableAddresses
-from .view import resolve_excel_view
+from .view import resolve_excel_view, units_hidden
 from ...core.expr import ListExpr, Literal
 from ...core.multi_variable import MultiVariableBase
 from ...core.variable import Variable
@@ -133,7 +141,7 @@ def to_excel(path: str | Path, root: "MultiVariableBase") -> None:
             translator, sheet_name, var_to_sheet, book_font=book_font, time=book_time,
         )
 
-    wb.save(path)
+    save_workbook(wb, path)
 
 
 def set_book_font(wb: Workbook, root: "MultiVariableBase") -> dict:
@@ -195,7 +203,10 @@ def write_laid_out_sheet(
                  opening_caption=engine.opening_by_sheet.get(key),
                  freeze=engine.freeze_by_sheet.get(key),
                  articles=engine.articles,
-                 caption_row=engine.caption_rows_by_sheet.get(key))
+                 caption_row=engine.caption_rows_by_sheet.get(key),
+                 key_captions=engine.key_captions_by_sheet.get(key),
+                 unit_rows=engine.unit_rows,
+                 key_caption_rows=engine.key_caption_rows)
     if plan is not None:
         from .totals_writer import write_totals
 
@@ -949,6 +960,13 @@ def _collect_root_sheets(root: "MultiVariableBase") -> list[MultiVariableBase]:
       "overview" tab named after ``root`` so orphan inputs (no enclosing
       MV) still land in the workbook.
 
+    The tabs stand in the order ``root`` declares them, unless its own
+    view lists an order (``sheet={'order': [...]}``, see
+    :func:`~.view.in_sheet_order`). It is applied here, after the model
+    has run, so every renderer that collects its sheets through this
+    function shows the same order, whatever order the sheets were
+    assigned in.
+
     Deeper sub-MVs (whether marked ``_is_sheet=True`` or not) render as
     sections inside their containing tab — :class:`LayoutEngine` is
     invoked with ``flatten_nested_sheets=True`` in :func:`to_excel`.
@@ -994,38 +1012,67 @@ def _collect_root_sheets(root: "MultiVariableBase") -> list[MultiVariableBase]:
         out.extend(claimed)
         return out
 
-    direct_vars: list[tuple[str, Variable]] = []
-    sub_mvs: list[MultiVariableBase] = []
-    for name in root._component_order:
-        comp = root._components[name]
-        if isinstance(comp, Variable):
-            direct_vars.append((name, comp))
-        elif isinstance(comp, MultiVariableBase):
-            from .view import ExcelView
+    direct_vars, sub_mvs = _root_parts(root)
 
-            if isinstance(comp, ExcelView):
-                # A named view is presentation metadata — never a tab.
-                continue
-            sub_mvs.append(comp)
-
-    out: list[MultiVariableBase] = []
+    # Each sheet with the attribute it is assigned to, so the model's
+    # declared order (``sheet={'order': [...]}``) can name it; the tab of
+    # the root's own lines has none.
+    sheets: list[tuple[str | None, MultiVariableBase]] = []
     if direct_vars:
         overview_name = root.display_name or root.python_name or "Sheet1"
         # Propagate ``_excel_layout`` from the root — without this the
         # virtual sheet loses the user's layout overrides (sheet name,
         # format) when the root is a Variables-only Model.
-        out.append(_make_virtual_sheet(overview_name, direct_vars, source=root))
+        sheets.append(
+            (None, _make_virtual_sheet(overview_name, direct_vars, source=root))
+        )
 
-    for mv in sub_mvs:
+    for name, mv in sub_mvs:
         if mv._is_sheet:
-            out.append(mv)
+            sheets.append((name, mv))
         else:
             # Promote a plain MV to a virtual Sheet without mutating the
             # user's model — new wrapper, same components by reference.
             label = mv.display_name or mv.python_name or mv.id
             items = [(n, mv._components[n]) for n in mv._component_order]
-            out.append(_make_virtual_sheet(label, items, source=mv))
-    return out
+            sheets.append((name, _make_virtual_sheet(label, items, source=mv)))
+    from .view import in_sheet_order
+
+    return [sheet for _name, sheet in in_sheet_order(root, sheets)]
+
+
+def _root_parts(
+    root: "MultiVariableBase",
+) -> tuple[list[tuple[str, Variable]], list[tuple[str, MultiVariableBase]]]:
+    """``root``'s own lines and its first-depth containers, each by the
+    attribute it is assigned to — what :func:`_collect_root_sheets` makes
+    the tabs of."""
+    from .view import ExcelView
+
+    direct_vars: list[tuple[str, Variable]] = []
+    sub_mvs: list[tuple[str, MultiVariableBase]] = []
+    for name in root._component_order:
+        comp = root._components[name]
+        if isinstance(comp, Variable):
+            direct_vars.append((name, comp))
+        elif isinstance(comp, MultiVariableBase) and not isinstance(comp, ExcelView):
+            # A named view is presentation metadata — never a tab.
+            sub_mvs.append((name, comp))
+    return direct_vars, sub_mvs
+
+
+def sheet_order_note(root: "MultiVariableBase") -> str | None:
+    """What ``root``'s declared sheet order names that is no sheet of it —
+    the names the order skips — as one sentence, or ``None``. For a caller
+    that wants the message as a string instead of a ``SheetOrderWarning``."""
+    if getattr(root, "_children_are_sections", False) or getattr(
+        root, "_is_context", False
+    ):
+        return None
+    from .view import sheet_order_note as _note
+
+    direct_vars, sub_mvs = _root_parts(root)
+    return _note(root, [(None, root)] * bool(direct_vars) + list(sub_mvs))
 
 
 def _make_virtual_sheet(
@@ -1255,6 +1302,67 @@ def _label_source(translator: Any, sheet_name: str, grain: str) -> Any:
     return lambda i: resolve(vid, i, sheet_name)
 
 
+#: The letters a number format reads as date and time code. A run drawn
+#: from them alone is tokens, however they mix: ``dd``, ``mmmmm``,
+#: ``yyyymmdd`` (a year, a month, a day), ``hhmmss``.
+_FORMAT_LETTERS = frozenset("dmyhsg")
+
+
+def quote_bare_literals(fmt: str) -> str:
+    """The format with its bare literals quoted: ``0.00x`` → ``0.00"x"``.
+
+    A run of letters outside quotes, ``[...]`` tags and the ``\\x`` /
+    ``_x`` / ``*x`` escapes is a format code only when Excel reads it as
+    one — ``General``, date and time tokens (a run of ``d``, ``m``,
+    ``y``, ``h``, ``s`` and ``g`` alone, adjacent ones included:
+    ``yyyymmdd``), ``AM/PM`` and ``A/P``, the exponent's ``E+`` /
+    ``E-``, the ``b1`` / ``b2`` calendars. Any other run is a literal
+    typed as it reads (a multiple's ``x``, a ``bn``): Excel's own dialog
+    quotes it and a stricter reader rejects it, so it is quoted here,
+    once, for every renderer. Only the letters are quoted — a ``.`` or
+    ``,`` beside them stays a format character, so a literal carrying
+    punctuation (``"pcs."``) is typed quoted. The rest of the format
+    stays as declared, a format already quoted included."""
+    out: list[str] = []
+    i, n = 0, len(fmt)
+    while i < n:
+        ch = fmt[i]
+        if ch in ('"', "["):
+            end = fmt.find('"' if ch == '"' else "]", i + 1)
+            end = n if end == -1 else end + 1
+            out.append(fmt[i:end])
+            i = end
+            continue
+        if ch in "_*\\":
+            out.append(fmt[i:i + 2])
+            i += 2
+            continue
+        if not ch.isalpha():
+            out.append(ch)
+            i += 1
+            continue
+        ahead = fmt[i:i + 5].lower()
+        if ahead == "am/pm" or ahead[:3] == "a/p":
+            k = 5 if ahead == "am/pm" else 3
+            out.append(fmt[i:i + k])
+            i += k
+            continue
+        j = i
+        while j < n and fmt[j].isalpha():
+            j += 1
+        word = fmt[i:j]
+        low = word.lower()
+        code = (
+            low == "general"
+            or set(low) <= _FORMAT_LETTERS
+            or (low == "e" and fmt[j:j + 1] in ("+", "-"))
+            or (low == "b" and fmt[j:j + 1] in ("1", "2"))
+        )
+        out.append(word if code else f'"{word}"')
+        i = j
+    return "".join(out)
+
+
 def resolve_number_format(comp: Variable) -> str | None:
     """The cell number format a Variable's values display with — one
     resolution shared by the .xlsx writer and any other renderer that
@@ -1270,7 +1378,16 @@ def resolve_number_format(comp: Variable) -> str | None:
     resolved ExcelView's ``formats`` for numeric cells: by the line's
     unit, then the ``'number'`` floor. A ``formats['date']`` replaces the
     ISO date the values would otherwise call for.
+
+    The format comes back with its bare literals quoted
+    (:func:`quote_bare_literals`): ``0.00x`` is declared as typed and
+    written as the code it means, ``0.00"x"``.
     """
+    fmt = _resolve_number_format(comp)
+    return quote_bare_literals(fmt) if fmt else fmt
+
+
+def _resolve_number_format(comp: Variable) -> str | None:
     layout = getattr(comp, "_excel_layout", None)
     if layout is not None:
         layout_format = getattr(layout, "format", None)
@@ -1731,6 +1848,25 @@ def _range_piece(start: "tuple[int, int]", end: "tuple[int, int]") -> str:
     return f"{a}:{get_column_letter(end[1])}{end[0]}"
 
 
+def row_sum_value(series: object) -> "float | None":
+    """The number a row's total shows: the sum of the numbers in ``series``,
+    skipping blanks, text and booleans as ``=SUM`` over the row's cells
+    skips them; ``None`` when there is no number to add up.
+
+    Public so every renderer that prints a row total prints this one: the
+    value a workbook caches beside its ``=SUM`` and any other renderer's
+    Total column."""
+    if not isinstance(series, list):
+        return None
+    total = 0.0
+    seen = False
+    for x in series:
+        if isinstance(x, numbers.Real) and not isinstance(x, bool):
+            total += float(x)
+            seen = True
+    return total if seen else None
+
+
 def row_sum_eligible(comp: object, values_refs: "list[str]") -> bool:
     """Whether a flagged row honestly carries a total.
 
@@ -1852,6 +1988,9 @@ def _write_sheet(
     freeze: str | None = None,
     articles: dict | None = None,
     caption_row: int | None = None,
+    key_captions: dict | None = None,
+    unit_rows: dict | None = None,
+    key_caption_rows: dict | None = None,
 ) -> None:
     """Fill a worksheet: an optional timeline header row, section-header
     labels for nested MVs, then a row per Variable (label + per-period
@@ -1873,6 +2012,14 @@ def _write_sheet(
         # columns hold the row's own cells, which wear the row's look.
         if _c and _look and _role not in ("label", "constants", "opening", "period"):
             _col_style[_c] = _look
+    # The unit column's look, for the unit row of a table whose captions
+    # head no row: a unit there wears what a unit beside a label wears.
+    _unit_look = {**_sheet_font, **_col_style.get((columns or {}).get('unit') or 0, {})}
+    # The header's look — the resolved view's ``bands['header']`` (brand
+    # fill, font colour) over the bold floor: the book's masthead, declared
+    # once, worn by the period captions, the column captions and the
+    # caption row of a keyed line alike.
+    _hdr_look = {**_sheet_font, 'bold': True, **(_sheet_view.band_styles or {}).get('header', {})}
     # Section headers first — every nested MV with a recorded slot
     # gets its display_name at (row, col). In flatten mode, nested
     # ``_is_sheet=True`` MVs render as sections inside their parent's
@@ -1919,11 +2066,12 @@ def _write_sheet(
     # Identity lookup first — worksheet titles are sanitized/uniquified
     # AFTER layout, so a name key can silently miss ('P/L' → 'P_L').
     _meta_triple = (engine_meta or {}).get(
-        id(sheet_mv), (engine_meta or {}).get(sheet_name, (False, False, False))
+        id(sheet_mv), (engine_meta or {}).get(sheet_name, (False, None, False))
     )
     # Tolerant unpack: the layout has carried a 2-tuple historically.
     _meta_article, _meta_unit = _meta_triple[0], _meta_triple[1]
     _meta_label = _meta_triple[2] if len(_meta_triple) > 2 else False
+    _label_col = 1 + (1 if _meta_article else 0)
 
     # Timeline header — period labels across row 1 (cols B onward), one per
     # value column on THIS sheet. Present only when the layout resolved a time
@@ -1962,11 +2110,7 @@ def _write_sheet(
                 header_max_col = max(header_max_col, coordinate_to_tuple(cell_addr)[1])
         n_cols = header_max_col - _hdr_first + 1 if _hdr_first else 0
         if n_cols > 0:
-            # Header band: the resolved view's ``bands['header']`` styles
-            # the period-label row (brand fill, font colour) over the
-            # bold floor — the book's masthead, declared once.
-            _hdr_bands = (_sheet_view.band_styles or {})
-            _hdr_props = {**_sheet_font, 'bold': True, **_hdr_bands.get('header', {})}
+            _hdr_props = _hdr_look
             _hdr_start = _hdr_first
             if totals_plan is not None:
                 # HIERARCHICAL header — "year" over "quarters" over
@@ -2052,7 +2196,9 @@ def _write_sheet(
                     if _end_ref is not None:
                         # The caption IS the period's end date, formatted:
                         # move the anchor's start and it follows.
-                        _label_cell.value = f"={_end_ref(i)}"
+                        _ref = _end_ref(i)
+                        _label_cell.value = f"={_ref}"
+                        remember_reference(ws, _label_cell.coordinate, _ref)
                         _label_cell.number_format = _LABEL_FORMATS[grain][style]
                     _apply_styling(_label_cell, _hdr_props)
                     if _stride > 1:
@@ -2104,13 +2250,17 @@ def _write_sheet(
         # A sheet of constants in a book whose sheets share their
         # columns: no period header, the same captions all the same.
         _write_captions(
-            ws, caption_row,
-            {**_sheet_font, 'bold': True,
-             **(_sheet_view.band_styles or {}).get('header', {})},
+            ws, caption_row, _hdr_look,
             (_meta_article, _meta_unit, _meta_label), meta_fields,
             constants_caption, (columns or {}).get('constants') or 0,
             None, None,
         )
+    # The caption row of each keyed line: its keys over its cells, in
+    # the header's look. The period header names the periods and nothing
+    # else; a line that runs along keys of its own names them here.
+    for _ref, _key in (key_captions or {}).items():
+        ws[_ref] = _key
+        _apply_styling(ws[_ref], _hdr_look)
 
     _hidden_rows: set[int] = set()
     for _, comp in sheet_mv.walk():
@@ -2156,13 +2306,21 @@ def _write_sheet(
                 # ``bands.section.bg`` can paint a section that has no fill of
                 # its own.
                 own = comp._excel_props or {}
-                if _meta_article and own.get('article'):
-                    ws.cell(row=row, column=1, value=str(own['article']))
+                # The section's own article, else the number the view's
+                # numbering gave it — in the lead column, left of its label.
+                _number = own.get('article') or (articles or {}).get(section_id)
+                _number_cell = (
+                    ws.cell(row=row, column=1, value=str(_number))
+                    if _meta_article and _number and col > 1 else None
+                )
                 role = "section" if _hdr_level == 0 else "subsection"
                 view_bands = resolve_excel_view(comp).band_styles or {}
                 band_props = {**_sheet_font, **view_bands.get(role, {}), **own}
                 if band_props:
                     _apply_styling(header_cell, band_props)
+                    # The number is part of the heading and wears its look.
+                    if _number_cell is not None:
+                        _apply_styling(_number_cell, band_props)
                     # Extend the band across the row (label cell already
                     # styled) — unless the label SHARES its row with
                     # data, as a record's does in a records-oriented
@@ -2223,6 +2381,7 @@ def _write_sheet(
         for i, cell_addr in enumerate(_maddr.values):
             cell = ws[cell_addr]
             cell.value = _cell_content(_mirror, i, _mirror.id, translator, sheet_name, _maddr)
+            remember(ws, cell_addr, computed_value(_mirror, i))
             if _mfmt:
                 cell.number_format = _mfmt
             _apply_styling(cell, _mirror_look)
@@ -2234,6 +2393,7 @@ def _write_sheet(
         if _mopen is not None and _maddr.opening:
             cell = ws[_maddr.opening]
             cell.value = _mopen
+            remember(ws, _maddr.opening, opening_value(_mirror))
             if _mfmt:
                 cell.number_format = _mfmt
             _apply_styling(cell, _mirror_look)
@@ -2254,9 +2414,14 @@ def _write_sheet(
         label = comp.display_name
         # Lead metadata columns: the article number in column A, the
         # unit in its own column right after the label. Written below,
-        # once the row's look is known.
+        # once the row's look is known. They are a ROW's: a caption
+        # standing in a value column — a scalar across a board, a field
+        # of a records table — heads no row of the sheet and takes none
+        # (its unit would land on the neighbour's caption); it carries
+        # its unit as a caption does without a unit column.
+        _own_row = bool(addr.name) and coordinate_to_tuple(addr.name)[1] == _label_col
         _lead: dict = {}
-        if addr.name:
+        if _own_row:
             _lrc = coordinate_to_tuple(addr.name)
             _lead = lead_cells_for_row(
                 comp,
@@ -2284,15 +2449,33 @@ def _write_sheet(
             _level = _nesting_level(comp)
             if _level > 0:
                 label = " " * (_indent * _level) + label
-        # Suffix the unit when the Variable has one — "Revenue ($)".
-        # (Skipped when the unit renders as its own lead column.)
-        unit = None if _meta_unit else getattr(comp, '_unit', None)
+        # The unit: beside the label, in the unit column (the lead cells
+        # above), when the sheet has one and the line heads a row; under
+        # the caption, in the unit row its table reserved (``unit_rows``),
+        # when it heads none; suffixed into the label — "Revenue ($)" —
+        # on a sheet without a unit column; nowhere on a sheet whose
+        # view hides units (``meta={'unit': False}``).
+        _unit_row = None if _own_row else (unit_rows or {}).get(var_id)
+        unit = (
+            None if units_hidden(_meta_unit) or (_meta_unit and _own_row)
+            or _unit_row is not None
+            else getattr(comp, '_unit', None)
+        )
         if unit is not None:
             unit_str = str(unit)
             if unit_str:
                 label = f"{label} ({unit_str})"
         if label and addr.name:
             ws[addr.name] = label
+        if _unit_row is not None and addr.name:
+            _own_unit = getattr(comp, '_unit', None)
+            _unit_str = str(_own_unit) if _own_unit is not None else ""
+            if _unit_str:
+                _apply_styling(
+                    ws.cell(row=_unit_row, column=coordinate_to_tuple(addr.name)[1],
+                            value=_unit_str),
+                    _unit_look,
+                )
 
         # Optional per-variable number format (e.g. dates → "mmm yyyy").
         # Two override sources, checked in priority order:
@@ -2359,6 +2542,7 @@ def _write_sheet(
         for i, cell_addr in enumerate(addr.values):
             cell = ws[cell_addr]
             cell.value = _cell_content(comp, i, var_id, translator, sheet_name, addr)
+            remember(ws, cell_addr, computed_value(comp, i))
             if number_format:
                 cell.number_format = number_format
             _apply_styling(cell, value_props)
@@ -2368,6 +2552,7 @@ def _write_sheet(
             if _open is not None:
                 cell = ws[addr.opening]
                 cell.value = _open
+                remember(ws, addr.opening, opening_value(comp))
                 if number_format:
                     cell.number_format = number_format
                 _apply_styling(cell, value_props)
@@ -2411,6 +2596,11 @@ def _write_sheet(
         )
         for (_r, _c), _text in _lead.items():
             _cell = ws.cell(row=_r, column=_c, value=_text)
+            if _c == _sum_col and isinstance(_text, str) and _text.startswith("="):
+                # The total of the very cells its =SUM reads.
+                remember(ws, _cell.coordinate, row_sum_value(
+                    [computed_value(comp, i) for i in range(len(addr.values))]
+                ))
             _look = {**_sheet_font, **_col_style.get(_c, {})}
             if _c == _sum_col:
                 if number_format and format_shows_a_number(number_format):
@@ -2471,6 +2661,9 @@ def _write_sheet(
     # Helper rows (``excel_props={'hidden': True}``, inherited down
     # the tree): written in full — values, formulas, labels — but
     # natively hidden. The book stays auditable; the eye stays clear.
+    # The caption row of a keyed line goes with its lines: hidden when
+    # every line sharing it is, kept for a visible sibling.
+    _hidden_rows |= hidden_key_caption_rows(sheet_mv, key_caption_rows or {})
     for _r in _hidden_rows:
         ws.row_dimensions[_r].hidden = True
 
@@ -2787,13 +2980,18 @@ def _cell_content(
     )
     if formula is not None:
         return formula
+    return _scalarize(computed_value(var, period_idx))
 
+
+def computed_value(var: Variable, period_idx: int) -> Any:
+    """What the engine computed for ``var`` in period ``period_idx``: the
+    value its cell shows, whether the cell holds that value or the formula
+    that produces it. Public so every renderer reads a cell's value the
+    same way."""
     value = var._value
     if isinstance(value, list):
-        if period_idx < len(value):
-            return _scalarize(value[period_idx])
-        return None
-    return _scalarize(value)
+        return value[period_idx] if period_idx < len(value) else None
+    return value
 
 
 def _scalarize(value: Any) -> Any:

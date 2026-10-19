@@ -7,6 +7,129 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] — 2026-10-19
+
+### Added
+
+- **A caption row over a keyed line.** A line that runs along keys instead
+  of periods — `mo.Variable({'FY2023': 400, 'FY2024': 450})`, or a line on
+  one non-time `indexed_by` axis — laid out on a period-headed sheet gets
+  one reserved row directly above it carrying its keys, its cells under
+  them from the first period column; consecutive keyed lines with the same
+  keys share the row, a hidden line hides it unless a visible sibling shares
+  it, and a subtotal column writes nothing over it. Before, the
+  line's cells sat under the year captions as if they were periods. The
+  notebook repr draws the same row.
+- **A unit row under a table's captions.** On a sheet that declares a unit
+  column (`ExcelView(meta={'unit': …})`), a records table or a board of
+  scalars writes its fields' units in one row under the caption row, in
+  the unit column's style, and keeps the captions bare; without a unit
+  column the unit is suffixed into the caption (`EV (USD m)`). Before, a
+  caption's unit was written one column right, over the neighbour.
+- **`check_compat(model, 'excel')` names every number baked into a
+  formula.** A cell whose formula is live but carries a computed literal
+  (an aggregate over an expression no row holds, a `mo.time` read with no
+  time window, a track coordinate without a row) is listed with its line,
+  its period and the sub-expression that became a number, beside the cells
+  written as plain values; `CompatIssue` gains optional cell fields, its
+  positional shape is unchanged.
+- **`SUMPRODUCT`.** `mo.SUM(price * volume)` over laid-out rows is written
+  `=SUMPRODUCT(C2:F2, C3:F3)` (three rows too); before, the cell held the
+  engine's number.
+- **A declared sheet order.** `ExcelView(sheet={'order': ['summary',
+  'inputs']})` on a model puts those sheets first, as listed, each named by
+  the attribute it is assigned to (`model.summary = …`; the tab of the
+  model's own lines goes by the model's name). The rest follow in the order
+  the model declares them. Every renderer that lists the sheets reads it
+  (the workbook, the notebook tabs), and only from the view of the model
+  being written, so a container written on its own keeps its own order.
+  A single name is an order too, and a repeat is harmless. A name that is
+  no sheet is skipped with a `SheetOrderWarning` that lists the sheets
+  there are, and the rest of the order still applies. A model without the
+  declaration writes the same workbook as before.
+
+### Changed
+
+- **`ExcelView(meta={'unit': False})` shows units nowhere.** The unit flag
+  has three states: a caption (or `True`) puts the units in a column of
+  their own and, under a table's captions, in a unit row; unset suffixes
+  each unit into its row label and table caption (`Revenue (USD m)`);
+  `False` hides the unit text everywhere — no column, no suffix, no unit
+  row — in the workbook and the notebook repr alike, while the number
+  formats keyed by unit (`formats={'%': '0.0%'}`) still apply: the unit
+  stays on the line, only its text is hidden. Before, `False` and unset
+  wrote the same sheet; a workbook that declared `False` loses its
+  suffixes.
+- **`mo.MIN` / `mo.MAX` over two or more operands work period by period.**
+  `mo.MIN(sweep, balance)` is the smaller of the two in every period and
+  `mo.MAX(cash, inputs.min_cash)` the larger: a series, with scalars
+  broadcast as `a + b` broadcasts them and an operand with tracks taken
+  track by track, written to every column as `=MIN(C2, C3)` / `=MAX(C4,
+  Inputs!B2)` — the cap and the floor of a hand-built workbook. Inside a
+  `loop=True` container they are allowed, like `IF`. Before, two series
+  reduced to one number across both rows (`=MIN(B2:F2, B3:F3)`) and a
+  cap had to be spelled `mo.IF(a < b, a, b)`. Over one operand
+  `mo.MIN(row)` stays the reduction (`=MIN(B2:F2)`), over scalars only it
+  stays one number (`=MIN(B2, B3)`), and a one-operand reduction inside a
+  loop stays refused, now pointing at the two-operand form.
+- **A `+` chain past Excel's 8,192 characters folds into `SUM`.** A run of
+  `+` over plain cell references of one sheet whose text would pass the
+  limit is written as `=SUM(first:last)` runs (at most 255 pieces); any
+  shorter chain is written as it always was. Before, the cell held the
+  engine's number and the writer logged the limit.
+- **`meta={'numbering': 'section'}` numbers a sheet as an outline.** A
+  first-level section is `1`, a section inside it `1.1`, and a line is
+  numbered one level below its section (`1.1.1`). Sections and lines of one
+  container count together, so a line on the sheet itself takes the next
+  number beside the sections. A section's own `article` wins, and its lines
+  count from it. A row that repeats another row (a total shown in a header
+  row, a track's copy of a line, a repeated instance in a matrix) takes no
+  number; a records table is one item; the rows of a columns matrix are
+  numbered like lines. Before, only lines were numbered, flat within each
+  first-level section.
+
+### Fixed
+
+- **A compound lag fill is written in brackets.** `x - mo.lag(y, fill=a + b
+  - c)` was written `=B2 - I!B1 + I!B2 - I!B3` — the fill bare inside the
+  enclosing operator, so the spreadsheet computed 120 where the model
+  computed 40. The fill now reads as one operand
+  (`=B2 - (I!B1 + I!B2 - I!B3)`) under every operator, under unary minus
+  and inside a recurrence template; a simple fill is written as before.
+- **A subscript is its cell, never Python text.** `line[-1]` resolves to the
+  last period's cell (`=Inp!D2 * 2`), an element of a line with no row of
+  its own is its number, and a subscript or method the renderer cannot
+  spell is written as the cell's value; before, the cell held the model's
+  source text (`=m.inp.ufcf[-1] * 2`).
+- **A columns board starts after the sheet's lead columns.** A board
+  (`excel_props={'orient': 'columns'}`) on a sheet with a unit, note or
+  constants column began at column B regardless, so the unit column
+  overwrote its first instance; it now begins where the period columns
+  do. A board's or a records container's own direct lines are laid out
+  beneath the table (before, they were dropped from the workbook), and a
+  line's `header_row` setting is honoured there too.
+- **A bare literal in a number format is quoted.** `0.00x` is written
+  `0.00"x"` (`#,##0 bn` → `#,##0 "bn"`); date and time codes, `General`,
+  `E+`, `AM/PM` and anything already quoted or escaped are left as typed.
+- **A workbook carries no green triangles of its writer's own making.**
+  Excel marks a suspected mistake with a green triangle in a cell's corner,
+  which a reader takes for a note that is not there. Line numbers and year
+  labels written as text, and the formulas the writer put in (a quarter's
+  total between its months, a range that starts after the opening column),
+  are now recorded in each sheet as checked. A formula that computes an
+  error keeps its mark, and so do typed values, labels and whatever a
+  reader types later into a cell that held no formula.
+- **A workbook's formula cells carry the values the engine computed.**
+  Every formula cell `to_excel` writes for a row, a header row repeating
+  another row, an opening cell or a period caption now holds the value the
+  engine computed beside its formula. A reader that does not recalculate
+  (a file preview, `openpyxl` with `data_only=True`, pandas) shows the
+  model's numbers instead of empty cells, zeros or dates in 1899. Excel
+  recalculates on open; LibreOffice, by default, shows the cached values.
+  A row total carries the sum of its row. A formula cell with nothing to
+  cache (a subtotal column, an empty period, a value no cell can hold) is
+  written with no value at all, so a preview shows it blank instead of 0.
+
 ## [0.2.1] — 2026-10-06
 
 ### Added

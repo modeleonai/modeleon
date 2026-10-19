@@ -466,29 +466,32 @@ def _project_variable(var: Variable, grain: str, cache: Dict[int, Any], key: int
                 result._grain = grain
         else:
             from .regrain import hole_value
+            from .variable import TimeLoc
             line_blank = hole_value(var._value)
+            label = var._display_name or var.python_name
+            # Each role re-grains as its own series would: at the line's
+            # own placement when it has one, else — a list — at the line's
+            # ambient window (the owner chain), else time-agnostic. Resolved
+            # once for the line, so no stand-in Variable is built per role
+            # (each would be projected through Variable.at with two more
+            # Variables and a Regrain).
+            own = (TimeLoc(var._start, var._grain, var._first_day)
+                   if var._grain is not None else None)
+            ambient = own if own is not None else var.time
             projected: Dict[str, Any] = {}
             p_start = None
             p_first = None
             for role, track in var._value.items():
-                # Named as the line: a refusal names the line, never this
-                # stand-in's floating id.
-                s = Variable(display_name=var._display_name or var.python_name)
-                s._value = list(track) if isinstance(track, list) else track
-                s._hole_value = line_blank      # the whole line's, not one track's
-                s.var_type = 'list' if isinstance(track, list) else 'scalar'
-                s._regrain = var._regrain
-                s._start = var._start
-                s._grain = var._grain
-                s._first_day = var._first_day
-                s._unit = var._unit
-                if getattr(var, '_owner', None) is not None:
-                    s.__dict__['_owner'] = var._owner
-                p = project_variable(s, grain, {})
-                projected[role] = p._value
+                loc_r = own if own is not None else (
+                    ambient if isinstance(track, list) else None)
+                values, start, first = _fold_track(
+                    track, loc_r, _spec, grain, label, line_blank,
+                    var._start, var._first_day,
+                )
+                projected[role] = values
                 if p_start is None:
-                    p_start = p._start
-                    p_first = getattr(p, '_first_day', None)
+                    p_start = start
+                    p_first = first
             result = Variable(display_name=var._display_name)
             result._value = TrackValues(projected)
             # Each track — the blend among them — re-grained on its own:
@@ -592,6 +595,88 @@ def _project_variable(var: Variable, grain: str, cache: Dict[int, Any], key: int
     return result
 
 
+def _fold_track(track: Any, loc: Any, spec: Any, grain: str, label: str, blank: Any,
+                start: Any, first_day: Any) -> tuple:
+    """One role of a tracked line at ``grain`` — ``(values, start, first_day)``,
+    what projecting the role as its own series computed: a scalar broadcasts,
+    a series already at the grain or without a time copies, a located series
+    applies the LINE's rule (:func:`~.variable.series_at_grain`, so the
+    refusals name the line the way ``Variable.at`` does)."""
+    if not isinstance(track, list):
+        return track, start, first_day
+    if loc is not None and loc.grain == grain:
+        return list(track), start, first_day
+    if spec is not None:
+        if loc is None:
+            if not spec.frozen:
+                raise ValueError(
+                    f"{label!r} has a re-grain rule but no resolvable native "
+                    f"grain — set grain= on it, or default_grain on an ancestor "
+                    f"model, so the rule knows which grain it re-grains from."
+                )
+            return list(track), start, first_day
+        from .variable import series_at_grain
+        values, start_label, first, _ranges, _rule = series_at_grain(
+            label, track, loc, spec, grain, blank)
+        return values, start_label, first
+    if loc is None:
+        return list(track), start, first_day
+    raise ValueError(
+        f"{label!r} has no re-grain rule and is not a formula; give it a "
+        f"rule (regrain=mo.up('sum'/'last'/'mean'))."
+    )
+
+
+def _absorbed(child: Variable, exc: BaseException) -> Variable:
+    """The ``'#VALUE!'`` row a line that cannot re-grain becomes under
+    ``on_error='absorb'`` — its teaching message on ``_regrain_error``, the
+    tracks SHAPE kept (the axis is structure, the token is the value), the
+    source text carried so a renderer still shows the row's code."""
+    from .tracks import TrackValues as _TV
+    projected = Variable('#VALUE!', display_name=child._display_name)
+    src_val = getattr(child, '_value', None)
+    if isinstance(src_val, _TV):
+        projected._value = _TV({r: '#VALUE!' for r in src_val.roles})
+        # The blend among them is the error too, never a track to splice
+        # again (nor one the row authored).
+        projected._regrained_tracks = True
+    projected._regrain_error = str(exc)
+    src_code = getattr(child, '_source_code', None)
+    if src_code:
+        projected._source_code = src_code
+    return projected
+
+
+def project_line(var: Variable, grain: str, cache: Dict[int, Any],
+                 on_error: str = 'raise') -> Variable:
+    """One line of a tree at ``grain`` through the shared ``cache`` — the
+    step :func:`project_model` takes per line, available on its own to
+    project one line without projecting the whole tree.
+    ``on_error='absorb'`` turns a refusal into
+    the same ``'#VALUE!'`` row the tree projection would place."""
+    try:
+        return project_variable(var, grain, cache)
+    except (ValueError, TypeError) as exc:
+        if on_error != 'absorb':
+            raise
+        return _absorbed(var, exc)
+
+
+class _WindowProbe:
+    """A bare object for :func:`window_projects` to set a window on."""
+
+
+def window_projects(mv: Any, grain: str) -> bool:
+    """Whether ``mv``'s own window re-grains to ``grain`` — the refusal
+    :func:`project_model` raises for a ROOT before touching a line (a model
+    of years asked for quarters), answered without a projection."""
+    try:
+        _propagate_window(mv, _WindowProbe(), grain)
+    except Exception:  # noqa: BLE001 — any refusal: the window does not project
+        return False
+    return True
+
+
 def project_model(mv: Any, grain: str, cache: Optional[Dict[int, Any]] = None,
                  on_error: str = 'raise') -> Any:
     """Re-grain a whole MV tree onto ``grain`` — returns a new MultiVariable.
@@ -620,32 +705,7 @@ def project_model(mv: Any, grain: str, cache: Optional[Dict[int, Any]] = None,
                 continue
             setattr(result, name, project_model(child, grain, cache, on_error))
         else:
-            try:
-                projected = project_variable(child, grain, cache)
-            except (ValueError, TypeError) as exc:
-                if on_error != 'absorb':
-                    raise
-                projected = Variable('#VALUE!', display_name=child._display_name)
-                from .tracks import TrackValues as _TV
-                src_val = getattr(child, '_value', None)
-                if isinstance(src_val, _TV):
-                    # Keep the tracks SHAPE under the error: the axis
-                    # is structure, the token is the value, so
-                    # .at(track=...) still works on the error row.
-                    projected._value = _TV(
-                        {r: '#VALUE!' for r in src_val.roles}
-                    )
-                    # The blend among them is the error too, never a track
-                    # to splice again (nor one the row authored).
-                    projected._regrained_tracks = True
-                projected._regrain_error = str(exc)
-                # Keep the row's IDENTITY readable: carry the source
-                # text over, so any renderer that shows a row's code
-                # still shows it for the error row.
-                src_code = getattr(child, '_source_code', None)
-                if src_code:
-                    projected._source_code = src_code
-            setattr(result, name, projected)
+            setattr(result, name, project_line(child, grain, cache, on_error))
     try:
         _propagate_window(mv, result, grain)
     except ValueError:

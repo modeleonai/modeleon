@@ -90,8 +90,11 @@ class Dependents:
 
 
 #: Functions that map one period to one period, so the loop can call
-#: them with this period's numbers. Everything else — ``SUM``, ``MAX``,
-#: ``NPV``, … — reads a whole series and cannot sit inside the loop.
+#: them with this period's numbers. Everything else — ``SUM``, ``NPV``,
+#: ``MAX`` over one operand, … — reads a whole series and cannot sit
+#: inside the loop. ``MAX`` / ``MIN`` over two or more operands (a floor,
+#: a cap) are per period as well; :func:`_check_elementwise` admits them
+#: by their arity.
 _ELEMENTWISE = frozenset({
     'IF', 'AND', 'OR', 'NOT', 'ABS', 'ROUND', 'INT', 'MOD', 'CHOOSE',
     'ISBLANK', 'EDATE', 'EOMONTH', 'YEAR', 'MONTH', 'DAY', 'DATE',
@@ -636,7 +639,8 @@ def _check_elementwise(v: Any) -> None:
         elif isinstance(node, UnaryOp):
             walk(node.operand)
         elif isinstance(node, FuncCall):
-            if node.func not in _ELEMENTWISE:
+            per_period_pair = node.func in ('MAX', 'MIN') and len(node.args) >= 2
+            if node.func not in _ELEMENTWISE and not per_period_pair:
                 from .. import functions as fns
                 if not hasattr(fns, node.func):
                     raise ValueError(
@@ -646,8 +650,8 @@ def _check_elementwise(v: Any) -> None:
                     )
                 hint = ""
                 if node.func in ('MAX', 'MIN'):
-                    hint = (" For a per-period floor or cap write "
-                            "mo.IF(x > 0, x, 0) / mo.IF(x < cap, x, cap).")
+                    hint = (" A per-period floor or cap is mo.MAX(x, 0) / "
+                            "mo.MIN(x, cap): two or more operands.")
                 raise ValueError(
                     f"{_label(v)} applies {node.func} to a row of the loop. "
                     f"{node.func} reads a whole series, and inside the loop "

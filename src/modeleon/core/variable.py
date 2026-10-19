@@ -46,7 +46,6 @@ if TYPE_CHECKING:
 
     from .loops import Dependents
 
-    from .multi_variable import MultiVariableBase
 
 
 #: A Variable's native time location — ``(start, grain)`` — or ``None`` when
@@ -90,6 +89,66 @@ def _typed_dates_line(var: "Variable") -> bool:
             return False
     return typed > 0
 
+
+
+def series_at_grain(label: str, values: Any, loc: 'TimeLoc', spec: Any, grain: str,
+                    blank: Any) -> tuple:
+    """The rule half of :meth:`Variable.at` for a LOCATED series: ``(values,
+    start_label, first_day, ranges, rule)`` at ``grain`` — or ``at``'s refusal,
+    word for word. One body for the method and for the projection's track-wise
+    fold (``core.projection``), so a tracked line's roles re-grain exactly as
+    the line would and a refusal names the line the same way."""
+    from .regrain import Ratio
+    from .time import bucket_ranges, coarse_first_day, regrain_series
+    if spec is None:
+        raise ValueError(
+            f"{label!r} has no re-grain rule; give it one (e.g. "
+            f"regrain=mo.up('sum'/'last'/'mean')) to re-grain {loc.grain} "
+            f"-> {grain}."
+        )
+    if spec.frozen and spec.default is None and not spec.overrides:
+        raise ValueError(
+            f"{label!r} is grain-frozen with no value rule — it has no "
+            f"meaning off its native grain (a period counter / date "
+            f"spine). If its VALUES do have coarse meaning — quarter-end "
+            f"cash is the last monthly close — declare it: "
+            f"regrain=mo.frozen(values='last')."
+        )
+    # A frozen spec with a value rule: the formula never re-evaluates at
+    # the target grain, but the computed value series re-grains below
+    # like any stored series — which is exactly what this path does.
+    rule = spec.overrides.get((loc.grain, grain), spec.default)
+    if rule is None:
+        raise ValueError(f"{label!r} has no re-grain rule for {loc.grain} -> {grain}.")
+    if isinstance(rule, Ratio) or callable(rule):
+        raise ValueError(
+            "ratio and callable re-grain rules are not applied by "
+            "Variable.at() — a ratio rule re-grains through the model "
+            "projection (model.at(grain)); use a named recipe here."
+        )
+    n = len(values) if isinstance(values, list) else 1
+    ranges = bucket_ranges(loc.grain, grain, loc.start, n)
+    labels, out = regrain_series(values, loc.grain, grain, loc.start, rule, loc.first_day,
+                                 blank=blank)
+    return out, labels[0], coarse_first_day(loc.start, loc.grain, loc.first_day, grain), ranges, rule
+
+
+#: Every field ``Variable.__init__`` starts from, with its default — written
+#: into a new instance's ``__dict__`` in one step; the constructor then
+#: writes only what differs. Immutable values only (the two per-instance
+#: containers, ``_excel_props`` and ``_dependency_refs``, are built per
+#: instance); the key set is exactly the fields the constructor defines,
+#: so ``vars(v)`` / ``hasattr`` see every field.
+_VARIABLE_DEFAULTS: Dict[str, Any] = {
+    '_role_kwargs': None, '_roles_materialized': False, '_roles_provisional': False,
+    '_blend_name': None, '_excel_layout': None, '_owner': None, '_component_name': None,
+    '_value': None, '_expr': None, '_raw_formula_str': None, 'pyformula': None,
+    '_source_code': None, '_unit': None, '_unit_declared': False, '_keys': None,
+    '_keys_source': None, 'var_type': 'scalar', 'value_type': 'float', '_indexed_by': (),
+    '_start': None, '_grain': None, '_regrain': None, '_schedule': None, '_extend': None,
+}
+
+_object_setattr = object.__setattr__
 
 class Variable(_VariableInit, _VariableArithmetic, Component):
     # ``__eq__`` is overridden on ``_VariableArithmetic`` to return a
@@ -243,12 +302,20 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
         built by the operator methods and ``__init__`` is called with
         ``formula=<string>``.
         """
+        # The 24 fields every Variable starts from, in one C-level write
+        # (``_VARIABLE_DEFAULTS``): the body below writes a field only when
+        # its value is NOT the default. Per-field writes through
+        # ``__setattr__`` dominated the cost of a Variable(), and every
+        # operator in a formula builds one. The key set of ``__dict__`` is
+        # the same either way.
+        self.__dict__.update(_VARIABLE_DEFAULTS)
+
         # Dict sugar: Variable({"Bear": 800, "Base": 1000}) → list+keys
         if isinstance(value, dict):
             keys = list(value.keys())
             value = list(value.values())
 
-        if sum(arg is not None for arg in (value, formula, pyformula)) > 1:
+        if (value is not None) + (formula is not None) + (pyformula is not None) > 1:
             raise ValueError(
                 "Cannot specify more than one of 'value', 'formula', or 'pyformula'. "
                 "Use 'value' for literal values, 'formula' for calculations."
@@ -265,24 +332,17 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
         # The override spelling: a positional shared expression plus
         # track overrides — ``mo.Variable(price * seats, actual=ledger)``
         # — derives non-overridden tracks from the shared value.
-        self._role_kwargs: Optional[dict] = None
-        # True once adoption has lowered the track kwargs onto a
-        # TrackValues. The guard must be a FLAG, not a check on the
-        # value's type — a tracked SHARED expression makes ``_value``
-        # TrackValues at construction, and the overrides still owe a
-        # materialization pass.
-        self._roles_materialized: bool = False
-        # True while the value was materialized from the KWARGS' OWN
-        # names, before any declaration was reachable (inside a
-        # MultiVariableClass body, where the instance is still
-        # floating). Adoption validates against the declaration and
-        # clears the flag.
-        self._roles_provisional: bool = False
-        # Name of the track the BLEND synthesized on this variable (None
-        # until synthesis). Distinguishes synthesized-by-us from
-        # authored/inherited on re-runs, and lets a copy carried into a
-        # blend-less context strip its now-stale synthesized track.
-        self._blend_name: Optional[str] = None
+        # ``_role_kwargs`` (None until kwargs arrive), ``_roles_materialized``
+        # (True once adoption has lowered the track kwargs onto a
+        # TrackValues — a FLAG, not a check on the value's type: a tracked
+        # SHARED expression makes ``_value`` TrackValues at construction,
+        # and the overrides still owe a materialization pass),
+        # ``_roles_provisional`` (True while the value was materialized
+        # from the KWARGS' OWN names, before any declaration was
+        # reachable; adoption validates and clears it) and
+        # ``_blend_name`` (the track the BLEND synthesized here, None until
+        # synthesis — tells synthesized-by-us from authored on re-runs)
+        # start from the defaults above.
 
         # --- tracked construction (the tracks value) ---
         # ``tracks={'plan': [...], 'actual': [...]}`` builds the value as
@@ -320,47 +380,34 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
         # Opaque layout-config attribute. Writer reads ``.format`` off it
         # to apply per-cell number_format overrides. ``None`` is the
         # inherit-from-parent signal for a resolver that walks the tree.
-        self._excel_layout = excel_layout
-        # Adoption back-pointers: set by ``MultiVariableBase._register_component``
-        # when this Variable is attached to a parent MV. Default ``None`` so
-        # the ``.path`` property can read them without ``getattr`` fallbacks.
-        self._owner: Optional["MultiVariableBase"] = None
-        self._component_name: Optional[str] = None
-        self._value: Any = None
-        # _expr is the structured source of truth for this Variable's
-        # formula. The ``.formula`` string property is a read-through
-        # view derived from ``_expr.to_string()`` — set ``_expr``
-        # directly, not ``formula``.
-        self._expr: Optional[Expr] = None
-        # Fallback string form for formulas passed or assigned as raw
-        # strings — e.g. ``Variable(formula="x + y")`` or external tools
-        # writing into ``self.formula = <rendered>`` via the setter.
-        # Internal DSL construction builds an AST on ``_expr`` and leaves
-        # this None; the ``formula`` getter reads ``_expr`` first and
-        # falls back here.
-        self._raw_formula_str: Optional[str] = None
-        # Captured rendering of a ``pyformula=`` input (see kwarg
-        # docstring). Marks the Variable as an input, not a computed
-        # formula. None for every other construction path.
-        self.pyformula: Optional[str] = None
-        # Human-readable source snippet for the expression that produced
-        # this Variable (e.g. ``"cohort_retention(new_cust, rate)"``,
-        # ``"SUM(revenues)"``, ``"recurrence(100, ...)"``). Set by
-        # ``functions/*`` helpers so inspection tools can show a
-        # friendlier rendering than the raw formula AST. Left as None
-        # for Variables that don't need one — operator-overloaded
-        # intermediates and plain inputs.
-        self._source_code: Optional[str] = None
+        if excel_layout is not None:
+            self._excel_layout = excel_layout
+        # Adoption back-pointers ``_owner`` / ``_component_name`` are set by
+        # ``MultiVariableBase._register_component`` when this Variable is
+        # attached to a parent MV — None until then, so the ``.path``
+        # property reads them without ``getattr`` fallbacks. ``_value``,
+        # ``_expr`` (the structured source of truth for the formula; the
+        # ``.formula`` string property is a read-through view of
+        # ``_expr.to_string()`` — set ``_expr``, not ``formula``),
+        # ``_raw_formula_str`` (the fallback string form for formulas
+        # passed or assigned as raw strings), ``pyformula`` (the captured
+        # rendering of a ``pyformula=`` input, which marks the Variable as
+        # an input) and ``_source_code`` (a friendlier source snippet the
+        # ``functions/*`` helpers set) all start as None.
         # _dependency_refs mirrors _expr.iter_refs() (with dedup); populated by
         # construction sites that build an AST. Kept as a cached list rather
         # than a live property so callers don't re-walk the tree on every read.
         self._dependency_refs: List['Variable'] = []
-        self._unit = self._resolve_unit(unit)
-        # A unit the author declares (``unit=`` / ``set_unit``) is kept as
-        # given; one the arithmetic derives may be derived again (a loop's
-        # rows, built on placeholders, are).
-        self._unit_declared = self._unit is not None
-        self._keys, self._keys_source = self._resolve_keys(keys)
+        if unit is not None:
+            resolved_unit = self._resolve_unit(unit)
+            if resolved_unit is not None:
+                self._unit = resolved_unit
+                # A unit the author declares (``unit=`` / ``set_unit``) is kept
+                # as given; one the arithmetic derives may be derived again (a
+                # loop's rows, built on placeholders, are).
+                self._unit_declared = True
+        if keys is not None:
+            self._keys, self._keys_source = self._resolve_keys(keys)
 
         # --- dispatch to the mode that was requested ---
         if formula is not None:
@@ -387,8 +434,10 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
                 var_type = 'list'
 
         # --- final type + metadata ---
-        self.var_type = var_type
-        self.value_type = value_type
+        if var_type != 'scalar':
+            self.var_type = var_type
+        if value_type != 'float':
+            self.value_type = value_type
         # is_formula is a derived @property — see below.
         # ``_display_name`` and ``_excel_props`` were set on Component
         # via ``super().__init__`` above.
@@ -404,7 +453,8 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
         # of the shape story: axes are just Variables that other
         # Variables happen to reference via ``indexed_by``. There is
         # no separate AxisProvider registry.
-        self._indexed_by: Tuple['Variable', ...] = tuple(indexed_by) if indexed_by else ()
+        if indexed_by:
+            self._indexed_by = tuple(indexed_by)
 
         # --- axised-construction invariant ---
         # A declared shape must be honored by the value, or the axis
@@ -440,32 +490,33 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
         # --- ambient time location + re-grain ---
         # A Variable is DEFINED at a native (start, grain) — re-grainable
         # metadata — or is time-agnostic (no grain; broadcasts unchanged).
-        self._start = start
-        self._grain = grain
-        self._regrain = regrain
+        if start is not None:
+            self._start = start
+        if grain is not None:
+            self._grain = grain
+        if regrain is not None:
+            self._regrain = regrain
         # ``mo.schedule`` steps ({date: value}, materialized at adoption
         # when the ambient window resolves) and the declared out-of-extent
         # behavior (mo.zero()/mo.hold()/mo.none()) — zero/hold
         # materialize a partial series to the window at adoption;
         # arithmetic between unequal extents aligns them by date and
         # reads each side's out-of-extent cells through its rule.
-        from .extend import ExtendRule
-        self._schedule: Optional[dict] = None
-        if extend is not None and not isinstance(extend, ExtendRule):
-            raise TypeError(
-                "extend= takes mo.zero(), mo.hold() or mo.none() — the "
-                "declared continuation of a partial series beyond its "
-                "values."
-            )
-        self._extend: Optional[str] = extend.kind if extend is not None else None
+        # ``_schedule`` starts as None.
+        if extend is not None:
+            from .extend import ExtendRule
+            if not isinstance(extend, ExtendRule):
+                raise TypeError(
+                    "extend= takes mo.zero(), mo.hold() or mo.none() — the "
+                    "declared continuation of a partial series beyond its "
+                    "values."
+                )
+            self._extend = extend.kind
         # A positional Variable carries its PENDING materialization
         # state into the copy: ``mo.Variable(mo.schedule({...}),
         # actual=...)`` binds the schedule Variable before it ever adopts
         # (its ``_value`` is still None), so the wrapper inherits the
         # steps / extension rule and materializes them itself.
-        # (``self._schedule`` was defaulted above, after the value
-        # dispatch — the carry must live here, not in
-        # ``_init_from_value``, or the default would clobber it.)
         if isinstance(value, Variable):
             if getattr(value, '_schedule', None) is not None:
                 self._schedule = dict(value._schedule)
@@ -473,16 +524,19 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
                 # schedule is the same rate as the bare one, so it
                 # averages into a quarter the same way unless the
                 # wrapper declares a rule of its own.
-                if self._regrain is None:
+                if self._regrain is None and value._regrain is not None:
                     self._regrain = value._regrain
             if self._extend is None:
-                self._extend = getattr(value, '_extend', None)
+                inherited_extend = getattr(value, '_extend', None)
+                if inherited_extend is not None:
+                    self._extend = inherited_extend
             # Wrapping never strips units: ``mo.Variable(a + b,
             # display_name=…)`` keeps the sum's unit unless the wrapper
             # declares its own.
             if self._unit is None and getattr(value, '_unit', None) is not None:
                 self._unit = value._unit
-                self._unit_declared = getattr(value, '_unit_declared', False)
+                if getattr(value, '_unit_declared', False):
+                    self._unit_declared = True
         if (start is None) != (grain is None):
             raise ValueError(
                 "A located Variable needs both `start` and `grain` (or neither, "
@@ -506,41 +560,42 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
             # default_grain (resolved lazily by ``.time``), so it is not required
             # here — a rule with no resolvable grain is caught at projection.
 
-        _track_candidates = self._process_kwargs(kwargs)
-        if _track_candidates:
-            if tracks is not None:
-                raise ValueError(
-                    "track kwargs and tracks= are two spellings of one "
-                    "thing — pick one."
-                )
-            if formula is not None or pyformula is not None:
-                raise ValueError(
-                    "track kwargs replace formula=/pyformula= — bind "
-                    "the shared expression positionally: "
-                    "mo.Variable(<shared formula>, actual=[...])."
-                )
-            if indexed_by:
-                raise ValueError(
-                    "track kwargs ARE the finite axis — indexed_by= "
-                    "cannot be combined with them (axis budget is one)."
-                )
-            self._role_kwargs = _track_candidates
-            # Materialize PROVISIONALLY from the kwargs' own names.
-            # The declaration lives on the model, which a Variable
-            # built inside a MultiVariableClass body cannot reach —
-            # and the very next line (``self.revenue = self.hours *
-            # rate``) computes eagerly, at operator time. The kwargs already
-            # NAME their tracks, so the value is knowable here;
-            # adoption validates the names against the declaration,
-            # fills any track the shared expression owes, and attaches
-            # the blend. Skipped when a shared positional expression is
-            # present — the non-overridden tracks need the declared
-            # vocabulary, which only adoption has.
-            if value is None and formula is None and pyformula is None:
-                self._materialize_roles(
-                    list(_track_candidates), display_name or 'variable'
-                )
-                self._roles_provisional = self._roles_materialized
+        if kwargs:
+            _track_candidates = self._process_kwargs(kwargs)
+            if _track_candidates:
+                if tracks is not None:
+                    raise ValueError(
+                        "track kwargs and tracks= are two spellings of one "
+                        "thing — pick one."
+                    )
+                if formula is not None or pyformula is not None:
+                    raise ValueError(
+                        "track kwargs replace formula=/pyformula= — bind "
+                        "the shared expression positionally: "
+                        "mo.Variable(<shared formula>, actual=[...])."
+                    )
+                if indexed_by:
+                    raise ValueError(
+                        "track kwargs ARE the finite axis — indexed_by= "
+                        "cannot be combined with them (axis budget is one)."
+                    )
+                self._role_kwargs = _track_candidates
+                # Materialize PROVISIONALLY from the kwargs' own names.
+                # The declaration lives on the model, which a Variable
+                # built inside a MultiVariableClass body cannot reach —
+                # and the very next line (``self.revenue = self.hours *
+                # rate``) computes eagerly, at operator time. The kwargs already
+                # NAME their tracks, so the value is knowable here;
+                # adoption validates the names against the declaration,
+                # fills any track the shared expression owes, and attaches
+                # the blend. Skipped when a shared positional expression is
+                # present — the non-overridden tracks need the declared
+                # vocabulary, which only adoption has.
+                if value is None and formula is None and pyformula is None:
+                    self._materialize_roles(
+                        list(_track_candidates), display_name or 'variable'
+                    )
+                    self._roles_provisional = self._roles_materialized
 
     @property
     def shape(self) -> Shape:
@@ -864,9 +919,10 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
         against the ambient declaration when the tree can reach it and
         stashed until adoption when it cannot.
         """
-        if (name.startswith('_') or name in self._PLAIN_ATTRS
-                or hasattr(type(self), name)):
-            super().__setattr__(name, value)
+        # ``self._PLAIN_ATTRS``, not the class's: a subclass may extend it
+        # with plain attributes of its own.
+        if name[:1] == '_' or name in self._PLAIN_ATTRS or hasattr(type(self), name):
+            _object_setattr(self, name, value)
             return
         self._bind_track(name, value)
 
@@ -1585,8 +1641,6 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
                 "at() needs a grain ('quarter'/'year') and/or a "
                 "track= coordinate."
             )
-        from .regrain import Ratio
-        from .time import regrain_series
         if isinstance(self._value, TrackValues):
             # Track-wise re-grain: each track projects by this
             # line's own rule (slice-then-regrain per role); the tracks
@@ -1645,45 +1699,16 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
             return self.copy()
         if loc.grain == grain:
             return self.copy()
-        spec = self._regrain
-        if spec is None:
-            raise ValueError(
-                f"{label!r} has no re-grain rule; give it one (e.g. "
-                f"regrain=mo.up('sum'/'last'/'mean')) to re-grain {loc.grain} "
-                f"-> {grain}."
-            )
-        if spec.frozen and spec.default is None and not spec.overrides:
-            raise ValueError(
-                f"{label!r} is grain-frozen with no value rule — it has no "
-                f"meaning off its native grain (a period counter / date "
-                f"spine). If its VALUES do have coarse meaning — quarter-end "
-                f"cash is the last monthly close — declare it: "
-                f"regrain=mo.frozen(values='last')."
-            )
-        # A frozen spec with a value rule: the formula never re-evaluates at
-        # the target grain, but the computed value series re-grains below
-        # like any stored series — which is exactly what this path does.
-        rule = spec.overrides.get((loc.grain, grain), spec.default)
-        if rule is None:
-            raise ValueError(f"{label!r} has no re-grain rule for {loc.grain} -> {grain}.")
-        if isinstance(rule, Ratio) or callable(rule):
-            raise ValueError(
-                "ratio and callable re-grain rules are not applied by "
-                "Variable.at() — a ratio rule re-grains through the model "
-                "projection (model.at(grain)); use a named recipe here."
-            )
-        from .time import bucket_ranges
-        n = len(self._value) if isinstance(self._value, list) else 1
-        ranges = bucket_ranges(loc.grain, grain, loc.start, n)
         from .regrain import LINE_UNKNOWN
-        labels, values = regrain_series(self._value, loc.grain, grain, loc.start, rule,
-                                        loc.first_day,
-                                        blank=getattr(self, '_hole_value', LINE_UNKNOWN))
+        spec = self._regrain
+        values, start_label, first_day, ranges, rule = series_at_grain(
+            label, self._value, loc, spec, grain,
+            getattr(self, '_hole_value', LINE_UNKNOWN),
+        )
         result = Variable(values, display_name=self._display_name,
-                          start=labels[0], grain=grain, regrain=spec)
+                          start=start_label, grain=grain, regrain=spec)
         # A first bucket that starts inside its coarse period is short.
-        from .time import coarse_first_day
-        result._first_day = coarse_first_day(loc.start, loc.grain, loc.first_day, grain)
+        result._first_day = first_day
         # Live formula: each target cell renders as a reducer over the source's
         # native cells (=SUM(range) / period-end cell), falling back to the
         # inlined value when the source has no address in the workbook.

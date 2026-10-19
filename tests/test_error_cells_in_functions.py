@@ -39,7 +39,12 @@ def test_an_aggregate_over_an_error_cell_is_that_error() -> None:
 def test_the_first_error_in_reading_order_wins(fn) -> None:
     assert fn(mo.Variable(["#N/A", "#DIV/0!", 3.0])).value == "#N/A"
     assert fn(mo.Variable(["#DIV/0!", "#N/A", 3.0])).value == "#DIV/0!"
-    assert fn(mo.Variable([1.0, 2.0]), mo.Variable(["#VALUE!", "#N/A"])).value == "#VALUE!"
+    two = fn(mo.Variable([1.0, 2.0]), mo.Variable(["#VALUE!", "#N/A"])).value
+    if fn in (mo.MIN, mo.MAX):
+        # Two series are read period by period: each period's first error.
+        assert two == ["#VALUE!", "#N/A"]
+    else:
+        assert two == "#VALUE!"
 
 
 def test_a_hole_is_skipped_as_a_blank_is() -> None:

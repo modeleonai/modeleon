@@ -166,10 +166,13 @@ Balance   B5: =Inputs!B6 - Inputs!C4 - B4   C5: =B5 - Inputs!D4 - C4
 ```
 
 A cycle that does not pass through `mo.lag` is refused by name — it
-would need a fixed point, not an order. So is `SUM`/`MAX`/`MIN` over a
-loop row inside the loop: those read a whole series, and a per-period
-floor is `mo.IF(x > 0, x, 0)`. A class is a loop container for every
-instance with `class Tranche(mo.MultiVariableClass, loop=True)`.
+would need a fixed point, not an order. So is `SUM` (or `MAX`/`MIN` over
+one operand) of a loop row inside the loop: those read a whole series. A
+per-period floor or cap is `mo.MAX(x, 0)` / `mo.MIN(sweep, balance)` —
+`MIN`/`MAX` over two or more operands work period by period, inside the
+loop too, and write `=MIN(C2, C3)` in every column. A class is a loop
+container for every instance with `class Tranche(mo.MultiVariableClass,
+loop=True)`.
 
 ---
 

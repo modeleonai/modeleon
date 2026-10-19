@@ -427,9 +427,10 @@ def test_a_reduction_over_a_loop_row_inside_the_loop_is_refused():
             m.x = mo.MultiVariable("X", loop=True)
             with m.x as x:
                 x.a = mo.lag(x.b) + 1.0
-                x.floor = mo.MAX(x.a, 0.0)
-                x.b = x.a - x.floor
-    assert "mo.IF" in str(err.value)
+                x.peak = mo.MAX(x.a)
+                x.b = x.a - x.peak
+    # The per-period pair is the way to write a floor or a cap.
+    assert "mo.MAX(x, 0)" in str(err.value)
     # The rows it left behind say why they have no value.
     with pytest.raises(ValueError, match="loop could not be computed"):
         m.x.a.value
@@ -530,8 +531,8 @@ def test_rows_reading_a_failed_loop_say_why():
             m.x = mo.MultiVariable("X", loop=True)
             with m.x as x:
                 x.a = mo.lag(x.b) + 1.0
-                x.floor = mo.MAX(x.a, 0.0)
-                x.b = x.a - x.floor
+                x.peak = mo.MAX(x.a)
+                x.b = x.a - x.peak
     m.after = m.x.b + 1.0
     with pytest.raises(ValueError, match="loop could not be computed"):
         m.after.value

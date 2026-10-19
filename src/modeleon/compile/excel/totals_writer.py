@@ -25,6 +25,7 @@ from numbers import Real
 from typing import Any, Dict
 
 from .addresses import VariableAddresses
+from .layout import line_keys
 from .translator import ExcelTranslator
 from .totals import TotalsPlan, listed_or_ranged, regrain_rule_of, rule_formula
 from .writer import resolve_number_format
@@ -186,6 +187,7 @@ def bucket_cells(
         for bi, (_label, lo, hi) in enumerate(plan.buckets[kind]):
             formula: Any = None
             value: Any = None
+            inlined = False
             if rule is not None:
                 _slot = getattr(var, '_col_slot', 0) or 0
                 month_refs = [
@@ -213,19 +215,20 @@ def bucket_cells(
                         # rows would be another track's number.
                         value = "#VALUE!"
                 if formula is None and value is None and pvar is not None:
-                    value = _bucket_value(pvar, bi)
+                    value = _bucket_value(pvar, bi, var)
             elif authored:
                 value = "#VALUE!"
             elif tracked is not None:
-                formula, value = _tracked_bucket(tracked, bi, sheet_name,
-                                                 books[kind][0].get(vid), pvar)
+                formula, value, inlined = _tracked_bucket(tracked, bi, sheet_name,
+                                                          books[kind][0].get(vid), pvar, var)
             elif metric and getattr(pvar, "_expr", None) is None:
                 try:
                     formula = translators[kind].translate(
                         var._expr, bi, current_sheet=sheet_name,
                         self_address=books[kind][0].get(vid), self_var=var)
+                    inlined = bool(getattr(translators[kind], "last_render_inlined", False))
                 except Exception:  # noqa: BLE001 — degrade to the number
-                    value = _bucket_value(pvar, bi) if pvar is not None else None
+                    value = _bucket_value(pvar, bi, var) if pvar is not None else None
             elif pvar is not None and getattr(pvar, "_expr", None) is not None:
                 try:
                     formula = translators[kind].translate(
@@ -237,19 +240,23 @@ def bucket_cells(
                         self_address=books[kind][0].get(vid),
                         self_var=pvar,
                     )
+                    inlined = bool(getattr(translators[kind], "last_render_inlined", False))
                 except Exception:
-                    value = _bucket_value(pvar, bi)
+                    value = _bucket_value(pvar, bi, var)
                 if isinstance(formula, str) and "TrackValues(" in formula:
                     # An operand the address book cannot place inlined a
                     # whole tracked value: the number, never that text.
-                    formula, value = None, _bucket_value(pvar, bi)
+                    formula, value = None, _bucket_value(pvar, bi, var)
             elif pvar is not None:
                 # Ruleless literal → the projection already answered:
                 # a value where it could, its teaching token where it
                 # could not. Never an invented sum.
-                value = _bucket_value(pvar, bi)
+                value = _bucket_value(pvar, bi, var)
             out[row_refs[bi]] = {
                 "formula": formula, "value": value, "id": vid,
+                # True when a formula's text carries a computed value baked
+                # in: that formula is correct for the current inputs only.
+                "inlined": bool(inlined),
             }
     return out
 
@@ -336,7 +343,7 @@ def _sums_its_months(var: Variable, pvar: Any, tracked: Any, buckets: Any,
             return False                # its formula renders at the bucket
 
         def engine(bi: int) -> Any:
-            formula, value = _tracked_bucket(tracked, bi, sheet_name, None, pvar)
+            formula, value, _inlined = _tracked_bucket(tracked, bi, sheet_name, None, pvar, var)
             return value if formula is None else _NOT_A_NUMBER
     blank = hole_value(months)
     for bi, (_label, lo, hi) in enumerate(buckets):
@@ -451,10 +458,11 @@ def _tracked_fold(var: Variable, native: Dict[str, Variable], kind: str,
 
 
 def _tracked_bucket(tracked: Any, bi: int, sheet_name: str, slot: Any,
-                    pvar: Any) -> Any:
-    """``(formula, value)`` of a tracked formula row's bucket ``bi``: the
-    line's formula there, or the engine's number for the row's track when
-    no live formula can stand."""
+                    pvar: Any, line: Any = None) -> Any:
+    """``(formula, value, inlined)`` of a tracked formula row's bucket
+    ``bi``: the line's formula there, or the engine's number for the row's
+    track when no live formula can stand; ``inlined`` says the formula's
+    text carries a value baked in (it holds for the current inputs only)."""
     projected, track, translator = tracked
     if getattr(projected, "_expr", None) is not None:
         try:
@@ -464,15 +472,15 @@ def _tracked_bucket(tracked: Any, bi: int, sheet_name: str, slot: Any,
         except Exception:  # noqa: BLE001 — degrade to the number
             formula = None
         if formula and "TrackValues(" not in formula:
-            return formula, None
+            return formula, None, bool(getattr(translator, "last_render_inlined", False))
     value = getattr(projected, "_value", None)
     if type(value).__name__ == "TrackValues":
         if track is None or track not in value.roles:
-            return None, (_bucket_value(pvar, bi) if pvar is not None else None)
+            return None, (_bucket_value(pvar, bi, line) if pvar is not None else None), False
         value = value[track]
     if isinstance(value, list):
-        return None, value[bi] if bi < len(value) else None
-    return None, value
+        return None, (value[bi] if bi < len(value) else None), False
+    return None, value, False
 
 
 def _track_suffix(var: Variable) -> str:
@@ -536,17 +544,22 @@ def _stable(bucket_refs: Dict[str, Dict[str, list]], plan: TotalsPlan):
             yield vid, {"kind": kind}
 
 
-def _bucket_value(pvar: Variable, bi: int) -> Any:
+def _bucket_value(pvar: Variable, bi: int, line: Any = None) -> Any:
     v = getattr(pvar, "_value", None)
     if type(v).__name__ == "TrackValues":
         # A tracked line's projected value is the whole role→series
         # container — written raw it lands in the cell as machine
         # repr. Resolve to the display default (the blend when the
         # model blends, else the first declared track) — the same
-        # default the line's own row shows.
+        # default the line's own row shows. A line projected on its own
+        # (:func:`project_line`) is floating — no owner chain of its own
+        # — so its default is the one of ``line``, the line it stands for.
         from ...core.tracks_decl import resolve_tracks_decl
 
-        decl = resolve_tracks_decl(getattr(pvar, "_owner", None))
+        owner = getattr(pvar, "_owner", None)
+        if owner is None and line is not None:
+            owner = getattr(line, "_owner", None) or getattr(line, "_parent", None)
+        decl = resolve_tracks_decl(owner)
         blend_name = getattr(getattr(decl, "blend", None), "name", None)
         roles = list(v.roles)
         v = v[blend_name if blend_name in roles else roles[0]]
@@ -556,10 +569,15 @@ def _bucket_value(pvar: Variable, bi: int) -> Any:
 
 
 def _is_periodic(var: Variable) -> bool:
+    # A line that runs along the periods, and so folds into buckets. A
+    # keyed line (``line_keys``) takes a series' place on the sheet but
+    # runs along keys of its own: no months to fold, no bucket cell — the
+    # layout keeps it off ``period_var_ids``, and its cells run across the
+    # bucket columns, where a bucket written on its row landed on a value.
     value = getattr(var, "_value", None)
-    if isinstance(value, list) or type(value).__name__ == "TrackValues":
-        return True
-    return bool(getattr(var, "_indexed_by", ()) or ())
+    periodic = (isinstance(value, list) or type(value).__name__ == "TrackValues"
+                or bool(getattr(var, "_indexed_by", ()) or ()))
+    return periodic and line_keys(var) is None
 
 
 def _row_of(address: str) -> int:

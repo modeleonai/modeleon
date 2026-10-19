@@ -16,6 +16,7 @@ format / count) are the foundation the re-grain projection reuses.
 
 from __future__ import annotations
 
+import functools
 from collections import namedtuple
 from datetime import date, timedelta
 from typing import Any, List, Optional
@@ -200,8 +201,8 @@ def spelled_first_day(window: Any) -> Optional[date]:
     return None
 
 
-def coarse_first_day(native_start: str, native_grain: str, native_first_day: Optional[date],
-                     target_grain: str) -> Optional[date]:
+def _coarse_first_day(native_start: str, native_grain: str, native_first_day: Optional[date],
+                      target_grain: str) -> Optional[date]:
     """The day the first ``target_grain`` period of a series re-grained from
     ``native_start`` starts on, when that is inside the coarse period — the
     coarse first period is then short, as every line and time row of the
@@ -411,8 +412,8 @@ def _days_in_period(anchor: Any, grain: str) -> int:
     return (date(anchor + 1, 1, 1) - date(anchor, 1, 1)).days  # year
 
 
-def period_weights(grain: str, start: str, n: int,
-                   first_day: Optional[date] = None) -> List[int]:
+def _period_weights(grain: str, start: str, n: int,
+                    first_day: Optional[date] = None) -> List[int]:
     """Day-count weights for ``n`` consecutive periods of ``grain`` from
     ``start``. A pure function of the calendar — every series over the same
     window shares one weight vector, which is what keeps weighted recipes
@@ -455,8 +456,8 @@ def _target_label(anchor: Any, native_grain: str, target_grain: str) -> str:
     )
 
 
-def bucket_ranges(native_grain: str, target_grain: str, native_start: str,
-                  n: int) -> List[tuple]:
+def _bucket_ranges(native_grain: str, target_grain: str, native_start: str,
+                   n: int) -> List[tuple]:
     """Group ``n`` native periods (from ``native_start``) into ``target_grain``
     buckets. Returns ``[(target_label, lo, hi), ...]`` half-open index ranges.
 
@@ -510,6 +511,72 @@ def regrain_series(values: List[Any], native_grain: str, target_grain: str,
         out_labels.append(label)
         out_values.append(apply_recipe(values[lo:hi], recipe, weights[lo:hi], blank=blank))
     return out_labels, out_values
+
+
+# --- the calendar, remembered -----------------------------------------------
+#
+# ``bucket_ranges`` / ``period_weights`` / ``coarse_first_day`` are pure
+# functions of the calendar and their arguments, and a projection asks them
+# the same question for every line of a model, mostly with a handful of
+# distinct argument tuples. Each remembers a bounded number of answers and
+# hands back a fresh list, so no caller can edit the remembered one; an
+# unhashable argument takes the plain path.
+
+
+@functools.lru_cache(maxsize=4096)
+def _bucket_ranges_cached(native_grain: str, target_grain: str, native_start: Any,
+                          n: int) -> tuple:
+    return tuple(_bucket_ranges(native_grain, target_grain, native_start, n))
+
+
+def bucket_ranges(native_grain: str, target_grain: str, native_start: str,
+                  n: int) -> List[tuple]:
+    """Group ``n`` native periods (from ``native_start``) into ``target_grain``
+    buckets. Returns ``[(target_label, lo, hi), ...]`` half-open index ranges.
+
+    The grouping is a pure function of ``(native_grain, target_grain,
+    native_start)`` — independent of any Variable's values — which is what lets
+    several series share one bucketing (the alignment that makes a ratio-of-sums
+    correct). Remembered per argument tuple; the list is the caller's own.
+    """
+    try:
+        return list(_bucket_ranges_cached(native_grain, target_grain, native_start, n))
+    except TypeError:
+        return _bucket_ranges(native_grain, target_grain, native_start, n)
+
+
+@functools.lru_cache(maxsize=4096)
+def _period_weights_cached(grain: str, start: Any, n: int, first_day: Optional[date]) -> tuple:
+    return tuple(_period_weights(grain, start, n, first_day))
+
+
+def period_weights(grain: str, start: str, n: int,
+                   first_day: Optional[date] = None) -> List[int]:
+    """Day-count weights for ``n`` consecutive periods of ``grain`` from
+    ``start`` — see :func:`_period_weights`; remembered per argument tuple,
+    the list is the caller's own."""
+    try:
+        return list(_period_weights_cached(grain, start, n, first_day))
+    except TypeError:
+        return _period_weights(grain, start, n, first_day)
+
+
+@functools.lru_cache(maxsize=4096)
+def _coarse_first_day_cached(native_start: Any, native_grain: str,
+                             native_first_day: Optional[date], target_grain: str) -> Optional[date]:
+    return _coarse_first_day(native_start, native_grain, native_first_day, target_grain)
+
+
+def coarse_first_day(native_start: str, native_grain: str, native_first_day: Optional[date],
+                     target_grain: str) -> Optional[date]:
+    """The day the first ``target_grain`` period of a series re-grained from
+    ``native_start`` starts on, when that is inside the coarse period — see
+    :func:`_coarse_first_day`; remembered per argument tuple (a date is
+    immutable)."""
+    try:
+        return _coarse_first_day_cached(native_start, native_grain, native_first_day, target_grain)
+    except TypeError:
+        return _coarse_first_day(native_start, native_grain, native_first_day, target_grain)
 
 
 # --- the time of a period (``mo.time``) ------------------------------------

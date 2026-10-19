@@ -15,7 +15,7 @@ The :class:`VariableAddresses` dataclass lives alongside in
 module and its consumers (writer, translator).
 """
 
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Union
+from typing import Any, Container, Dict, Iterable, Iterator, List, Optional, Sequence, Union
 
 from .addresses import VariableAddresses
 from ...core.multi_variable import MultiVariableBase
@@ -69,6 +69,19 @@ def effective_hidden(node: object) -> bool:
     return False
 
 
+def hidden_key_caption_rows(sheet_mv: Any, key_caption_rows: Dict[str, int]) -> set:
+    """The caption rows of keyed lines (``LayoutEngine.key_caption_rows``)
+    a renderer hides along with the lines beneath them: every line that
+    shares the row is hidden (:func:`effective_hidden`). A visible
+    sibling keeps the row for both. Public so the workbook and every
+    other renderer hide the same rows."""
+    owners: Dict[int, List[bool]] = {}
+    for _, comp in sheet_mv.walk():
+        if isinstance(comp, Variable) and comp.id in key_caption_rows:
+            owners.setdefault(key_caption_rows[comp.id], []).append(effective_hidden(comp))
+    return {row for row, hidden in owners.items() if all(hidden)}
+
+
 def _own_orient(mv: Any) -> Optional[str]:
     """The layout orientation ``mv`` DECLARES for itself.
 
@@ -99,49 +112,97 @@ def _own_orient(mv: Any) -> Optional[str]:
     return str(orient) if orient else None
 
 
-def number_lines(sheet_mv: Any, lines: Iterable[Any], scheme: Any) -> Dict[str, str]:
-    """``{line id: number}`` for one sheet's lines in the order they stand
-    (``lines``; ``None`` entries and the header's mirrors are skipped),
-    by ``scheme`` — ``'section'``: each first-level section's lines
-    ``1.1``, ``1.2``, … and a line on the sheet itself ``1``, ``2``, ….
-    A link (a line that only repeats another) carries no number, and a
-    line with an ``article`` of its own keeps it and takes none. The one
-    rule every renderer numbers by."""
+def number_lines(
+    sheet_mv: Any,
+    rows: Iterable[str],
+    scheme: Any,
+    sections: Optional[Container[str]] = None,
+) -> Dict[str, str]:
+    """``{id: number}`` for one sheet's sections and lines, by ``scheme`` —
+    ``'section'``: an outline in the order the sheet stands. A first-level
+    section is ``1``, ``2``, …, a section inside it ``1.1``, and a line is
+    numbered one level below its section (``1.1.1``); sections and lines
+    of one container count together, so a line on the sheet itself is
+    ``1``, ``2``, … beside the first-level sections.
+
+    ``rows`` are the ids of the lines that head a row of their own (a
+    label cell): a line riding another row — a header-row total, a
+    track's slot copy, a matrix's sibling instance — carries no number.
+    ``sections`` are the ids of the sections that head a row (the
+    layout's ``section_header_rows``); a container laid out elsewhere, a
+    nested sheet, is skipped. A link (a line that only repeats another)
+    carries no number and takes no place; a line or a section with an
+    ``article`` of its own keeps it and takes none, and that section's
+    lines count from its article. A table (``orient='records'``) is one
+    item. The lines are read from ``sheet_mv`` as they stand now, so
+    every caller numbers them by the same rule — the one rule every
+    renderer numbers by."""
     out: Dict[str, str] = {}
     if scheme != 'section':
         return out
-    homes = {id(sheet_mv), id(getattr(sheet_mv, '_sheet_source', None))}
-    sections: Dict[int, int] = {}
-    counts: Dict[int, int] = {}
-    loose = 0
-    for var in lines:
-        if var is None or getattr(var, '_mirror_of', None) is not None:
-            continue
-        if (getattr(var, '_excel_props', None) or {}).get('article') \
-                or row_kind(var) == 'link':
-            continue
-        top = _first_section(var, homes)
-        if top is None:
-            loose += 1
-            out[var.id] = str(loose)
-            continue
-        section = sections.setdefault(id(top), len(sections) + 1)
-        counts[id(top)] = counts.get(id(top), 0) + 1
-        out[var.id] = f"{section}.{counts[id(top)]}"
+    _number_outline(sheet_mv, '', set(rows), sections, out, [0])
     return out
 
 
-def _first_section(var: object, homes: set) -> Any:
-    """The first-level section of ``var`` on its sheet (``homes``: the
-    sheet's ids), or ``None`` for a line that stands on the sheet itself."""
-    below = None
-    node = getattr(var, '_owner', None)
-    while node is not None:
-        if id(node) in homes:
-            return below
-        below = node
-        node = getattr(node, '_parent', None)
-    return None
+def _takes_number(var: Any, rows: set) -> bool:
+    return (
+        var.id in rows
+        and getattr(var, '_mirror_of', None) is None
+        and not (getattr(var, '_excel_props', None) or {}).get('article')
+        and row_kind(var) != 'link'
+    )
+
+
+def _number_outline(
+    mv: Any, prefix: str, rows: set, sections: Optional[Container[str]],
+    out: Dict[str, str], count: List[int],
+) -> None:
+    """Number ``mv``'s rows under ``prefix``, in the order ``_layout_mv``
+    lays them out. ``count`` is the place last taken at this level — shared
+    with the parent when ``mv`` heads no row of its own."""
+    orient = _own_orient(mv)
+    if orient == 'records':
+        return
+    if orient == 'columns':
+        # Instances run across; the rows are the fields the first instance
+        # names, then the container's own lines beneath the matrix.
+        instances = [
+            c for c in mv._components.values()
+            if isinstance(c, MultiVariableBase) and not _is_presentation(c)
+        ]
+        if not instances:
+            return
+        lines = [f for inst in instances for f in inst._components.values()] + list(
+            mv._components.values()
+        )
+        for var in lines:
+            if isinstance(var, Variable) and _takes_number(var, rows):
+                count[0] += 1
+                out[var.id] = f"{prefix}{count[0]}"
+        return
+    for name in mv._component_order:
+        comp = mv._components[name]
+        if isinstance(comp, Variable):
+            if _takes_number(comp, rows):
+                count[0] += 1
+                out[comp.id] = f"{prefix}{count[0]}"
+            continue
+        if not isinstance(comp, MultiVariableBase) or _is_presentation(comp):
+            continue
+        section_id = comp.id or comp.python_name or comp._name_in_parent
+        if (section_id not in sections) if sections is not None else comp._is_sheet:
+            continue
+        own = (getattr(comp, '_excel_props', None) or {}).get('article')
+        if own:
+            _number_outline(comp, f"{str(own).rstrip('.')}.", rows, sections, out, [0])
+        elif not comp.display_name:
+            # No label, no row to number: its lines count as the parent's.
+            _number_outline(comp, prefix, rows, sections, out, count)
+        else:
+            count[0] += 1
+            number = f"{prefix}{count[0]}"
+            out[section_id] = number
+            _number_outline(comp, f"{number}.", rows, sections, out, [0])
 
 
 def _row_number(address: str) -> int:
@@ -162,6 +223,42 @@ def _col_number(address: str) -> int:
     return n
 
 
+def _is_context_sheet(sheet_mv: Any) -> bool:
+    """A Context sheet — lines that come from outside this model, laid out
+    on this book's calendar: the container carries the ``_is_context``
+    marker, or the virtual sheet standing for it does."""
+    source = getattr(sheet_mv, '_sheet_source', None) or sheet_mv
+    return bool(
+        getattr(sheet_mv, '_is_context', False) or getattr(source, '_is_context', False)
+    )
+
+
+def _declares_view(node: Any) -> bool:
+    """Whether a container up ``node``'s owner chain points at an
+    ``ExcelView`` of its own."""
+    from .view import ExcelView
+
+    seen: set = set()
+    n = node
+    while n is not None and id(n) not in seen:
+        seen.add(id(n))
+        if isinstance(getattr(n, 'default_excel_view', None), ExcelView):
+            return True
+        n = getattr(n, '_owner', None) or getattr(n, '_parent', None)
+    return False
+
+
+def _top_of(node: Any) -> Any:
+    """The root of ``node``'s owner chain — the model a line belongs to."""
+    seen: set = set()
+    n, top = node, node
+    while n is not None and id(n) not in seen:
+        seen.add(id(n))
+        top = n
+        n = getattr(n, '_owner', None) or getattr(n, '_parent', None)
+    return top
+
+
 def _sheet_has_constants(mv: MultiVariableBase, flatten: bool = False) -> bool:
     """Does this sheet carry any line that is NOT per-period?"""
     for comp in mv._components.values():
@@ -175,7 +272,13 @@ def _sheet_has_constants(mv: MultiVariableBase, flatten: bool = False) -> bool:
                 # A columns-oriented section's columns are INSTANCES. Its cells are
                 # neither periods nor constants in this sense — they
                 # have a geometry of their own, and counting them
-                # would move a header that must not cover them.
+                # would move a header that must not cover them. Its
+                # own direct lines are rows of the sheet, though.
+                if any(
+                    isinstance(c, Variable) and not _is_periodic(c)
+                    for c in comp._components.values()
+                ):
+                    return True
                 continue
             if comp._is_sheet and not flatten:
                 continue
@@ -198,6 +301,26 @@ def _is_periodic(var: Variable) -> bool:
     return bool(getattr(var, '_indexed_by', ()) or ())
 
 
+def line_keys(var: Variable) -> Optional[List[str]]:
+    """The keys a line runs ALONG instead of periods — a keyed list
+    (``mo.Variable({'FY2023': 400, 'FY2024': 450})``) or a line on one
+    finite axis that is not time (``indexed_by=[regions]``) — one per
+    cell, in cell order; ``None`` for a series, a constant and a
+    tracked line. Such a line stands under a caption row of these keys
+    (``key_captions_by_sheet``) and counts for no period column. Public
+    so a renderer captions the line by the keys the layout placed it
+    under."""
+    keys = getattr(var, '_keys', None)
+    if keys and isinstance(getattr(var, '_value', None), list):
+        return [str(k) for k in keys]
+    axes: Sequence[Any] = getattr(var, '_indexed_by', None) or ()
+    if len(axes) == 1 and getattr(axes[0], '_axis_kind', None) != 'time':
+        labels = getattr(axes[0], '_value', None)
+        if isinstance(labels, list):
+            return [str(label) for label in labels]
+    return None
+
+
 def _sheet_has_periods(mv: MultiVariableBase, flatten: bool = False) -> bool:
     """Does this SHEET carry any per-period line?
 
@@ -207,11 +330,12 @@ def _sheet_has_periods(mv: MultiVariableBase, flatten: bool = False) -> bool:
     column B, and each assumption read as a January figure.
 
     A nested sheet's content belongs to that sheet, not this one,
-    unless the caller is flattening them into one.
+    unless the caller is flattening them into one. A keyed line runs
+    along its own keys, not the periods: it asks for no period header.
     """
     for comp in mv._components.values():
         if isinstance(comp, Variable):
-            if _is_periodic(comp):
+            if _is_periodic(comp) and line_keys(comp) is None:
                 return True
         elif isinstance(comp, MultiVariableBase):
             if _is_presentation(comp):
@@ -220,7 +344,13 @@ def _sheet_has_periods(mv: MultiVariableBase, flatten: bool = False) -> bool:
                 # A columns-oriented section's columns are INSTANCES. Its cells are
                 # neither periods nor constants in this sense — they
                 # have a geometry of their own, and counting them
-                # would move a header that must not cover them.
+                # would move a header that must not cover them. Its
+                # own direct lines are rows of the sheet, though.
+                if any(
+                    isinstance(c, Variable) and _is_periodic(c) and line_keys(c) is None
+                    for c in comp._components.values()
+                ):
+                    return True
                 continue
             if comp._is_sheet and not flatten:
                 continue
@@ -342,8 +472,17 @@ class LayoutEngine:
       sheet-walking code.
     - ``section_header_rows`` — ``{section_id: (row, col)}`` so custom
       emitters can place section headers at the right position.
-    - ``sheets_with_key_header`` — sheets that need a top-row key header
-      (dict-keyed Variables without a datetime axis to name columns).
+    - ``sheets_with_key_header`` — sheets whose keyed Variables have no
+      datetime axis to name columns. Informational: the keys stand in
+      the caption rows below.
+    - ``keyed_var_ids`` / ``key_captions_by_sheet`` — the lines that run
+      along keys of their own (see :func:`line_keys`), and per sheet the
+      cells of their caption rows: ``{"C3": "FY2023", …}``, each key over
+      the cell that holds its value. ``key_caption_rows`` — each such
+      line's caption row, ``{var_id: row}``.
+    - ``unit_rows`` — ``{var_id: row}`` for a caption that heads no row
+      (a records-table field, a scalar across a board) on a sheet with a
+      unit column: the unit row its table reserves under the captions.
     """
 
     def __init__(
@@ -388,6 +527,10 @@ class LayoutEngine:
         self._header_rows_on = header_rows
         #: ``id(sheet_mv) → SheetHeader`` for every sheet showing a header.
         self.header_by_sheet: Dict[int, Any] = {}
+        #: sheet (name and ``id(mv)``) -> ``(article, unit, label)`` — the
+        #: view's lead-column flags as resolved, a caption kept as text.
+        #: The unit slot keeps all three of its states (a caption or
+        #: ``True``, ``None``, ``False`` — see ``ResolvedView.meta_unit_col``).
         self.meta_by_sheet: Dict[Any, tuple] = {}
         self._hoisted_ids: set = set()
         #: Value addresses laid out by columns-oriented sections — their
@@ -412,6 +555,26 @@ class LayoutEngine:
         #: Value ids whose row runs ALONG the time axis. The period
         #: header names their columns and nobody else's.
         self.period_var_ids: set = set()
+        #: Value ids whose row runs along KEYS of its own (:func:`line_keys`):
+        #: laid out from the first period column like a series, but off
+        #: the period header's accounting — the header is the periods'.
+        self.keyed_var_ids: set = set()
+        #: sheet (name and ``id(mv)``) -> ``{cell: key}`` — the caption row
+        #: of each keyed line, directly above it: every key over the cell
+        #: that holds its value. Consecutive keyed lines with the same keys
+        #: share one. Painted in the header's look by every renderer.
+        self.key_captions_by_sheet: Dict[Any, Dict[str, str]] = {}
+        #: var id -> the caption row each keyed line stands under — the
+        #: one row the lines that share its keys share. A renderer hides
+        #: it with its lines (:func:`hidden_key_caption_rows`).
+        self.key_caption_rows: Dict[str, int] = {}
+        #: var id -> the row its unit stands in, for a caption that heads
+        #: no row of the sheet (a records-table field, a scalar across a
+        #: board) on a sheet with a unit column: the UNIT ROW its table
+        #: reserves directly under the captions, one unit per field
+        #: column. Reserved only where a field carries a unit — like the
+        #: constants column, a row that would stand empty is not taken.
+        self.unit_rows: Dict[str, int] = {}
         #: sheet (name AND ``id(mv)``) -> the column periods start at.
         #: ONE number, computed where the geometry is decided, so the
         #: writer and every other renderer read it instead of
@@ -461,8 +624,9 @@ class LayoutEngine:
         #: the rows it repeats. Decided here, once, for every renderer.
         self.freeze_by_sheet: Dict[Any, str] = {}
         self._freeze_facts: Dict[str, tuple] = {}
-        #: var id -> the line number the view's ``meta['numbering']``
-        #: gives it (``'1.2'``), for a line without an ``article`` of its own.
+        #: line id or section id -> the number the view's
+        #: ``meta['numbering']`` gives it (``'1.2'``), where it has no
+        #: ``article`` of its own.
         self.articles: Dict[str, str] = {}
         #: sheet name -> its numbering scheme (``meta['numbering']``), for
         #: every sheet whose lines are numbered — so a renderer that numbers
@@ -470,7 +634,6 @@ class LayoutEngine:
         #: layout asked.
         self.numbering_by_sheet: Dict[str, Any] = {}
         self._numbering: Dict[str, tuple] = {}
-        self._var_by_id: Dict[str, Variable] = {}
         self.sheets_with_key_header: set = set()
         # id(sheet_mv) -> (start, grain, style) for the timeline header row.
         # Keyed by object identity, not sheet name: a model and its ``.at()``
@@ -545,9 +708,24 @@ class LayoutEngine:
         from ...core.time import (
             DEFAULT_TIME_LABEL_STYLE,
             TIME_LABEL_STYLES,
+            DefaultWindow,
             resolve_default_window,
         )
         from .view import resolve_excel_view
+
+        # The book's own calendar and view — the first sheet that is not a
+        # Context and resolves a window — for a Context sheet to stand on:
+        # lines from outside this model, drawn as a tab of THIS book.
+        book_window = None
+        book_root = None
+        for sheet_mv in sheets:
+            if _is_context_sheet(sheet_mv):
+                continue
+            anchor = next(self._iter_sheet_variables(sheet_mv), None)
+            w = resolve_default_window(anchor) if anchor is not None else None
+            if w is not None and w.grain is not None and w.start is not None:
+                book_window, book_root = w, _top_of(anchor)
+                break
 
         for sheet_mv, sheet_name in zip(sheets, layout_sheet_names(sheets)):
             # Unique per-sheet key for internal bookkeeping (``_occupied_rows``,
@@ -568,6 +746,12 @@ class LayoutEngine:
             # ``resolve_excel_view`` returns the global house-default snapshot
             # for ``None``, so no separate fallback is needed.
             view = resolve_excel_view(anchor_var)
+            # A Context sheet wears the book's view (label style, lead
+            # columns, the header's presence) unless it declares one of its
+            # own — its dates must read as the model's tabs read them.
+            is_context = _is_context_sheet(sheet_mv)
+            if is_context and book_root is not None and not _declares_view(anchor_var):
+                view = resolve_excel_view(book_root)
             # Dense-nesting rule for THIS sheet's section walk: blank
             # rows between sections come from the view (None = the
             # classic single gap).
@@ -581,9 +765,11 @@ class LayoutEngine:
             # column's caption (``meta={'unit': 'Unit'}``) and the
             # writer needs it downstream. Every use here is
             # truthiness-only, and a non-empty caption is truthy — so
-            # the geometry is unchanged either way.
+            # the geometry is unchanged either way. The unit keeps its
+            # unset ``None`` apart from ``False`` too: a renderer tells
+            # them apart (``units_hidden``) where it writes the text.
             self._meta_article = view.meta_article_col or False
-            self._meta_unit = view.meta_unit_col or False
+            self._meta_unit = view.meta_unit_col
             #: Caption only — the label column exists regardless.
             self._meta_label = view.meta_label_col or False
             #: Projected field columns — one per ``meta['fields']``
@@ -594,6 +780,14 @@ class LayoutEngine:
             window = (
                 resolve_default_window(anchor_var) if anchor_var is not None else None
             )
+            if window is None and is_context and book_window is not None:
+                # The book's start and grain only — never its periods: the
+                # header's length is the lines' own extent, and a window key
+                # distinct from the model's keeps the sheet's captions text,
+                # never formulas off the model's header rows. The lines
+                # themselves keep no time of their own; only the layout
+                # stands on the calendar.
+                window = DefaultWindow(book_window.start, book_window.grain, None)
             self.window_by_sheet[id(sheet_mv)] = window
 
             # Transpose (``orient='down'``) is supported for a FLAT sheet only —
@@ -611,9 +805,10 @@ class LayoutEngine:
             if is_transposed:
                 # A transposed sheet runs periods DOWN — its layout
                 # never reserves lead columns, so the writer must not
-                # shift either.
-                self._meta_article = self._meta_unit = False
-                self._meta_label = False
+                # shift either. The unit column goes; the view's word
+                # on whether units show at all stays.
+                self._meta_article = self._meta_label = False
+                self._meta_unit = None if self._meta_unit else self._meta_unit
             # Keyed by BOTH the raw sheet name (external consumers use
             # layout names verbatim) and the MV's identity (the writer
             # re-sanitizes titles — a name key would silently miss).
@@ -653,7 +848,9 @@ class LayoutEngine:
                     if self._totals_override is not None
                     else tuple(view.time_totals or ())
                 )
-                if _tot_kinds:
+                # No buckets on a Context sheet: a line that is not this
+                # model's to re-grain has no rule to sum or carry by.
+                if _tot_kinds and not is_context:
                     # Subtotal columns ride the time header — resolved
                     # here where the view and window are in hand,
                     # applied after addresses exist (_apply_totals).
@@ -723,7 +920,6 @@ class LayoutEngine:
             # keeps row 1 for data, as it always did.
             want_captions = (
                 not want_time_header
-                and not needs_key_header
                 and not is_transposed
                 and _own_orient(sheet_mv) not in ('columns', 'records')
                 and bool(view.sheet_same_columns)
@@ -788,9 +984,11 @@ class LayoutEngine:
                 self.caption_rows_by_sheet[sheet_name] = _top + 1
                 self.caption_rows_by_sheet[id(sheet_mv)] = _top + 1
 
+            # A keyed line names its columns in the caption row above it,
+            # so a sheet of keyed lines reserves no key header row.
             start_row = _top + (
                 2 + _extra_header_rows
-                if (needs_key_header or want_time_header or want_captions) else 1
+                if (want_time_header or want_captions) else 1
             )
 
             if _hdr_mirrors and want_time_header:
@@ -811,6 +1009,10 @@ class LayoutEngine:
                 self._sheet_ids_by_name.setdefault(sheet_name, []).append(
                     id(sheet_mv)
                 )
+            if sheet_name in self.key_captions_by_sheet:
+                self.key_captions_by_sheet[id(sheet_mv)] = (
+                    self.key_captions_by_sheet[sheet_name]
+                )
             if view.meta_numbering and not is_transposed:
                 self._numbering[sheet_name] = (sheet_mv, view.meta_numbering)
             self._freeze_facts[sheet_name] = (
@@ -825,13 +1027,15 @@ class LayoutEngine:
         return self.addresses
 
     def _record_numbers(self) -> None:
-        """Number each numbered sheet's lines by section, in the order they
-        stand (``meta={'numbering': 'section'}``)."""
+        """Number each numbered sheet's sections and lines as an outline, in
+        the order they stand (``meta={'numbering': 'section'}``)."""
         for name, (sheet_mv, scheme) in self._numbering.items():
             self.numbering_by_sheet[name] = scheme
             self.articles.update(number_lines(
-                sheet_mv, [self._var_by_id.get(v) for v in self.sheet_map.get(name, [])],
-                scheme,
+                sheet_mv,
+                [v for v in self.sheet_map.get(name, [])
+                 if getattr(self.addresses.get(v), 'name', None)],
+                scheme, self.section_header_rows,
             ))
 
     def _record_freezes(self) -> None:
@@ -1057,14 +1261,19 @@ class LayoutEngine:
         # a section header that follows one needs the same breathing gap
         # it leaves behind itself, or it glues to the row above.
         prev_was_var = False
+        # The keys and caption row of the keyed line laid out last, while
+        # the next line follows it directly: lines that share the keys
+        # share the caption row.
+        prev_keyed: Optional[tuple] = None
         for name in mv._component_order:
             comp = mv._components[name]
-            
+
             if isinstance(comp, MultiVariableBase):
                 if _is_presentation(comp):
                     continue
                 if comp._is_sheet and not self._flatten_nested_sheets:
                     continue
+                prev_keyed = None
                 # Use the fully-qualified id so same-named sections on different
                 # sheets (e.g. control.dates vs timing.flags.dates) don't collide.
                 section_id = comp.id or comp.python_name or comp._name_in_parent
@@ -1151,18 +1360,38 @@ class LayoutEngine:
                             sheet_name, []
                         ).append(comp.id)
                         continue
+                keys = line_keys(comp)
+                if keys is None:
+                    prev_keyed = None
+                elif prev_keyed is None or prev_keyed[0] != keys:
+                    # A keyed line stands under a caption row of its keys,
+                    # directly above it: both rows free, the caption's
+                    # first.
+                    cap_row = self._ensure_row_free(sheet_name, row)
+                    while cap_row + 1 in self._occupied_rows.get(sheet_name, {}):
+                        cap_row = self._ensure_row_free(sheet_name, cap_row + 1)
+                    self._mark_row(sheet_name, cap_row, f"{comp.id}.__keys__")
+                    prev_keyed = (keys, cap_row)
+                    row = cap_row + 1
                 row = self._ensure_row_free(sheet_name, row)
                 key = comp.id
                 self._mark_row(sheet_name, row, key)
                 addr = self._create_var_address(comp, row, col)
                 self.addresses[key] = addr
                 self.sheet_map.setdefault(sheet_name, []).append(key)
+                if keys is not None and prev_keyed is not None:
+                    self.key_caption_rows[key] = prev_keyed[1]
+                    captions = self.key_captions_by_sheet.setdefault(sheet_name, {})
+                    for cell, label in zip(addr.values, keys):
+                        captions[
+                            f"{self._col_to_letter(_col_number(cell))}{prev_keyed[1]}"
+                        ] = label
                 if getattr(comp, '_col_slot', None) is not None:
                     self._group_rows[(sheet_name, id(comp))] = row
                     self._slot_by_id[key] = comp._col_slot or 0
                 row += 1
                 prev_was_var = True
-        
+
         return row
     
     def _layout_mv_records(
@@ -1191,13 +1420,19 @@ class LayoutEngine:
           records under it.
 
         A record therefore names itself once in the table and once per
-        block; ``section_header_echoes`` carries the repeats.
+        block; ``section_header_echoes`` carries the repeats. The
+        container's own direct lines — a total under the table — follow
+        beneath as ordinary rows.
         """
         records = [
             (name, c) for name, c in mv._components.items()
             if isinstance(c, MultiVariableBase) and not _is_presentation(c)
         ]
-        if not records:
+        lines = [
+            c for c in mv._components.values()
+            if isinstance(c, Variable) and id(c) not in self._hoisted_ids
+        ]
+        if not records and not lines:
             return sec_row
 
         def _is_series(f: Variable) -> bool:
@@ -1217,8 +1452,6 @@ class LayoutEngine:
                     scalar_order if bucket is series_order else series_order
                 ):
                     bucket.append(fname)
-        if not scalar_order and not series_order:
-            return sec_row
 
         # Which record names each column: the FIRST that carries the
         # field. Fixed up front rather than raced for during the walk —
@@ -1238,6 +1471,20 @@ class LayoutEngine:
             header_row = self._ensure_row_free(sheet_name, row)
             self._mark_row(sheet_name, header_row, f"{mv.id}.__header__")
             row = header_row + 1
+            # The unit row: a field's caption heads no row of the sheet,
+            # so its unit stands under the caption, in the row the table
+            # reserves for every field's — where the sheet has a unit
+            # column and a field has a unit to put there. The record
+            # that names a column (``header_owner``) names its unit too:
+            # a unit only a later record carries does not relabel the
+            # column, and reserves no row on its own.
+            unit_row = self._unit_row([
+                rec._components[fname] for _n, rec in records
+                for fname in scalar_order
+                if header_owner.get(fname) == id(rec)
+            ], row, sheet_name, f"{mv.id}.__units__")
+            if unit_row is not None:
+                row = unit_row + 1
             for i, (rname, rec) in enumerate(records):
                 row = self._ensure_row_free(sheet_name, row)
                 rec_id = rec.id or rec.python_name or rname
@@ -1273,6 +1520,8 @@ class LayoutEngine:
                     )
                     self.board_var_ids.add(f.id)
                     self.sheet_map.setdefault(sheet_name, []).append(f.id)
+                    if name_addr and unit_row is not None:
+                        self.unit_rows[f.id] = unit_row
                 row += 1
 
         # Period blocks start PAST the fields table. The table's columns
@@ -1322,6 +1571,24 @@ class LayoutEngine:
                     self.section_header_rows[rec_id] = (row, sec_col)
                 row += 1
 
+        # The container's own DIRECT lines (a total under the table)
+        # follow beneath the table and the blocks — never dropped. A
+        # series stands in the columns the blocks use, so the month
+        # masthead stays over them; a scalar where the sheet's scalars
+        # stand. The label is the line's own, in the label column.
+        for var in lines:
+            row = self._ensure_row_free(sheet_name, row)
+            self._mark_row(sheet_name, row, var.id)
+            addr = self._create_var_address(
+                var, row, series_col if _is_periodic(var) else sec_col
+            )
+            self.addresses[var.id] = VariableAddresses(
+                name=f"{self._col_to_letter(sec_col)}{row}",
+                formula=addr.formula, values=addr.values, opening=addr.opening,
+            )
+            self.sheet_map.setdefault(sheet_name, []).append(var.id)
+            row += 1
+
         return row
 
     def _layout_mv_columns(
@@ -1329,27 +1596,63 @@ class LayoutEngine:
         sheet_name: str,
     ) -> int:
         """Matrix layout for a columns-oriented section: instance
-        display names across ``sec_row`` (one column each, from B),
-        scalar fields as rows beneath — the first instance's field
-        owns the label cell in column A; sibling instances' same-name
-        fields get value-only addresses in their column."""
+        display names across ``sec_row`` (one column each, from the
+        first period column), scalar fields as rows beneath — the first
+        instance's field owns the label cell in the label column;
+        sibling instances' same-name fields get value-only addresses in
+        their column."""
         instances = [
             (name, c) for name, c in mv._components.items()
             if isinstance(c, MultiVariableBase) and not _is_presentation(c)
         ]
-        scalars = [
+        # The board's own DIRECT lines: a scalar (a total across the
+        # instances) and a series alike — never dropped. A line hoisted
+        # onto the parent's header row already stands there.
+        lines = [
             (name, c) for name, c in mv._components.items()
-            if isinstance(c, Variable) and not isinstance(
-                getattr(c, '_value', None), list
-            )
+            if isinstance(c, Variable) and id(c) not in self._hoisted_ids
         ]
+        scalars = [
+            (name, c) for name, c in lines
+            if not isinstance(getattr(c, '_value', None), list)
+        ]
+        series = [
+            (name, c) for name, c in lines
+            if isinstance(getattr(c, '_value', None), list)
+        ]
+
+        def _line_row(var: Variable, row: int) -> int:
+            # A direct line is a row of the sheet: a scalar's value
+            # where the sheet's scalars stand, a series' cells in the
+            # period columns. The series is no board cell — the
+            # masthead names its columns and stretches over them.
+            row = self._ensure_row_free(sheet_name, row)
+            self._mark_row(sheet_name, row, var.id)
+            self.addresses[var.id] = self._create_var_address(var, row, sec_col)
+            if not _is_periodic(var):
+                self.board_var_ids.add(var.id)
+            self.sheet_map.setdefault(sheet_name, []).append(var.id)
+            return row + 1
+
+        # The board's columns are instances, run across the way periods
+        # are: its first column is the first period's — past the label
+        # and every lead column the sheet reserves (unit, fields,
+        # constants, opening), the steps ``_create_var_address`` takes
+        # for a series. Started at the label's neighbour, the board sat
+        # under the unit column, and the unit text of its first field
+        # row was written over the first instance's value.
+        first = sec_col + 1 + (
+            1 if getattr(self, '_meta_unit', False) else 0
+        ) + len(getattr(self, '_meta_fields', ()) or ()) + (
+            1 if getattr(self, '_constants_col', False) else 0
+        ) + (1 if getattr(self, '_opening_col', False) else 0)
         row = sec_row
         if instances:
             # Instance headers ride the section-header machinery: one
             # position per instance on the section's own row.
             for j, (iname, inst) in enumerate(instances):
                 inst_id = inst.id or inst.python_name or iname
-                self.section_header_rows[inst_id] = (row, sec_col + 1 + j)
+                self.section_header_rows[inst_id] = (row, first + j)
             field_order: list[str] = []
             for _, inst in instances:
                 for fname, f in inst._components.items():
@@ -1365,7 +1668,7 @@ class LayoutEngine:
                     f = inst._components.get(fname)
                     if not isinstance(f, Variable):
                         continue
-                    cell = f"{self._col_to_letter(sec_col + 1 + j)}{row}"
+                    cell = f"{self._col_to_letter(first + j)}{row}"
                     name_addr = (
                         f"{self._col_to_letter(sec_col)}{row}" if j == 0 else ''
                     )
@@ -1375,36 +1678,56 @@ class LayoutEngine:
                     self.board_var_ids.add(f.id)
                     self.sheet_map.setdefault(sheet_name, []).append(f.id)
                 row += 1
-            # The section's own DIRECT scalar rows (a Total across the
-            # instances) follow beneath the matrix — never dropped.
-            for name, var in scalars:
-                row = self._ensure_row_free(sheet_name, row)
-                self._mark_row(sheet_name, row, var.id)
-                cell = f"{self._col_to_letter(sec_col + 1)}{row}"
-                self.addresses[var.id] = VariableAddresses(
-                    name=f"{self._col_to_letter(sec_col)}{row}",
-                    formula=cell, values=[cell],
-                )
-                self.board_var_ids.add(var.id)
-                self.sheet_map.setdefault(sheet_name, []).append(var.id)
-                row += 1
+            # The section's own direct lines follow beneath the matrix,
+            # in declaration order.
+            for _name, var in lines:
+                row = _line_row(var, row)
             return row
         if scalars:
-            # Scalar children: names across one row, values beneath.
+            # Scalar children: names across one row, their units in the
+            # row beneath where the sheet has a unit column (a caption
+            # across heads no row to put one beside), values beneath.
             hdr_row = row + 1
-            val_row = row + 2
+            self._mark_row(sheet_name, hdr_row, f"{mv.id}.__hdr__")
+            unit_row = self._unit_row(
+                [var for _n, var in scalars], hdr_row + 1, sheet_name, f"{mv.id}.__units__",
+            )
+            val_row = (hdr_row if unit_row is None else unit_row) + 1
             for j, (name, var) in enumerate(scalars):
-                cell = f"{self._col_to_letter(sec_col + 1 + j)}{val_row}"
-                label = f"{self._col_to_letter(sec_col + 1 + j)}{hdr_row}"
+                cell = f"{self._col_to_letter(first + j)}{val_row}"
+                label = f"{self._col_to_letter(first + j)}{hdr_row}"
                 self.addresses[var.id] = VariableAddresses(
                     name=label, formula=cell, values=[cell],
                 )
                 self.board_var_ids.add(var.id)
                 self.sheet_map.setdefault(sheet_name, []).append(var.id)
-            self._mark_row(sheet_name, hdr_row, f"{mv.id}.__hdr__")
+                if unit_row is not None:
+                    self.unit_rows[var.id] = unit_row
             self._mark_row(sheet_name, val_row, f"{mv.id}.__val__")
-            return val_row + 1
+            row = val_row + 1
+            # A series has no place across; it follows beneath as a row.
+            for _name, var in series:
+                row = _line_row(var, row)
+            return row
+        if series:
+            for _name, var in series:
+                row = _line_row(var, row)
+            return row
         return row + 1
+
+    def _unit_row(
+        self, lines: Sequence[Variable], row: int, sheet_name: str, item_id: str,
+    ) -> Optional[int]:
+        """Reserve the unit row of a table or board whose captions head no
+        row — the first free row at ``row`` — when the sheet has a unit
+        column and any of ``lines`` carries a unit; ``None`` otherwise."""
+        if not getattr(self, '_meta_unit', False) or not any(
+            getattr(var, '_unit', None) is not None for var in lines
+        ):
+            return None
+        unit_row = self._ensure_row_free(sheet_name, row)
+        self._mark_row(sheet_name, unit_row, item_id)
+        return unit_row
 
     def _record_period_starts(self) -> None:
         """Fix each sheet's period-start column from the laid-out cells.
@@ -1493,15 +1816,18 @@ class LayoutEngine:
         cell of a per-period values run."
         """
         _reject_rank2_emission(var)
-        self._var_by_id[var.id] = var
         name_addr = f"{self._col_to_letter(start_col)}{row}"
         values_start = start_col + 1 + (
             1 if getattr(self, '_meta_unit', False) else 0
         ) + len(getattr(self, '_meta_fields', ()) or ())
         periodic = _is_periodic(var)
+        # A keyed line takes a series' place — its cells start where
+        # the periods do — but it is no series: it counts for no period
+        # column, and its cells run one per key, whatever the stride.
+        keyed = periodic and line_keys(var) is not None
         opening_addr = None
         if periodic:
-            self.period_var_ids.add(var.id)
+            (self.keyed_var_ids if keyed else self.period_var_ids).add(var.id)
             # Step past the constants column. A scalar keeps the first
             # value column — it is not a January figure and must not
             # be printed as one.
@@ -1511,17 +1837,17 @@ class LayoutEngine:
             if getattr(self, '_opening_col', False):
                 opening_addr = f"{self._col_to_letter(values_start)}{row}"
                 values_start += 1
-        formula_addr = (
-            f"{self._col_to_letter(values_start + (getattr(var, '_col_slot', 0) or 0))}{row}"
-            if periodic else f"{self._col_to_letter(values_start)}{row}"
-        )
 
         # Track column groups: a period is ``stride`` columns wide and
         # this line's cells sit at its SLOT inside each group. Stride 1
         # / slot 0 — every workbook without ``tracks='compare'`` —
         # reduces to one column per period.
-        stride = getattr(self, '_group_stride', 1)
-        slot = getattr(var, '_col_slot', 0) or 0
+        stride = 1 if keyed else getattr(self, '_group_stride', 1)
+        slot = 0 if keyed else getattr(var, '_col_slot', 0) or 0
+        formula_addr = (
+            f"{self._col_to_letter(values_start + slot)}{row}"
+            if periodic else f"{self._col_to_letter(values_start)}{row}"
+        )
 
         value = var._value
         if type(value).__name__ == 'TrackValues':

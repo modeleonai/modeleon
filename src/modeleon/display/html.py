@@ -35,7 +35,7 @@ import html
 import itertools
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any, Optional
 
@@ -170,15 +170,30 @@ def _is_text_value(value: Any) -> bool:
     return False
 
 
-def _label_with_unit(var) -> str:
-    """Variable's display name with its unit suffix when present."""
+def _label_with_unit(var, hidden: bool = False) -> str:
+    """Variable's display name with its unit suffix when present — unless
+    the view hides units (``hidden``, from :func:`_units_hidden`): the
+    repr has no unit column, so the suffix is the one place a unit
+    shows here."""
     label = var.display_name
+    if hidden:
+        return label
     unit = getattr(var, '_unit', None)
     if unit is not None:
         unit_str = str(unit)
         if unit_str:
             label = f"{label} ({unit_str})"
     return label
+
+
+def _units_hidden(mv) -> bool:
+    """Does the view resolved for ``mv`` hide units (``meta={'unit':
+    False}``)? The one decision the workbook makes, read the same way."""
+    try:
+        from ..compile.excel.view import resolve_excel_view, units_hidden
+        return units_hidden(resolve_excel_view(mv).meta_unit_col)
+    except Exception:  # presentation only — never break the repr over a view
+        return False
 
 
 # ─── Translator context (formula-mode rendering) ──────────────────
@@ -196,7 +211,9 @@ class _Ctx:
     ``section_header_rows`` carries ``{section_id: (row, col)}`` from
     :class:`~modeleon.compile.excel.layout.LayoutEngine` so the table
     renderer can label section header rows with their flat-layout row
-    numbers.
+    numbers; ``key_caption_rows`` carries ``{var_id: row}`` — the caption
+    row the layout reserves over a keyed line — so the renderer draws
+    that row where the sheet has it.
 
     Failures during construction (e.g. a bare MultiVariable used for
     grouping with no Sheet inside it) yield ``None`` — callers fall
@@ -206,6 +223,7 @@ class _Ctx:
     translator: Any
     var_to_sheet: dict
     section_header_rows: dict
+    key_caption_rows: dict = field(default_factory=dict)
 
 
 def _ctx_from_layout(roots, *, flatten_nested_sheets: bool = False) -> Optional[_Ctx]:
@@ -240,6 +258,7 @@ def _ctx_from_layout(roots, *, flatten_nested_sheets: bool = False) -> Optional[
             translator=translator,
             var_to_sheet=var_to_sheet,
             section_header_rows=dict(engine.section_header_rows),
+            key_caption_rows=dict(engine.key_caption_rows),
         )
     except Exception as exc:
         logger.debug("HTML repr: translator context unavailable (%s)", exc)
@@ -302,16 +321,19 @@ def _merge_ctxs(ctxs: list[_Ctx]) -> Optional[_Ctx]:
     addresses: dict = {}
     var_to_sheet: dict = {}
     section_header_rows: dict = {}
+    key_caption_rows: dict = {}
     for ctx in ctxs:
         addresses.update(ctx.addresses)
         var_to_sheet.update(ctx.var_to_sheet)
         section_header_rows.update(ctx.section_header_rows)
+        key_caption_rows.update(ctx.key_caption_rows)
 
     return _Ctx(
         addresses=addresses,
         translator=ExcelTranslator(addresses, var_to_sheet),
         var_to_sheet=var_to_sheet,
         section_header_rows=section_header_rows,
+        key_caption_rows=key_caption_rows,
     )
 
 
@@ -947,10 +969,11 @@ def _collect_rows(mv, direct_only: bool = False) -> tuple[list, int]:
 
     rows: list = []
     max_cols = 1
+    hidden = _units_hidden(mv)
     for name in mv._component_order:
         comp = mv._components[name]
         if isinstance(comp, Variable):
-            label = _label_with_unit(comp)
+            label = _label_with_unit(comp, hidden)
             values = comp._value if isinstance(comp._value, list) else [comp._value]
             if comp._awaits or comp._forward_of is not None:
                 # A row waiting on an open loop: no values yet.
@@ -1081,8 +1104,13 @@ def _render_mv_table(
             f"{period_cells}</tr>"
         )
 
+    from ..compile.excel.layout import line_keys
+
     body = ""
     has_formula = False
+    # The caption row drawn last over a keyed line: consecutive lines
+    # with the same keys share one, as on the sheet.
+    drawn_cap_row = None
     for kind, label, var, values in rows:
         if kind == 'section':
             # ``var`` here is the section's sub-MV; its layout-side
@@ -1117,6 +1145,25 @@ def _render_mv_table(
                 f"{html.escape(str(label))}</th></tr>"
             )
             continue
+        # A keyed line (``mo.Variable({"FY2023": …})``) stands under a
+        # caption row of its keys, each over the cell that holds its
+        # value — the row the layout reserved for it, numbered as the
+        # sheet numbers it, so nothing of the sheet is skipped and the
+        # values do not read as the period header's.
+        cap_row = ctx.key_caption_rows.get(var.id) if ctx is not None else None
+        if cap_row is not None and cap_row != drawn_cap_row:
+            keys = line_keys(var) or []
+            key_cells = "".join(
+                f'<th style="{_TH_PERIOD}">'
+                f'{html.escape(keys[i]) if i < len(keys) else ""}</th>'
+                for i in range(max_cols)
+            )
+            body += (
+                f'<tr><th style="{_TH_ROW}">{cap_row}</th>'
+                f'<th style="{_TH_PERIOD}"></th>'
+                f"{key_cells}</tr>"
+            )
+            drawn_cap_row = cap_row
         cells = ""
         for i in range(max_cols):
             if values is not None and i < len(values):
@@ -1237,19 +1284,25 @@ def model_html(root) -> str:
     )
     panel_ctxs: list[_Ctx] = []
     panel_specs: list[tuple] = []  # (label, panel_mv, ctx, direct_only, is_overview)
-    if direct_var_names:
-        # Lay out only the root's direct Variables under a virtual
-        # sheet named after the root — sub-MV variables get their
-        # addresses on their own panels, and including them here would
-        # double-assign addresses when the panel ctxs merge.
-        overview_virt = _make_overview_sheet(root, direct_var_names)
-        overview_ctx = _ctx_from_layout(
-            [overview_virt], flatten_nested_sheets=True,
-        )
-        if overview_ctx is not None:
-            panel_ctxs.append(overview_ctx)
-        panel_specs.append((overview_label, root, overview_ctx, True, False))
-    for name, mv in sub_mvs:
+    # The tabs in the book's order: the model's own view may declare one.
+    from ..compile.excel.view import in_sheet_order
+
+    overview = [(None, root)] if direct_var_names else []
+    tabs = in_sheet_order(root, overview + sub_mvs)
+    for name, mv in tabs:
+        if name is None:
+            # Lay out only the root's direct Variables under a virtual
+            # sheet named after the root — sub-MV variables get their
+            # addresses on their own panels, and including them here would
+            # double-assign addresses when the panel ctxs merge.
+            overview_virt = _make_overview_sheet(root, direct_var_names)
+            overview_ctx = _ctx_from_layout(
+                [overview_virt], flatten_nested_sheets=True,
+            )
+            if overview_ctx is not None:
+                panel_ctxs.append(overview_ctx)
+            panel_specs.append((overview_label, root, overview_ctx, True, False))
+            continue
         panel_ctx = _build_ctx(mv)
         if panel_ctx is not None:
             panel_ctxs.append(panel_ctx)
@@ -1270,6 +1323,7 @@ def model_html(root) -> str:
                 translator=shared_ctx.translator,
                 var_to_sheet=panel_ctx.var_to_sheet,
                 section_header_rows=panel_ctx.section_header_rows,
+                key_caption_rows=panel_ctx.key_caption_rows,
             )
         # Don't suppress the panel title — the ``.mo-panel-title``
         # div stays in the markup and the CSS hides it in tabbed mode

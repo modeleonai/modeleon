@@ -9,7 +9,8 @@ of related settings, each a sub-model):
     bands      {section, …}         structure — section/band styling
     cell_types {on, colors{…}, styles{…}}   cell look by kind (input/reference)
     timeline   {header, label_format, opening, …}   the period-label header
-    sheet      {title, gridlines, columns[…], …}    the furniture of every sheet
+    sheet      {title, gridlines, columns[…], …}    the furniture of every sheet,
+               order[…]                             and, on the model, the order of the sheets
 
 So a view is a real tree you navigate (``view.timeline.label_format``,
 ``view.cell_types.colors.input``). Renderers don't read the tree — they read a
@@ -28,7 +29,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from dataclasses import fields as _dc_fields
 from html import escape
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, TypeVar
 
 from ...core.multi_variable import MultiVariable, MultiVariableBase
 from ...core.variable import Variable
@@ -72,6 +73,17 @@ class ResolvedView:
     #: so the wording stays in the model and the engine stays
     #: language-neutral.
     meta_article_col: Optional[bool | str] = None
+    #: The unit has THREE states, told apart here and nowhere else —
+    #: every renderer reads this one value (the layout carries it in
+    #: its meta triple) and asks :func:`units_hidden`:
+    #: a caption or ``True`` — a unit column, and under the captions of
+    #: a records table or a board a unit row; unset (``None``) — no
+    #: column, the unit suffixed into the row label and the table
+    #: caption ("Revenue (USD m)"); ``False`` — the unit text shown
+    #: NOWHERE: no column, no suffix, no unit row, in the workbook and
+    #: the notebook repr alike. The unit stays on the line either way:
+    #: the number format keyed by it (``formats={'%': '0.0%'}``) still
+    #: applies, only the text is hidden.
     meta_unit_col: Optional[bool | str] = None
     #: The LABEL column's header. Unlike the two above this is not a
     #: flag — the label column always exists — so only a string means
@@ -82,11 +94,13 @@ class ResolvedView:
     #: carries non-periodic lines — so like the label column this is
     #: caption-only: a string heads it, absence keeps it headerless.
     meta_constants_col: Optional[str] = None
-    #: Line numbers by position: ``meta={'numbering': 'section'}`` numbers
-    #: each first-level section's lines ``1.1``, ``1.2``, … in the order
-    #: they stand — the inputs and the results; a link (a line that only
+    #: Numbers by position: ``meta={'numbering': 'section'}`` numbers the
+    #: sheet as an outline in the order it stands — a first-level section
+    #: ``1``, a section inside it ``1.1``, that section's lines ``1.1.1``,
+    #: ``1.1.2``, … — the inputs and the results; a link (a line that only
     #: repeats another) carries no number of its own, the number belongs
-    #: to the line it repeats. A line's own ``article`` wins.
+    #: to the line it repeats. An own ``article`` wins, on a line or a
+    #: section.
     meta_numbering: Optional[str] = None
     #: Which lines carry the row total (the ``('row_sum', …)`` field)
     #: without saying so each: ``meta={'row_sum_for': ['sum']}`` — a line
@@ -195,6 +209,15 @@ class ResolvedView:
 _RESOLVED_FIELDS = tuple(f.name for f in _dc_fields(ResolvedView))
 
 
+def units_hidden(meta_unit: object) -> bool:
+    """Does the resolved unit flag — :attr:`ResolvedView.meta_unit_col`,
+    or the layout's copy of it — hide the unit text everywhere?
+    ``meta={'unit': False}`` does; a caption, ``True`` and unset do not.
+    The one predicate that tells ``False`` from unset, so every renderer
+    hides the same thing."""
+    return meta_unit is False
+
+
 def _to_node(name: str, value: Any) -> Any:
     """A config value as a tree node: an already-built node as-is, a sub-model
     for a dict (authoring sugar), else a ``Variable``."""
@@ -277,6 +300,15 @@ class ExcelView(MultiVariable):
                         "ExcelView tracks= 'shown' must be a list of "
                         "track names."
                     )
+        order = sheet.get("order") if isinstance(sheet, dict) else None
+        if order is not None and not isinstance(order, str) and not (
+            isinstance(order, (list, tuple)) and all(isinstance(n, str) for n in order)
+        ):
+            raise ValueError(
+                "ExcelView sheet= 'order' takes the model's sheets, each by "
+                "the attribute it is assigned to: sheet={'order': ['summary', "
+                "'inputs']}."
+            )
         if grain is not None:
             from ...core.time import GRAINS
             if grain not in GRAINS:
@@ -620,3 +652,88 @@ def resolve_excel_view(node: Any) -> ResolvedView:
     for snap in reversed(chain):
         result = _merge(snap, result)
     return result
+
+
+class SheetOrderWarning(UserWarning):
+    """``sheet={'order': [...]}`` names a sheet the model does not have; the
+    order skips the name and places the rest."""
+
+
+def declared_sheet_order(root: Any) -> Optional[Tuple[str, ...]]:
+    """The sheet order ``root``'s OWN view declares (``sheet={'order':
+    [...]}``), each name once, or ``None``. Read from the view's nodes, so a
+    model that declares none is laid out exactly as before, whatever else
+    its view holds. A container written on its own does not read its
+    parent's order: the order describes the whole book."""
+    view = getattr(root, "__dict__", {}).get("default_excel_view")
+    if not isinstance(view, ExcelView):
+        return None
+    group = view._components.get("sheet")
+    node = group._components.get("order") if isinstance(group, MultiVariableBase) else None
+    order = _node_value(node) if node is not None else None
+    if isinstance(order, str):
+        order = [order]
+    return tuple(dict.fromkeys(str(n) for n in order)) if order else None
+
+
+_Sheet = TypeVar("_Sheet")
+
+
+def _sheet_names(
+    root: Any, sheets: Sequence[Tuple[Optional[str], _Sheet]],
+) -> Dict[str, Tuple[Optional[str], _Sheet]]:
+    """Each sheet by the name an order calls it: its attribute, and for the
+    tab of the root's own lines the root's name."""
+    own = getattr(root, "python_name", None)
+    out: Dict[str, Tuple[Optional[str], _Sheet]] = {}
+    for name, sheet in sheets:
+        key = own if name is None else name
+        if key is not None:
+            out.setdefault(key, (name, sheet))
+    return out
+
+
+def sheet_order_note(
+    root: Any, sheets: Sequence[Tuple[Optional[str], _Sheet]],
+) -> Optional[str]:
+    """One sentence naming what ``root``'s declared order calls that is no
+    sheet of it (``sheets`` as :func:`in_sheet_order` takes them), or
+    ``None`` when every name is one."""
+    order = declared_sheet_order(root)
+    named = _sheet_names(root, sheets)
+    unknown = [n for n in order or () if n not in named]
+    if not unknown:
+        return None
+    model = getattr(root, "python_name", None) or getattr(root, "display_name", None)
+    which = ", ".join(map(repr, unknown))
+    return (
+        f"ExcelView sheet= 'order' names {which}, which "
+        f"{'is not a sheet' if len(unknown) == 1 else 'are not sheets'} of "
+        f"{model!r}, so the order skips "
+        f"{'it' if len(unknown) == 1 else 'them'}. Its sheets are: "
+        f"{', '.join(map(repr, named))}."
+    )
+
+
+def in_sheet_order(
+    root: Any, sheets: Sequence[Tuple[Optional[str], _Sheet]],
+) -> List[Tuple[Optional[str], _Sheet]]:
+    """``sheets`` — ``(attribute, sheet)`` pairs in the order ``root``
+    declares them, ``None`` for the tab of the root's own lines, which goes
+    by the root's name — in the order :func:`declared_sheet_order` gives:
+    the named sheets first, as listed, the rest after them as they stand.
+    Without a declaration, ``sheets`` as given. A name that is no sheet of
+    ``root`` is skipped with a :class:`SheetOrderWarning` that lists the
+    sheets it has; the model is laid out all the same."""
+    order = declared_sheet_order(root)
+    if not order:
+        return list(sheets)
+    note = sheet_order_note(root, sheets)
+    if note is not None:
+        import warnings
+
+        warnings.warn(note, SheetOrderWarning, stacklevel=2)
+    named = _sheet_names(root, sheets)
+    first = [named[n] for n in order if n in named]
+    placed = {id(sheet) for _n, sheet in first}
+    return first + [p for p in sheets if id(p[1]) not in placed]

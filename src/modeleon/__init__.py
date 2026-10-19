@@ -51,7 +51,7 @@ Package layout:
     plugins.py  - extension point registry
 """
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 # Plugin system — extensions register via entry points
 from modeleon.plugins import load_plugins as _load_plugins
