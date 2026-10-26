@@ -27,10 +27,18 @@ addresses shift with them, so every native formula follows for free.
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from ...core.time import bucket_ranges
+from ...core.calendar import GREGORIAN
+from ...core.time import article, bucket_ranges
 
 
-#: One interleaved column: ``('month', i)`` / ``('quarter', bi)`` /
+#: The kind of a sheet's OWN periods in a plan — its native grain's
+#: columns, whatever that grain is. A bucket is keyed by its ruler's
+#: name (``'month'``, ``'quarter'``, ``'half'``, ``'year'``), so a day
+#: sheet may carry month buckets beside its days without the two keys
+#: meeting (they used to: the native columns were spelled ``'month'``).
+NATIVE = "period"
+
+#: One interleaved column: ``(NATIVE, i)`` / ``('quarter', bi)`` /
 #: ``('year', bi)`` — in on-sheet order.
 ColKey = Tuple[str, int]
 
@@ -63,10 +71,17 @@ class TotalsPlan:
     #: (every book without a compare layout) collapses both to the
     #: historical single-column reading.
     stride: int = 1
+    #: The sheet's own ruler — what its native captions shorten to under
+    #: a tier (an hour keeps its clock, "13:00", under its day).
+    grain: Optional[str] = None
 
 
-    def month_col(self, i: int) -> int:
-        return self.col_of[("month", i)]
+    def native_col(self, i: int) -> int:
+        """The column of the sheet's own period ``i``."""
+        return self.col_of[(NATIVE, i)]
+
+    #: The name this had when every native period was a month.
+    month_col = native_col
 
     def cell(self, key: ColKey, slot: int = 0) -> int:
         """The physical column of one SLOT inside ``key``'s group."""
@@ -99,14 +114,14 @@ def build_totals_plan(
             (label, lo, hi)
             for (label, lo, hi) in bucket_ranges(grain, kind, str(start), n)
         ]
-    # Walk the months; a bucket column follows its last month —
+    # Walk the periods; a bucket column follows its last period —
     # quarter before year where both close on the same month.
     ends: Dict[str, Dict[int, int]] = {
         kind: {hi: bi for bi, (_l, _lo, hi) in enumerate(plan.buckets[kind])}
         for kind in usable
     }
     for i in range(n):
-        plan.columns.append(("month", i))
+        plan.columns.append((NATIVE, i))
         for kind in usable:
             bi = ends[kind].get(i + 1)
             if bi is not None:
@@ -115,23 +130,81 @@ def build_totals_plan(
         plan.col_of[key] = base_col + offset * stride
     plan.depth = 1 + len(usable)
     plan.stride = stride
+    plan.grain = grain
     return plan
 
 
 def _coarser(kind: str, grain: str) -> bool:
-    order = {"day": 0, "month": 1, "quarter": 2, "year": 3}
-    return order.get(kind, -1) > order.get(grain, 99)
+    """Whether ``kind`` is a bucket a ``grain`` sheet can total by — a
+    ruler ``grain`` nests in; an unknown word never is."""
+    return GREGORIAN.coarser(kind, grain)
+
+
+class TotalsWarning(UserWarning):
+    """A view declares a totals kind a sheet cannot draw — its periods do
+    not lie inside that kind's (weeks in months), or it straddles another
+    declared kind's (weeks beside months over days). The column is left
+    out; the warning says why."""
+
+
+def drawable_kinds(kinds: Tuple[str, ...], grain: str) -> Tuple[Tuple[str, ...], List[str]]:
+    """The declared totals ``kinds`` a ``grain`` sheet draws, in their
+    order, and a note for each it cannot. A kind finer than the sheet
+    (a month column on a quarterly sheet) is skipped without a word —
+    one view serves sheets of several grains. A kind the sheet's periods
+    do not lie inside (a month column over weeks) is a note; so is a
+    kind that does not nest with one already kept (weeks and months over
+    days — the tiers of a header must nest)."""
+    kept: List[str] = []
+    notes: List[str] = []
+    up = GREGORIAN.rolls_up_to(grain) if GREGORIAN.knows(grain) else ()
+    for kind in kinds:
+        if kind in kept or not (GREGORIAN.knows(kind) and GREGORIAN.knows(grain)):
+            continue
+        if kind == grain or GREGORIAN.nests(kind, grain):
+            continue
+        if not GREGORIAN.nests(grain, kind):
+            notes.append(
+                f"'{kind}' totals are not drawn: a {grain} does not lie inside one "
+                f"{kind} ({grain}s straddle {kind}s). A {grain} sheet totals by "
+                f"{', '.join(up) if up else 'nothing coarser'}."
+            )
+            continue
+        clash = next((k for k in kept if not GREGORIAN.comparable(k, kind)), None)
+        if clash is not None:
+            notes.append(
+                f"'{kind}' totals are not drawn beside '{clash}' on {article(grain)} {grain} sheet: "
+                f"{kind}s and {clash}s do not nest, so their header tiers cannot "
+                f"stand one over the other. Total by one of them."
+            )
+            continue
+        kept.append(kind)
+    return tuple(kept), notes
 
 
 def display_label(bucket_label: str, kind: str, style: str) -> str:
     """``2026-Q1`` → ``Q1 2026`` (finance) — same voice as the month
-    labels beside it; iso keeps the native spelling."""
+    labels beside it; iso keeps the native spelling. A month bucket (a
+    day sheet's month total) is written as the month ruler writes a
+    month: ``Jan 2026``, ``Jan-26``."""
     if style == "iso":
         return bucket_label
-    if kind == "quarter" and "-Q" in bucket_label.upper():
-        y, q = bucket_label.upper().split("-Q")
-        return f"Q{q} {y}"
+    if kind in ("day", "month", "week", "iso_year"):
+        ruler = GREGORIAN.ruler(kind)
+        try:
+            return ruler.label(ruler.parse(bucket_label), style)
+        except ValueError:
+            return bucket_label
+    tag = _TAG.get(kind)
+    if tag and f"-{tag}" in bucket_label.upper():
+        y, n = bucket_label.upper().split(f"-{tag}")
+        return f"{tag}{n} {y}"
     return bucket_label
+
+
+#: The letter a quarter's and a half's keys carry (``2026-Q1``,
+#: ``2026-H2``) — what the finance spelling leads with (``Q1 2026``).
+_TAG = {"quarter": "Q", "half": "H"}
 
 
 def regrain_rule_of(var: Any) -> Any:
@@ -255,17 +328,27 @@ def rule_formula(rule: str, refs: List[str],
     return None if body is None else f"={body}"
 
 
-def short_label(label: str, kind: str, style: str, hierarchical: bool) -> str:
+def short_label(label: str, kind: str, style: str, hierarchical: bool,
+                grain: Optional[str] = None) -> str:
     """The label a HIERARCHICAL header wants: the year lives on its own
     row, so the rows below drop it — "Jan", "Q1" — while a flat header
     keeps the full form. Non-finance styles keep their native spelling
-    either way."""
+    either way. ``grain`` is the sheet's own ruler: a clock ruler's
+    captions keep their clock ("13:00"), the day on the tier above."""
     if not hierarchical or style != "finance":
-        return display_label(label, kind, style) if kind != "month" else label
-    if kind == "month":
+        return display_label(label, kind, style) if kind != NATIVE else label
+    if kind == NATIVE:
+        if grain is not None and GREGORIAN.knows(grain) and GREGORIAN.ruler(grain).sub_day:
+            return label.rsplit(" ", 1)[-1] if " " in label else label
         return label.split(" ")[0] if " " in label else label
-    if kind == "quarter" and "-Q" in label.upper():
-        return f"Q{label.upper().split('-Q')[1]}"
+    if kind in ("day", "month", "week"):
+        # A month or week tier over days: "Jan", "W05" — the year on
+        # the tier above.
+        full = display_label(label, kind, style)
+        return full.split(" ")[0] if " " in full else full
+    tag = _TAG.get(kind)
+    if tag and f"-{tag}" in label.upper():
+        return f"{tag}{label.upper().split(f'-{tag}')[1]}"
     return label
 
 
@@ -287,15 +370,22 @@ def header_rows(
     paints and merges it, and any other renderer can draw the same
     header from it.
     """
-    kinds_top_down = [
-        k for k in ("year", "quarter") if k in plan.kinds
-    ]
+    # Coarsest tier on top — the calendar's order, whatever order the
+    # kinds were declared in; a month tier stands over a day sheet's
+    # days.
+    kinds_top_down = sorted(plan.kinds, key=GREGORIAN.rank, reverse=True)
     rows: List[dict] = []
     hierarchical = True
+
+    def tiered(kind: str) -> bool:
+        # A day tier drops its month and year only under a month tier
+        # that carries them; over an hour sheet alone it reads in full.
+        return hierarchical and (kind != "day" or "month" in plan.kinds)
+
     for row_i, kind in enumerate(kinds_top_down, start=1):
         cells = []
         for bi, (blabel, lo, hi) in enumerate(plan.buckets[kind]):
-            first = plan.col_of[("month", lo)]
+            first = plan.col_of[(NATIVE, lo)]
             # …up to but NOT including its own total column: that one
             # carries the bucket's "Total" label, starting on this very
             # row. Swallowing it left the label nowhere to go but the
@@ -307,20 +397,20 @@ def header_rows(
             cells.append({
                 "col": first,
                 "colspan": last - first + 1,
-                "label": short_label(blabel, kind, plan.style, hierarchical),
+                "label": short_label(blabel, kind, plan.style, tiered(kind)),
                 "kind": kind,
             })
         rows.append({"row": row_i, "cells": cells})
     month_row = len(kinds_top_down) + 1
     cells = [
         {
-            "col": plan.month_col(i),
+            "col": plan.native_col(i),
             "colspan": plan.stride,
             "label": short_label(
                 month_labels[i] if i < len(month_labels) else "",
-                "month", plan.style, hierarchical,
+                NATIVE, plan.style, hierarchical, plan.grain,
             ),
-            "kind": "month",
+            "kind": NATIVE,
         }
         for i in range(plan.n)
     ]
@@ -344,7 +434,7 @@ def header_rows(
                 "rowspan": rowspan,
                 "label": (
                     f"{plan.totals_word} "
-                    f"{short_label(blabel, kind, plan.style, hierarchical)}"
+                    f"{short_label(blabel, kind, plan.style, tiered(kind))}"
                 ),
                 "kind": kind,
             })

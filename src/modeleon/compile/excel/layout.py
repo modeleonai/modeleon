@@ -19,6 +19,7 @@ from typing import Any, Container, Dict, Iterable, Iterator, List, Optional, Seq
 
 from .addresses import VariableAddresses
 from ...core.multi_variable import MultiVariableBase
+from ...core.shape import line_keys
 from ...core.variable import Variable
 
 
@@ -181,7 +182,7 @@ def _number_outline(
                 out[var.id] = f"{prefix}{count[0]}"
         return
     for name in mv._component_order:
-        comp = mv._components[name]
+        comp = mv._component(name)
         if isinstance(comp, Variable):
             if _takes_number(comp, rows):
                 count[0] += 1
@@ -301,26 +302,6 @@ def _is_periodic(var: Variable) -> bool:
     return bool(getattr(var, '_indexed_by', ()) or ())
 
 
-def line_keys(var: Variable) -> Optional[List[str]]:
-    """The keys a line runs ALONG instead of periods — a keyed list
-    (``mo.Variable({'FY2023': 400, 'FY2024': 450})``) or a line on one
-    finite axis that is not time (``indexed_by=[regions]``) — one per
-    cell, in cell order; ``None`` for a series, a constant and a
-    tracked line. Such a line stands under a caption row of these keys
-    (``key_captions_by_sheet``) and counts for no period column. Public
-    so a renderer captions the line by the keys the layout placed it
-    under."""
-    keys = getattr(var, '_keys', None)
-    if keys and isinstance(getattr(var, '_value', None), list):
-        return [str(k) for k in keys]
-    axes: Sequence[Any] = getattr(var, '_indexed_by', None) or ()
-    if len(axes) == 1 and getattr(axes[0], '_axis_kind', None) != 'time':
-        labels = getattr(axes[0], '_value', None)
-        if isinstance(labels, list):
-            return [str(label) for label in labels]
-    return None
-
-
 def _sheet_has_periods(mv: MultiVariableBase, flatten: bool = False) -> bool:
     """Does this SHEET carry any per-period line?
 
@@ -392,6 +373,48 @@ def _reject_rank2_emission(var: Variable) -> None:
             f"Emit a slice instead (drop an axis first), or keep the "
             f"variable out of the workbook."
         )
+
+
+def _board_list_field_refusal(
+    mv: MultiVariableBase,
+    iname: str,
+    inst: MultiVariableBase,
+    fname: str,
+    var: Variable,
+    cells: int,
+) -> str:
+    """The refusal of a field of several cells in an ``orient='columns'`` block.
+
+    The matrix holds ONE cell per field per instance. A list field — a
+    period series, a keyed line, a line on an axis — was skipped here
+    without a word: its row vanished from the sheet, and every aggregate
+    reading it was written as its computed number, a dead cell. Loud
+    instead, with the forms that do hold such a line.
+    """
+    keys = line_keys(var)
+    label = (getattr(var, '_display_name', None)
+             or getattr(var, '_python_name', None) or fname)
+    instance = getattr(inst, '_display_name', None) or inst.python_name or iname
+    section = getattr(mv, '_display_name', None) or mv.python_name or mv.id
+    if keys is None:
+        along = "period"
+        fix = (
+            f"Put '{label}' outside '{section}', where it gets a row of its "
+            f"own on the sheet, or lay '{section}' out with orient='records', "
+            f"where a per-period field gets a block of its own beneath the table."
+        )
+    else:
+        along = "key"
+        fix = (
+            f"Put '{label}' outside '{section}', where it gets a row of its "
+            f"own on the sheet, under a caption row of its keys."
+        )
+    return (
+        f"'{label}' in '{instance}' is a line of {cells} cell(s), one per "
+        f"{along}, and '{section}' is laid out with orient='columns' — one "
+        f"column per instance, one cell per field — which has no row for it. "
+        f"{fix}"
+    )
 
 
 def layout_sheet_names(sheets: Sequence[MultiVariableBase]) -> List[str]:
@@ -518,6 +541,17 @@ class LayoutEngine:
         self._totals_override = (
             tuple(totals_override) if totals_override is not None else None
         )
+        if self._totals_override:
+            # A kind the engine has no bucket for is refused by name — a
+            # typo or a grain the engine does not know must not vanish into "no
+            # totals" without a word.
+            from ...core.time import GRAINS
+            unknown = [k for k in self._totals_override if k not in GRAINS]
+            if unknown:
+                raise ValueError(
+                    f"A totals column is one of {', '.join(GRAINS)}; got "
+                    f"{', '.join(repr(k) for k in unknown)}."
+                )
         self.roots = roots
         self._flatten_nested_sheets = flatten_nested_sheets
         #: The workbook's header rows (``default_header``) — mirrors of the
@@ -568,6 +602,10 @@ class LayoutEngine:
         #: one row the lines that share its keys share. A renderer hides
         #: it with its lines (:func:`hidden_key_caption_rows`).
         self.key_caption_rows: Dict[str, int] = {}
+        #: What the layout refused to place, one message each that says how to fix it —
+        #: a workbook is not written while any stands (the writer raises
+        #: the first); other readers keep their addresses.
+        self.refusals: List[str] = []
         #: var id -> the row its unit stands in, for a caption that heads
         #: no row of the sheet (a records-table field, a scalar across a
         #: board) on a sheet with a unit column: the UNIT ROW its table
@@ -645,6 +683,17 @@ class LayoutEngine:
         # in-process writer keeps the id() keying above; the deduped name
         # is unique per compute_addresses pass, so no clone collision).
         self.time_headers_by_sheet: Dict[str, tuple] = {}
+        #: sheet_name → the day its window's short first period starts
+        #: on (``DefaultWindow.first_day``), ``None`` when whole — the
+        #: one window fact ``time_headers_by_sheet`` does not carry.
+        self.time_first_day_by_sheet: Dict[str, Any] = {}
+        #: sheet_name → the window's fixed offset ('+01:00'), when it
+        #: declares one — kept for a caller; a workbook's dates carry no zone.
+        self.time_zone_by_sheet: Dict[str, Any] = {}
+        #: Why a declared totals kind is not drawn on a sheet (a month
+        #: column over weeks) — ``"<sheet>: <reason>"``, each also raised as
+        #: a ``TotalsWarning``; kept here for a caller that collects them.
+        self.totals_notes: List[str] = []
         #: id(sheet_mv) -> the time window its period columns follow
         #: (``None`` when the model declares none) — recorded whether or
         #: not a header shows it, because the columns follow it anyway.
@@ -854,22 +903,25 @@ class LayoutEngine:
                     # Subtotal columns ride the time header — resolved
                     # here where the view and window are in hand,
                     # applied after addresses exist (_apply_totals).
+                    # Only kinds the sheet's periods nest in, and that
+                    # nest with each other, are drawn; the rest are reported.
+                    from .totals import TotalsWarning, drawable_kinds
+
+                    _usable, _notes = drawable_kinds(tuple(_tot_kinds), window.grain)
+                    for _note in _notes:
+                        self.totals_notes.append(f"{sheet_name}: {_note}")
+                        import warnings as _warnings
+                        _warnings.warn(f"{sheet_name}: {_note}", TotalsWarning, stacklevel=2)
                     self._totals_decl[sheet_name] = (
-                        tuple(_tot_kinds),
+                        _usable,
                         window.start,
                         window.grain,
                         style,
                         view.time_totals_word or "Total",
                     )
                     self._totals_ids[sheet_name] = id(sheet_mv)
-                    from .totals import _coarser as _tot_coarser
-
-                    _usable = [
-                        k for k in _tot_kinds
-                        if _tot_coarser(k, window.grain)
-                    ]
                     # The hierarchical header: one row per bucket kind
-                    # ABOVE the month row — data moves down with it.
+                    # ABOVE the periods' row — data moves down with it.
                     _extra_header_rows = len(_usable)
                 if style not in TIME_LABEL_STYLES:
                     raise ValueError(
@@ -882,6 +934,8 @@ class LayoutEngine:
                     window.grain,
                     style,
                 )
+                self.time_first_day_by_sheet[sheet_name] = getattr(window, 'first_day', None)
+                self.time_zone_by_sheet[sheet_name] = getattr(window, 'zone', None)
 
             # Track column groups: the sheet's STRIDE is the widest
             # slot any of its lines carries — resolved here, once,
@@ -1022,6 +1076,7 @@ class LayoutEngine:
 
         self._record_period_starts()
         self._apply_totals()
+        self._check_sheet_width()
         self._record_freezes()
         self._record_numbers()
         return self.addresses
@@ -1155,7 +1210,7 @@ class LayoutEngine:
         while stack:
             mv = stack.pop()
             for name in mv._component_order:
-                comp = mv._components[name]
+                comp = mv._component(name)
                 if isinstance(comp, Variable):
                     yield comp
                 elif isinstance(comp, MultiVariableBase):
@@ -1246,8 +1301,9 @@ class LayoutEngine:
         # REPEATING children spread ACROSS — one column per sub-MV
         # (instance), one row per scalar field. The matrix form for
         # instances: metrics × instances instead of N stacked
-        # blocks. List fields don't fit a scalar matrix and are
-        # skipped.
+        # blocks. A list field has no cell in a scalar matrix: the
+        # layout records its refusal (``refusals``) and skips it; the
+        # writer refuses the book.
         if _own_orient(mv) == 'columns':
             return self._layout_mv_columns(mv, row, col, sheet_name)
         # Records orientation: one ROW per child record, one COLUMN
@@ -1266,7 +1322,7 @@ class LayoutEngine:
         # share the caption row.
         prev_keyed: Optional[tuple] = None
         for name in mv._component_order:
-            comp = mv._components[name]
+            comp = mv._component(name)
 
             if isinstance(comp, MultiVariableBase):
                 if _is_presentation(comp):
@@ -1301,7 +1357,7 @@ class LayoutEngine:
                 # components sit under it. The label cell stays the
                 # section's; the child gets value addresses only.
                 for _hname in comp._component_order:
-                    _hchild = comp._components[_hname]
+                    _hchild = comp._component(_hname)
                     if (isinstance(_hchild, Variable)
                             and (_hchild._excel_props or {}).get('header_row')):
                         _haddr = self._create_var_address(
@@ -1654,11 +1710,26 @@ class LayoutEngine:
                 inst_id = inst.id or inst.python_name or iname
                 self.section_header_rows[inst_id] = (row, first + j)
             field_order: list[str] = []
-            for _, inst in instances:
+            for iname, inst in instances:
                 for fname, f in inst._components.items():
-                    if (isinstance(f, Variable)
-                            and not isinstance(getattr(f, '_value', None), list)
-                            and fname not in field_order):
+                    if not isinstance(f, Variable):
+                        continue
+                    value = getattr(f, '_value', None)
+                    if isinstance(value, list) and (
+                        len(value) > 1 or line_keys(f) is not None
+                        or getattr(f, '_grain', None) is not None
+                    ):
+                        # A field is ONE cell of the matrix; a line of
+                        # several has no place in it. The layout records
+                        # the refusal and skips the line — a workbook is
+                        # refused by the writer, a compatibility check
+                        # reports it, every other reader keeps its
+                        # addresses.
+                        self.refusals.append(
+                            _board_list_field_refusal(mv, iname, inst, fname, f, len(value))
+                        )
+                        continue
+                    if fname not in field_order:
                         field_order.append(fname)
             row += 1
             for fname in field_order:
@@ -1756,6 +1827,32 @@ class LayoutEngine:
             if roles is not None:
                 roles['period'] = start
 
+    def _check_sheet_width(self) -> None:
+        """The width law: a sheet holds 16,384 columns, and a period is
+        one (a total another). A window wider than its sheet — counting
+        the label columns before it and the totals between — is refused
+        with the count and the two ways out, never cut."""
+        from ...core.time import SHEET_COLUMNS, SheetWidthError, width_refusal
+        for sheet, var_ids in self.sheet_map.items():
+            last = 0
+            plan = self.totals_by_sheet.get(sheet)
+            if plan is not None and plan.col_of:
+                last = max(plan.col_of.values()) + plan.stride - 1
+            for v in var_ids:
+                addr = self.addresses.get(v)
+                if addr is not None and addr.values:
+                    last = max(last, _col_number(addr.values[-1]))
+            if last <= SHEET_COLUMNS:
+                continue
+            header = self.time_headers_by_sheet.get(sheet)
+            grain = header[1] if header else 'period'
+            start = self.period_start_by_sheet.get(sheet) or 2
+            lead = start - 1
+            periods = plan.n if plan is not None else last - lead
+            raise SheetWidthError(
+                f"{sheet}: " + width_refusal(grain, periods, lead, last - lead)
+            )
+
     def _apply_totals(self) -> None:
         """Interleave subtotal columns into every declaring sheet.
 
@@ -1766,7 +1863,7 @@ class LayoutEngine:
         bucket, recorded on the plan for the writer and any other
         consumer.
         """
-        from .totals import build_totals_plan
+        from .totals import NATIVE, build_totals_plan
 
         for sheet, decl in self._totals_decl.items():
             kinds, start, grain, style, totals_word = decl
@@ -1793,7 +1890,7 @@ class LayoutEngine:
                 row = _row_number(a.values[0])
                 slot = self._slot_by_id.get(v, 0)
                 moved = [
-                    f"{self._col_to_letter(plan.cell(('month', i), slot))}{row}"
+                    f"{self._col_to_letter(plan.cell((NATIVE, i), slot))}{row}"
                     for i in range(len(a.values))
                 ]
                 self.addresses[v] = VariableAddresses(
@@ -1887,7 +1984,7 @@ class LayoutEngine:
         """
         col = start_col
         for name in mv._component_order:
-            comp = mv._components[name]
+            comp = mv._component(name)
             if isinstance(comp, Variable):
                 self.addresses[comp.id] = self._create_var_address_down(
                     comp, header_row, col

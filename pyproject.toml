@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "modeleon"
-version = "0.2.2"
+version = "0.2.3"
 description = "Financial Model Engineering — Python code compiles to live Excel formulas"
 requires-python = ">=3.12"
 license = "Apache-2.0"

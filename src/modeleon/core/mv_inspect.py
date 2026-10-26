@@ -35,6 +35,7 @@ class _MVInspect:
     # Attributes provided by MultiVariableBase.
     _components: Dict[str, Any]
     _component_order: List[str]
+    _component_names: List[str]
     _parent: Optional["MultiVariableBase"]
     _excel_props: Dict[str, Any]
     _qualified_id: Any
@@ -57,6 +58,18 @@ class _MVInspect:
         """List of all component names in creation order."""
         return self._component_order.copy()
 
+    def _has_component(self, name: str) -> bool:
+        """``name in self._components``, without building the dict."""
+        return name in self._component_names and name in self.__dict__
+
+    def _component(self, name: str) -> Any:
+        """``self._components[name]``, without building the dict — a
+        copy of every child, once per child read, made each walk over a
+        container quadratic in its size."""
+        if self._has_component(name):
+            return self.__dict__[name]
+        raise KeyError(name)
+
     @property
     def sheet_name(self) -> Optional[str]:
         """Resolved sheet (Excel tab) name for sheet-role MVs.
@@ -74,7 +87,7 @@ class _MVInspect:
         instances."""
         from .multi_variable import MultiVariableBase
         for name in self._component_order:
-            component = self._components[name]
+            component = self._component(name)
             yield name, component
             if isinstance(component, MultiVariableBase):
                 yield from component.walk()

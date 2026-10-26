@@ -36,7 +36,7 @@ class CompatIssue:
 
     func: str                 # the call; for a cell, the call written as a number,
                               # else the sub-expression itself
-    kind: str                 # "render", "compute", "value" or "inlined"
+    kind: str                 # "render", "compute", "value", "inlined" or "layout"
     declared: frozenset       # the FuncCall's declared backend set (a cell: empty)
     target: str               # the target that was checked
     qpath: Optional[str] = None     # a cell: the line's qualified path
@@ -45,6 +45,8 @@ class CompatIssue:
     literal: Optional[str] = None   # an inlined cell: the number written in its place
 
     def __str__(self) -> str:
+        if self.kind == "layout":
+            return self.func
         if self.kind == "inlined":
             return (
                 f"{self.qpath}[{self.period}]: {self.inlined} is written as "
@@ -222,6 +224,10 @@ def _excel_cell_issues(root: Any, target: str) -> List[CompatIssue]:
         time=book_time_for(engine, roots, sheet_names, addresses, var_to_sheet),
     )
     issues: List[CompatIssue] = []
+    issues.extend(
+        CompatIssue(func=msg, kind="layout", declared=frozenset(), target=target)
+        for msg in engine.refusals
+    )
     for sheet_mv, sheet_name in zip(roots, sheet_names):
         for _name, comp in sheet_mv.walk():
             if not isinstance(comp, Variable):

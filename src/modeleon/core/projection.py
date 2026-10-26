@@ -24,6 +24,7 @@ A shared cache re-grains each source once, so cross-line references agree.
 
 from __future__ import annotations
 
+import math
 import operator
 from typing import Any, Dict, Optional
 
@@ -41,10 +42,18 @@ _COMPARES: Dict[str, Any] = {'==': operator.eq, '!=': operator.ne,
                              '<': operator.lt, '<=': operator.le,
                              '>': operator.gt, '>=': operator.ge}
 #: mo.* functions safe to re-run over re-grained inputs — Variable-aware,
-#: element-wise or scalar-broadcasting, no self-reference. Reductions
-#: (SUM/NPV/IRR/…) never reach recompute: scalar-valued formulas copy.
+#: element-wise or scalar-broadcasting, no self-reference. Reductions over
+#: one series (SUM/NPV/IRR/…) never reach recompute: scalar-valued formulas
+#: copy.
 _RECOMPUTE_FUNCS = ('IF', 'AND', 'OR', 'NOT', 'CHOOSE',
                     'MAX', 'MIN', 'ABS', 'ROUND', 'INT', 'MOD')
+#: Aggregates whose call over two or more operands with a series among
+#: them is one per period, re-grained as their operators are: ``SUM`` and
+#: ``AVERAGE`` as ``a + b`` — the call over the re-grained operands, each
+#: by its own rule (a balance its last month, a flow its sum) — and
+#: ``PRODUCT`` as ``a * b``, a flow evaluated at native grain when two of
+#: its operands vary in time.
+_PER_PERIOD_AGGREGATES = ('SUM', 'AVERAGE', 'PRODUCT')
 
 
 def _unsupported(what: str) -> str:
@@ -77,6 +86,12 @@ def _recompute(expr: Any, grain: str, cache: Dict[int, Any]) -> Any:
             raise ValueError(_unsupported(f"operator {expr.op!r}"))
         return fn(_recompute(expr.left, grain, cache),
                   _recompute(expr.right, grain, cache))
+    if (isinstance(expr, FuncCall) and expr.func in _PER_PERIOD_AGGREGATES
+            and _per_period_call(expr)):
+        if expr.func == 'PRODUCT' and sum(map(_is_time_varying, expr.args)) >= 2:
+            return _flow_regrain(expr, grain)
+        from .. import functions as fns
+        return getattr(fns, expr.func)(*[_recompute(a, grain, cache) for a in expr.args])
     if isinstance(expr, (Compare, FuncCall)) and (
             not isinstance(expr, FuncCall) or expr.func in _RECOMPUTE_FUNCS):
         # NON-LINEAR forms (mo.IF — the tax line — comparisons,
@@ -131,6 +146,16 @@ def _recompute(expr: Any, grain: str, cache: Dict[int, Any]) -> Any:
             "(costs, one-time capex), values='mean' for prices / rates."
         )
     raise ValueError(_unsupported(f"{type(expr).__name__} expressions"))
+
+
+def _per_period_call(call: FuncCall) -> bool:
+    """A call over as many operands as its ``per_period_arity`` or more, a
+    series among them — one call per period."""
+    from ..functions._helpers import series_node
+    from ..functions.registry import per_period_arity
+    arity = per_period_arity(call.func)
+    return (arity is not None and len(call.args) >= arity
+            and any(series_node(arg) for arg in call.args))
 
 
 def _is_time_varying(expr: Any, _seen: Optional[set] = None) -> bool:
@@ -219,7 +244,7 @@ def _native_eval(expr: Any) -> Any:
         if fn is None:
             raise ValueError(_unsupported(f"comparison {expr.op!r}"))
         return fn(_native_eval(expr.left), _native_eval(expr.right))
-    if isinstance(expr, FuncCall) and expr.func in _RECOMPUTE_FUNCS:
+    if isinstance(expr, FuncCall) and expr.func in _RECOMPUTE_FUNCS + _PER_PERIOD_AGGREGATES:
         from .. import functions as _fns
         fn = getattr(_fns, expr.func)
         args = [
@@ -756,7 +781,16 @@ def _project_time_row(var: Any, loc: Any, grain: str) -> Variable:
     coarse_first = coarse_first_day(loc.start, loc.grain, first_day, grain)
     full = time_field_series('days', buckets[0][0], grain, len(buckets), coarse_first)
     native_days = time_field_series('days', loc.start, loc.grain, n, first_day)
-    if all(sum(native_days[lo:hi]) == full[k] for k, (_, lo, hi) in enumerate(buckets)):
+    def whole(k: int, lo: int, hi: int) -> bool:
+        got = sum(native_days[lo:hi])
+        # An hour's 1/24 of a day sums in floating point.
+        return got == full[k] if isinstance(got, int) else math.isclose(got, full[k])
+    # A clock ruler's periods end where they stop; a day's end is its last
+    # day. Over hours, a day's time is its hours' — first start, last
+    # stop, their days — never re-spelled at the day's own reading.
+    from .calendar import GREGORIAN
+    clock = GREGORIAN.knows(loc.grain) and GREGORIAN.ruler(loc.grain).sub_day
+    if not clock and all(whole(k, lo, hi) for k, (_, lo, hi) in enumerate(buckets)):
         return time_variable(field, DefaultWindow(buckets[0][0], grain, len(buckets),
                                                   None, coarse_first))
     # A window that starts or ends inside a quarter: its first or last
@@ -770,9 +804,18 @@ def _project_time_row(var: Any, loc: Any, grain: str) -> Variable:
         values.append({'start': native['start'][lo], 'end': native['end'][hi - 1],
                        'days': sum(native['days'][lo:hi]),
                        'months': sum(native['months'][lo:hi]), 'index': k + 1}[field])
-    out = Variable(values, value_type='datetime' if field in ('start', 'end') else 'int',
+    kind = 'datetime' if field in ('start', 'end') else (
+        'int' if all(isinstance(v, int) for v in values) else 'float')
+    out = Variable(values, value_type=kind,
                    var_type='list', start=buckets[0][0], grain=grain)
     out._first_day = coarse_first
+    recipe = {'start': 'first', 'end': 'last', 'days': 'sum'}.get(field)
+    if clock and recipe is not None:
+        # Over hours a day's time is read off its hours' own cells — the
+        # first start, the last stop, the sum of the days — a live formula
+        # wherever the row is laid out, its values where it is not.
+        out._set_expr(Regrain(source=var, buckets=[(lo, hi) for _, lo, hi in buckets],
+                              recipe=recipe, fill_values=list(values)))
     return out
 
 

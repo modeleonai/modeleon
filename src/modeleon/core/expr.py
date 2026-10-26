@@ -31,7 +31,7 @@ from __future__ import annotations
 
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterator, List, Optional, TYPE_CHECKING, Union
+from typing import Any, Dict, Iterator, List, Optional, Set, TYPE_CHECKING, Union
 
 if TYPE_CHECKING:
     from .variable import Variable
@@ -40,9 +40,11 @@ if TYPE_CHECKING:
 # ─── Base ────────────────────────────────────────────────────────────
 
 
-#: Variables whose expression is being inlined into a formula string
-#: right now — see :meth:`VarRef.to_string`.
-_INLINING: ContextVar[frozenset] = ContextVar('modeleon_inlining', default=frozenset())
+#: Ids of the Variables whose expressions are being inlined into a
+#: formula string right now — see :meth:`VarRef.to_string`. ``None``
+#: outside a render; the outermost inlining frame of a context owns the
+#: set and clears the variable when it returns.
+_INLINING: ContextVar[Optional[Set[int]]] = ContextVar('modeleon_inlining', default=None)
 
 
 class Expr:
@@ -114,12 +116,16 @@ class VarRef(Expr):
     var: "Variable"
 
     def to_string(self) -> str:
+        var = self.var
         # Prefer python_name (set by ``parent.child = ...``). For unattached
         # Variables with an explicit display_name, snake-case the label so
-        # formulas read ``revenue * 0.6`` instead of ``v3 * 0.6``.
-        if self.var.python_name:
-            return self.var.python_name
-        explicit_label = getattr(self.var, '_display_name', None)
+        # formulas read ``revenue * 0.6`` instead of ``v3 * 0.6``. The
+        # field is read directly: the property is a plain accessor and
+        # this is the most visited line of a formula render.
+        name = var._python_name
+        if name:
+            return name
+        explicit_label = getattr(var, '_display_name', None)
         if explicit_label:
             from .humanize import identifier_from_label
             return identifier_from_label(explicit_label)
@@ -131,22 +137,36 @@ class VarRef(Expr):
         # ``(revenue * cogs_pct) * units`` render as their composite
         # algebra rather than an opaque floating id. Wrap in parens for
         # precedence safety — the inlined expression may itself be a BinOp.
-        inner_expr = getattr(self.var, '_expr', None)
+        inner_expr = getattr(var, '_expr', None)
         if isinstance(inner_expr, TimeRef):
             return inner_expr.to_string()
         if inner_expr is not None:
             # A row of a loop across periods reads itself through ``lag``;
             # once detached from its container it has no name to stop the
-            # inlining, so a second visit prints its id instead.
-            inlining = _INLINING.get()
-            if id(self.var) in inlining:
-                return self.var.path.leaf
-            token = _INLINING.set(inlining | {id(self.var)})
+            # inlining, so a second visit prints its id instead. The ids
+            # being inlined live in one mutable set per context: the
+            # outermost frame creates it, every frame below adds its id on
+            # the way in and removes it on the way out, so at any moment
+            # the set holds exactly the frames on the stack — a chain of
+            # intermediates costs one ContextVar round trip instead of a
+            # fresh set and two ContextVar operations per level. The
+            # ContextVar keeps renders on other threads and tasks apart.
+            key = id(var)
+            active = _INLINING.get()
+            if active is None:
+                token = _INLINING.set({key})
+                try:
+                    return f"({inner_expr.to_string()})"
+                finally:
+                    _INLINING.reset(token)
+            if key in active:
+                return var.path.leaf
+            active.add(key)
             try:
                 return f"({inner_expr.to_string()})"
             finally:
-                _INLINING.reset(token)
-        return self.var.path.leaf
+                active.discard(key)
+        return var.path.leaf
 
     def iter_refs(self) -> Iterator["Variable"]:
         yield self.var
@@ -265,7 +285,7 @@ class ListExpr(Expr):
     items: List[Expr] = field(default_factory=list)
 
     def to_string(self) -> str:
-        return f"[{', '.join(item.to_string() for item in self.items)}]"
+        return f"[{', '.join([item.to_string() for item in self.items])}]"
 
     def iter_refs(self) -> Iterator["Variable"]:
         for item in self.items:
@@ -301,7 +321,7 @@ class FuncCall(Expr):
     compute_backends: Optional[frozenset] = None
 
     def to_string(self) -> str:
-        return f"{self.func}({', '.join(a.to_string() for a in self.args)})"
+        return f"{self.func}({', '.join([a.to_string() for a in self.args])})"
 
     def iter_refs(self) -> Iterator["Variable"]:
         for arg in self.args:

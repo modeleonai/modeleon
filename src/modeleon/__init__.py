@@ -44,14 +44,15 @@ Multi-period structure is a plain list-valued Variable —
 
 Package layout:
     core/       - Variable, MultiVariable, QPath, Unit, Expr AST
-    functions/  - IF, SUM, MAX, MIN, AVERAGE, ABS, ROUND, INT, MOD,
-                  recurrence, IRR, NPV, XIRR, PMT, FV, PV, …
+    functions/  - IF, IFERROR, SUM, SUMIFS, XLOOKUP, INDEX, MATCH, ROUND,
+                  MEDIAN, PERCENTILE_INC, recurrence, IRR, NPV, PMT, RATE,
+                  SLN, … (the registry says how each is written)
     compile/    - AST renderers + layout + .xlsx writer (Excel, JSON)
     display/    - notebook HTML rendering
     plugins.py  - extension point registry
 """
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 
 # Plugin system — extensions register via entry points
 from modeleon.plugins import load_plugins as _load_plugins
@@ -81,7 +82,7 @@ from modeleon.core.unit import Unit
 from modeleon.compile import check_compat, to_json
 
 # Excel presentation view — declared-once, cascading layout/styling
-from modeleon.compile.excel.view import ExcelView, house_view
+from modeleon.compile.excel.view import ExcelView, applied_view, house_view
 
 # Pre-built DSL helpers
 from modeleon.functions import (
@@ -89,18 +90,30 @@ from modeleon.functions import (
     pyformula,
     # Aggregates
     SUM, MAX, MIN, AVERAGE,
+    # Conditional aggregates and counts
+    SUMIF, SUMIFS, COUNTIF, COUNTIFS, AVERAGEIF, AVERAGEIFS, MAXIFS, MINIFS, COUNT, COUNTA,
     # Math
-    ABS, ROUND, INT, MOD,
+    ABS, ROUND, INT, MOD, ROUNDUP, ROUNDDOWN, TRUNC, CEILING, FLOOR, POWER, SQRT, EXP, LN,
+    LOG, LOG10, SIGN, PRODUCT,
     # Conditional / logical
-    IF, AND, OR, NOT, CHOOSE, ISBLANK,
+    IF, AND, OR, NOT, CHOOSE, ISBLANK, IFERROR, ISERROR, ISNUMBER, XOR, IFS, SWITCH,
+    # Lookup / reference
+    MATCH, INDEX, XLOOKUP, VLOOKUP, HLOOKUP,
     # Dates
     YEAR, MONTH, DAY, DATE, EDATE, EOMONTH, DAYS360, YEARFRAC, DAYS, TODAY,
+    DATEDIF, WEEKDAY, WEEKNUM, NETWORKDAYS, WORKDAY,
     # Text
-    LEN, UPPER, LOWER, CONCAT,
+    LEN, UPPER, LOWER, CONCAT, LEFT, RIGHT, MID, TRIM, FIND, SEARCH, SUBSTITUTE, VALUE, TEXT,
+    REPT, TEXTJOIN,
     # Recurrence / cohort / shift
     cumsum, lag, recurrence, recurrence_sum, cohort_retention, schedule,
     # Financial
     IRR, NPV, XIRR, XNPV, PMT, FV, PV,
+    NPER, IPMT, PPMT, RATE, CUMIPMT, CUMPRINC, SLN, DB, DDB, SYD,
+    # Statistics
+    MEDIAN, STDEV_S, STDEV_P, VAR_S, VAR_P, PERCENTILE_INC, PERCENTILE_EXC, QUARTILE_INC,
+    QUARTILE_EXC, LARGE, SMALL, RANK_EQ, RANK_AVG,
+    STDEV, STDEVP, VAR, VARP, PERCENTILE, QUARTILE, RANK,
 )
 
 # The process-wide default view — EVERY value the engine uses, made explicit so
@@ -140,6 +153,7 @@ __all__ = [
     "Model",
     "Unit",
     "ExcelView",
+    "applied_view",
     "default_excel_view",
     "house_view",
     # Exceptions / warnings
@@ -159,14 +173,51 @@ __all__ = [
     "NOT",
     "ISBLANK",
     "CHOOSE",
+    "IFERROR",
+    "ISERROR",
+    "ISNUMBER",
+    "XOR",
+    "IFS",
+    "SWITCH",
     "SUM",
     "MAX",
     "MIN",
     "AVERAGE",
+    # Conditional aggregates and counts
+    "SUMIF",
+    "SUMIFS",
+    "COUNTIF",
+    "COUNTIFS",
+    "AVERAGEIF",
+    "AVERAGEIFS",
+    "MAXIFS",
+    "MINIFS",
+    "COUNT",
+    "COUNTA",
+    # Math
     "ABS",
     "ROUND",
     "INT",
     "MOD",
+    "ROUNDUP",
+    "ROUNDDOWN",
+    "TRUNC",
+    "CEILING",
+    "FLOOR",
+    "POWER",
+    "SQRT",
+    "EXP",
+    "LN",
+    "LOG",
+    "LOG10",
+    "SIGN",
+    "PRODUCT",
+    # Lookup / reference
+    "MATCH",
+    "INDEX",
+    "XLOOKUP",
+    "VLOOKUP",
+    "HLOOKUP",
     # Dates
     "YEAR",
     "MONTH",
@@ -178,11 +229,27 @@ __all__ = [
     "YEARFRAC",
     "DAYS",
     "TODAY",
+    "DATEDIF",
+    "WEEKDAY",
+    "WEEKNUM",
+    "NETWORKDAYS",
+    "WORKDAY",
     # Text
     "LEN",
     "UPPER",
     "LOWER",
     "CONCAT",
+    "LEFT",
+    "RIGHT",
+    "MID",
+    "TRIM",
+    "FIND",
+    "SEARCH",
+    "SUBSTITUTE",
+    "VALUE",
+    "TEXT",
+    "REPT",
+    "TEXTJOIN",
     # Domain helpers (no Excel equivalent — stay lowercase)
     "cumsum",
     "cohort_retention",
@@ -203,4 +270,35 @@ __all__ = [
     "PMT",
     "FV",
     "PV",
+    "NPER",
+    "IPMT",
+    "PPMT",
+    "RATE",
+    "CUMIPMT",
+    "CUMPRINC",
+    "SLN",
+    "DB",
+    "DDB",
+    "SYD",
+    # Statistics
+    "MEDIAN",
+    "STDEV_S",
+    "STDEV_P",
+    "VAR_S",
+    "VAR_P",
+    "PERCENTILE_INC",
+    "PERCENTILE_EXC",
+    "QUARTILE_INC",
+    "QUARTILE_EXC",
+    "LARGE",
+    "SMALL",
+    "RANK_EQ",
+    "RANK_AVG",
+    "STDEV",
+    "STDEVP",
+    "VAR",
+    "VARP",
+    "PERCENTILE",
+    "QUARTILE",
+    "RANK",
 ]

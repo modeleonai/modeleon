@@ -570,3 +570,175 @@ class TestMultiVariableClassNodeKwargs:
         n = Named.__shell__(code=99, description="d")
         assert n.component_names == []
         assert n.description == "d"
+
+
+class TestAdoptionRefusals:
+    """A container assigned under a second name inside its own tree —
+    ``model.m = model`` — used to recurse until Python gave up.
+    Refused with the alias to write, spelled in the author's own names;
+    the container is untouched."""
+
+    def test_a_container_cannot_hold_itself(self):
+        m = Model("m", default_grain="year", default_start="2026", default_periods=2)
+        with pytest.raises(ValueError, match=r"cannot hold itself.*`with m as alias:`"):
+            m.alias = m
+        assert "alias" not in m._components
+        assert type(m) is Model  # not demoted on the way to the refusal
+
+    def test_a_container_cannot_hold_its_ancestor(self):
+        m = Model("m", default_grain="year", default_start="2026", default_periods=2)
+        m.sub = MultiVariable("sub")
+        with pytest.raises(
+            ValueError, match=r"`m\.sub\.back = m`: .*one of its ancestors.*`with m as back:`"
+        ):
+            m.sub.back = m
+        assert "back" not in m.sub._components
+
+    def test_the_hint_spells_the_names_the_author_bound(self):
+        """``mo.Model('m')`` bound as ``model``: the hint says ``model``;
+        a holder is spelled from the highest bound ancestor
+        (``model.sub``, not the block's alias ``s``), an unattached
+        container by its own name."""
+        model = Model("m", default_grain="year", default_start="2026", default_periods=2)
+        with model:
+            model.sub = MultiVariable("sub")
+            with model.sub as s:
+                with pytest.raises(
+                    ValueError, match=r"`model\.sub\.back = model`: .*`with model as back:`"
+                ):
+                    s.back = model
+        with MultiVariable("Debt", loop=True) as debt:
+            with pytest.raises(ValueError, match=r"`debt\.me = debt`: .*`with debt as me:`"):
+                debt.me = debt
+
+    def test_the_same_name_points_at_a_plain_block(self):
+        m = Model("m")
+        with pytest.raises(ValueError, match=r"`with m:`"):
+            m.m = m
+
+    def test_a_missing_component_says_how_to_assign_it(self):
+        m = Model("m")
+        m.sub = MultiVariable("sub")
+        with pytest.raises(
+            AttributeError,
+            match=r"has no component 'rate'.*`m\.sub\.rate = mo\.Variable\(\.\.\.\)`.*loop=True",
+        ):
+            m.sub.rate
+
+    def test_the_missing_component_hint_is_python(self):
+        """The display name ('Income Statement') and the declared name
+        ('m' bound as ``model``) are never the hint's spelling."""
+        with MultiVariable("Income Statement") as income:
+            with pytest.raises(AttributeError, match=r"`income\.revenue = mo\.Variable"):
+                income.revenue
+        model = Model("m")
+        with pytest.raises(AttributeError, match=r"`model\.revenue = mo\.Variable"):
+            model.revenue
+        # A probe with a default still answers the default.
+        assert getattr(model, "revenue", None) is None
+
+    def test_the_hint_survives_the_line_it_points_at(self):
+        """A comprehension's variable is gone before the line the hint
+        says to write, so the hint is spelled from the model (``model.b``);
+        a global the frame's own parameter shadows is not the model's
+        name there; a setting of the container is never offered as a row."""
+        model = Model("m", default_grain="year", default_start="2026", default_periods=2)
+        model.a = MultiVariable("a")
+        model.b = MultiVariable("b")
+        model.a.revenue = Variable([1.0, 2.0])
+        with pytest.raises(AttributeError, match=r"`model\.b\.revenue = mo\.Variable"):
+            [seg.revenue for seg in (model.a, model.b)]
+        with pytest.raises(AttributeError, match=r"`model\.b\.revenue = mo\.Variable"):
+            (lambda q: q.revenue)(model.b)
+
+        base = model
+        other = Model("other")
+        other.b = MultiVariable("b")
+
+        def read(model):  # the parameter shadows the name ``model``
+            return base.b.revenue
+
+        with pytest.raises(AttributeError, match=r"`base\.b\.revenue = mo\.Variable"):
+            read(other)
+        with pytest.raises(AttributeError, match=r"has no component 'default_periods'$"):
+            Model("bare").default_periods
+        with pytest.raises(AttributeError, match=r"has no component 'default_zone'$"):
+            Model("bare").default_zone
+
+
+class TestAHorizonByAssignment:
+    @pytest.fixture(autouse=True)
+    def _no_model_noted(self):
+        # The model last given a horizon is process-wide state: start from
+        # none, so a model an earlier test built cannot answer for this one.
+        from dataclasses import replace
+
+        from modeleon.core import mv_context
+
+        ctx = mv_context._loop_context
+        token = ctx.set(replace(ctx.get(), windowed=None))
+        yield
+        ctx.reset(token)
+
+    def test_a_model_given_its_horizon_by_assignment_is_the_window_time_finds(self):
+        """``m.default_periods = 3`` marks the model last given a horizon,
+        as the constructor does: a line reading ``mo.time`` outside the
+        model's ``with`` block (its lines written without the block) finds
+        the window there (it used to raise "there is no model window here")."""
+        import modeleon as mo
+
+        m = Model("m")
+        m.default_grain = "quarter"
+        m.default_periods = 3
+        m.default_start = "2031-Q2"
+        m.pnl = MultiVariable("pnl")
+        m.pnl.days = mo.time.days
+        assert list(m.pnl.days.value) == [91, 92, 92]
+
+    def test_a_refused_change_of_horizon_notes_nothing(self):
+        """A model whose lines already read the window refuses a new
+        horizon; the refused model is not the one ``mo.time`` finds next."""
+        import modeleon as mo
+
+        m = Model("m", default_grain="month", default_start="2026-01", default_periods=3)
+        m.pnl = MultiVariable("pnl")
+        m.pnl.days = mo.time.days
+        other = Model("other", default_grain="month", default_start="2031-05", default_periods=2)
+        with pytest.raises(ValueError):
+            m.default_periods = 99
+        x = MultiVariable("x")
+        x.d = mo.time.days
+        assert list(x.d.value) == [31, 30]      # other's window, not m's
+
+
+class TestAPlainValueUnderAComponentName:
+    """A line overwritten by a plain number keeps its name: removing it,
+    deleting it or moving its container works as for a line."""
+
+    def _model(self):
+        m = Model("m", default_grain="month", default_start="2026-01", default_periods=4)
+        with m:
+            m.inputs = MultiVariable("Inputs")
+            m.inputs.rate = Variable(0.05, display_name="rate")
+            m.inputs.a = Variable([1.0, 2.0, 3.0, 4.0], display_name="a")
+            m.y = MultiVariable("Y", default_grain="month", default_start="2026-03",
+                                   default_periods=4)
+        m.inputs.rate = 0.05
+        return m
+
+    def test_remove(self):
+        m = self._model()
+        assert m.inputs.remove("rate") == 0.05
+        assert "rate" not in m.inputs._component_names
+
+    def test_del(self):
+        m = self._model()
+        del m.inputs.rate
+        assert "rate" not in m.inputs._component_names
+
+    def test_its_container_moved(self):
+        m = self._model()
+        inputs = m.remove("inputs")
+        m.y.inputs = inputs
+        assert m.y.inputs.a.time.start == "2026-03"
+        assert m.y.inputs.a.id == "m.y.inputs.a"

@@ -166,13 +166,13 @@ Balance   B5: =Inputs!B6 - Inputs!C4 - B4   C5: =B5 - Inputs!D4 - C4
 ```
 
 A cycle that does not pass through `mo.lag` is refused by name — it
-would need a fixed point, not an order. So is `SUM` (or `MAX`/`MIN` over
-one operand) of a loop row inside the loop: those read a whole series. A
-per-period floor or cap is `mo.MAX(x, 0)` / `mo.MIN(sweep, balance)` —
-`MIN`/`MAX` over two or more operands work period by period, inside the
-loop too, and write `=MIN(C2, C3)` in every column. A class is a loop
-container for every instance with `class Tranche(mo.MultiVariableClass,
-loop=True)`.
+would need a fixed point, not an order. So is `SUM`, `MAX` or `MIN` over
+one operand of a loop row inside the loop: it reads a whole series. Over
+two or more operands they work period by period, inside the loop too: a
+per-period floor or cap is `mo.MAX(x, 0)` / `mo.MIN(sweep, balance)`, a
+subtotal `mo.SUM(a, b)`, written `=MIN(C2, C3)` / `=SUM(C2, C3)` in every
+column. A class is a loop container for every instance with `class
+Tranche(mo.MultiVariableClass, loop=True)`.
 
 ---
 
@@ -185,12 +185,32 @@ Standard library functions emit live formulas, not values:
 ```python
 mo.IRR(cf)       # =IRR(B2:F2, 0.1)
 mo.NPV(0.1, cf)  # =NPV(0.1, B2:F2)
+mo.SUM(revenue)                 # =SUM(B2:F2) — the total over the periods
+mo.SUM(product_a, product_b)    # =SUM(B2, B3) in every period — a subtotal of two lines
 mo.IF(rev > 0, rev * 0.25, 0)   # =IF(B1>0, B1*0.25, 0)
 mo.CHOOSE(scenario, base, bull) # =CHOOSE(B1, B4, B5) in every period — one scenario cell switches the row
 mo.EOMONTH(start, 1)            # =EOMONTH(B1, 1)
+mo.IFERROR(cost / units, 0)     # =IFERROR(B7 / B8, 0) in every period — a zero divisor shows 0
+mo.SUMIFS(amount, region, "North")  # =SUMIFS(C6:E6, C5:E5, "North")
+mo.XLOOKUP(year, years, inflation)  # =_xlfn.XLOOKUP(B4, C2:E2, C3:E3)
+mo.PERCENTILE_INC(multiples, 0.25)  # =_xlfn.PERCENTILE.INC(Comps!C3:C9, 0.25) — a field down a table
+mo.MEDIAN([p.revenue for p in peers])  # each year: =MEDIAN(Peers!C3:C9), =MEDIAN(Peers!D3:D9), …
 ```
 
-Also: `IRR`, `NPV`, `XIRR`, `XNPV`, `PMT`, `FV`, `PV` · `SUM`, `MAX`, `MIN`, `AVERAGE` · `IF`, `AND`, `OR`, `NOT`, `CHOOSE` · `ABS`, `ROUND`, `INT`, `MOD` · `YEAR`, `MONTH`, `DAY`, `DAYS`, `YEARFRAC`, `EDATE`, `EOMONTH`, `DATE`, `TODAY` · `CONCAT`, `UPPER`, `LOWER`, `LEN`. All emit live formulas.
+| Family | Functions |
+|---|---|
+| Aggregates | `SUM`, `MAX`, `MIN`, `AVERAGE`, `PRODUCT` |
+| Conditional aggregates | `SUMIF`, `SUMIFS`, `COUNTIF`, `COUNTIFS`, `AVERAGEIF`, `AVERAGEIFS`, `MAXIFS`, `MINIFS`, `COUNT`, `COUNTA` |
+| Logic and errors | `IF`, `IFS`, `SWITCH`, `CHOOSE`, `AND`, `OR`, `NOT`, `XOR`, `IFERROR`, `ISERROR`, `ISNUMBER`, `ISBLANK` |
+| Lookup | `XLOOKUP`, `INDEX`, `MATCH`, `VLOOKUP`, `HLOOKUP` |
+| Math and rounding | `ABS`, `ROUND`, `ROUNDUP`, `ROUNDDOWN`, `TRUNC`, `INT`, `MOD`, `CEILING`, `FLOOR`, `POWER`, `SQRT`, `EXP`, `LN`, `LOG`, `LOG10`, `SIGN` |
+| Financial | `IRR`, `NPV`, `XIRR`, `XNPV`, `PMT`, `FV`, `PV`, `NPER`, `RATE`, `IPMT`, `PPMT`, `CUMIPMT`, `CUMPRINC` |
+| Depreciation | `SLN`, `DB`, `DDB`, `SYD` |
+| Dates | `DATE`, `YEAR`, `MONTH`, `DAY`, `DAYS`, `DAYS360`, `YEARFRAC`, `DATEDIF`, `EDATE`, `EOMONTH`, `WEEKDAY`, `WEEKNUM`, `NETWORKDAYS`, `WORKDAY`, `TODAY` |
+| Text | `LEN`, `UPPER`, `LOWER`, `CONCAT`, `LEFT`, `RIGHT`, `MID`, `TRIM`, `FIND`, `SEARCH`, `SUBSTITUTE`, `VALUE`, `TEXT`, `REPT`, `TEXTJOIN` |
+| Statistics | `MEDIAN`, `STDEV_S`, `STDEV_P`, `VAR_S`, `VAR_P`, `PERCENTILE_INC`, `PERCENTILE_EXC`, `QUARTILE_INC`, `QUARTILE_EXC`, `LARGE`, `SMALL`, `RANK_EQ`, `RANK_AVG`, and the older `STDEV`, `STDEVP`, `VAR`, `VARP`, `PERCENTILE`, `QUARTILE`, `RANK` |
+
+All emit live formulas. A function of one value per period, given a row, is one call per period (`=ROUNDUP(C9, 1)`, `=ROUNDUP(D9, 1)`, …) and runs inside a loop container too. A row given where a function takes one value is read per period as well: `mo.ROUND(x, digits)` is `=ROUND(C9, C10)` and `mo.PMT(rate / 100, 12, 1000)` is `=PMT(C9 / 100, 12, 1000, 0, 0)` in each column. Every function reads rows on other time windows by date and rows along keys key by key, as `a + b` reads them (the workbook reads the cell of the same date, and the row's `extend=` rule where it has none); a loop container's rows read them so too. A formula over a row runs on that row's window and, carrying no `extend=` rule, must cover the combined window: `mo.IF(fee > 15, rev, 0)` with `fee` on a tranche's window asks for a line with a rule, `m.t.big = mo.Variable(m.t.fee > 15, extend=mo.zero())`. Every aggregate follows one rule: several series given to it — `SUM`, `AVERAGE`, `MIN`, `MAX`, `PRODUCT`, `COUNT`, `COUNTA`, `MEDIAN`, `STDEV_S`, `STDEV_P`, `VAR_S` or `VAR_P` — or listed as a percentile's or a rank's range, are combined period by period, as `a + b` is (`mo.SUM(a, b)` is `=SUM(C5, C9)` and `mo.MEDIAN(plan, actual)` is `=MEDIAN(C5, C9)` in each column); one row alone is reduced over its periods (`mo.SUM(a)` is `=SUM(C5:N5)`); scalars only stay one number. The total of several rows over all their periods is `mo.SUM(a) + mo.SUM(b)`. A function Excel added after 2007 is stored with the `_xlfn.` prefix the file format expects, and a name Excel spells with a dot is written with an underscore (`mo.PERCENTILE_INC` is `PERCENTILE.INC`).
 
 ---
 

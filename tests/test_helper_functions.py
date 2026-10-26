@@ -94,8 +94,12 @@ class TestVariadic:
         assert mo.SUM(mo.Variable([10, 20, 30]))._value == 60
 
     def test_sum_mixed_variable_and_scalar(self):
+        # A series and a scalar: the scalar is added in every period, as
+        # ``a + 100`` adds it; the total of the series and the scalar is
+        # ``mo.SUM(row) + 100``.
         result = mo.SUM(mo.Variable([10, 20]), 100)
-        assert result._value == 130
+        assert result._value == [110, 120]
+        assert (mo.SUM(mo.Variable([10, 20])) + 100)._value == 130
 
     def test_sum_all_scalars_returns_variable(self):
         # =SUM(1, 2, 3) is a valid Excel formula — so we return a Variable,

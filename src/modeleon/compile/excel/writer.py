@@ -20,9 +20,11 @@ Typical caller path::
 
 from __future__ import annotations
 
+import functools
 import logging
 import numbers
 import re
+import warnings
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Optional
@@ -46,7 +48,7 @@ from .layout import (
 )
 from .addresses import VariableAddresses
 from .view import resolve_excel_view, units_hidden
-from ...core.expr import ListExpr, Literal
+from ...core.expr import FuncCall, ListExpr, Literal
 from ...core.multi_variable import MultiVariableBase
 from ...core.variable import Variable
 
@@ -64,6 +66,10 @@ def _refuse_pending_rows(root: "MultiVariableBase") -> None:
             raise ValueError(pending_message(var))
 
 
+#: The package's own frames: a warning raised to the author skips them.
+_ENGINE_DIR = str(Path(__file__).resolve().parents[2])
+
+
 def to_excel(path: str | Path, root: "MultiVariableBase") -> None:
     """Write a model to an ``.xlsx`` file.
 
@@ -77,7 +83,15 @@ def to_excel(path: str | Path, root: "MultiVariableBase") -> None:
     """
     path = Path(path)
     _refuse_pending_rows(root)
-    from .view import resolve_excel_view
+    from ...core.mv_context import author_frame, spelled
+    from .view import UnreadViewWarning, resolve_excel_view, unread_view_notes
+    frame = author_frame()
+    for _path, note in unread_view_notes(
+        [root], spell=lambda node: spelled(node, frame),
+    ):
+        # A view nothing reads: the book keeps its look, and a warning tells
+        # the author where the view goes — on the line that asked for the book.
+        warnings.warn(note, UnreadViewWarning, skip_file_prefixes=(_ENGINE_DIR,))
     track_mode = resolve_excel_view(root).tracks or 'rows'
     root = expand_tracked_tree(root, mode=track_mode)
     # (no compare SELECTION is passed here: a declared tracks='compare'
@@ -100,6 +114,10 @@ def to_excel(path: str | Path, root: "MultiVariableBase") -> None:
     # section row in t's sheet rather than dropping it.
     engine = LayoutEngine(roots, flatten_nested_sheets=True, header_rows=True)
     addresses = engine.compute_addresses()
+    if engine.refusals:
+        # The layout found a line it has no place for — no book while it
+        # stands; the message says where the line belongs.
+        raise ValueError(engine.refusals[0])
     if not addresses:
         raise ValueError(
             "Tabs exist but contain no Variables. "
@@ -248,13 +266,14 @@ def _refuse_lines_off_the_window(
         window = engine.window_by_sheet.get(id(sheet_mv))
         if window is None or window.start is None or window.grain is None:
             continue    # undated columns: no date to put a line under
+        clean: dict[int, ListExpr] = {}
         for var in engine._iter_sheet_variables(sheet_mv):
             if var.id not in addresses:
                 continue
             source, loc = var, _off_window(var, window)
             if loc is None and var._expr is not None:
                 read = _reads_unwritten_off_window(
-                    var._expr, window, addresses, set()
+                    var._expr, window, addresses, set(), clean
                 )
                 if read is not None:
                     source, loc = read, read.time
@@ -264,6 +283,9 @@ def _refuse_lines_off_the_window(
         return
 
     def _name(v: Variable) -> str:
+        if not (v._display_name or getattr(v, '_python_name', None)):
+            from ...core.variable_ops import _line_name
+            return _line_name(v)
         return (f"'{v.display_name}'" if v.path.is_floating
                 else f"'{v.display_name}' ({v.path})")
 
@@ -306,10 +328,12 @@ def _periods_of(var: Variable) -> Optional[int]:
     return getattr(value, 'time_length', None)
 
 
-def _off_window(var: Variable, window: Any) -> Any:
+def _off_window(var: Variable, window: Any, periods: bool = True) -> Any:
     """``var``'s time location when it is a series that does not run
     on ``window``; ``None`` when it does, or carries no dates at all (a
-    constant, a coordinate row, a row of axis labels)."""
+    constant, a coordinate row, a row of axis labels). ``periods``: a
+    line placed by its own ``start=`` must also hold one value per period
+    of the window."""
     from ...core.time import Time, _parse
     from .layout import _is_periodic
 
@@ -335,7 +359,7 @@ def _off_window(var: Variable, window: Any) -> Any:
     # it was given — it is never stretched to the window the way a bare
     # list with extend= is. Shorter or longer than the window, a formula
     # reading it in the book would pair periods Python does not pair.
-    if var._grain is not None and window.periods is not None:
+    if periods and var._grain is not None and window.periods is not None:
         n = _periods_of(var)
         if n is not None and n != window.periods:
             return loc
@@ -344,6 +368,7 @@ def _off_window(var: Variable, window: Any) -> Any:
 
 def _reads_unwritten_off_window(
     expr, window: Any, addresses: dict, seen: set,
+    clean: Optional[dict[int, ListExpr]] = None,
 ) -> Optional[Variable]:
     """The first input ``expr`` reads that the workbook does not write
     and that is declared on a window of its own, or ``None``.
@@ -355,22 +380,70 @@ def _reads_unwritten_off_window(
     intermediates (``a + b`` inside a longer formula) have no cells
     either — the formula is spelled through them, so the walk goes
     through them too, on a stack of its own: ``sum(rows)`` is one such
-    step per row.
+    step per row. A list of lines many formulas share (a range read
+    once, ``RANK`` of each record among its peers) is walked once on
+    the window: ``clean`` keeps, by id, the lists walked through
+    without finding one — never one met again on its own walk's way
+    down (a line reading itself), which another walk could not trust.
     """
-    pending = [iter(expr.iter_refs())]
+    pending: list[tuple[Any, Optional[int], bool]] = [
+        (_refs_walked(expr, clean), None, _reduces(expr))]
+    walking: set[int] = set()
+    looped = False
     while pending:
-        ref = next(pending[-1], None)
+        refs, owner, reduced = pending[-1]
+        ref = next(refs, None)
         if ref is None:
             pending.pop()
+            if owner is not None:
+                walking.discard(owner)
             continue
-        if id(ref) in seen or ref.id in addresses:
+        if type(ref) is ListExpr:
+            if clean is not None and not looped:
+                clean[id(ref)] = ref
+            continue
+        if id(ref) in seen:
+            looped = looped or id(ref) in walking
+            continue
+        if ref.id in addresses:
             continue
         seen.add(id(ref))
         if ref._expr is not None:
-            pending.append(iter(ref._expr.iter_refs()))
+            if (not reduced and ref._read_by_date and ref._grain is not None
+                    and _off_window(ref, window, periods=False) is not None):
+                # Its operands were read by date onto a window of its own
+                # (two windows met in it); written from the sheet's first
+                # column, its periods would sit under other dates. A
+                # reduction over it (a total) reads no dates.
+                return ref
+            walking.add(id(ref))
+            pending.append((_refs_walked(ref._expr, clean), id(ref), _reduces(ref._expr)))
         elif ref._grain is not None and _off_window(ref, window) is not None:
             return ref
     return None
+
+
+def _reduces(expr: Any) -> bool:
+    """Does ``expr`` read its operands as ranges (a reduction, a call over
+    a range), never period by period?"""
+    if type(expr) is not FuncCall:
+        return False
+    from ...functions.registry import is_range_taking
+    return bool(is_range_taking(expr.func))
+
+
+# ``expr.iter_refs()``, a list of lines in ``clean`` left out, each other
+# list a call holds followed by itself — walked through.
+def _refs_walked(expr: Any, clean: Optional[dict[int, ListExpr]]) -> Any:
+    if clean is None or type(expr) is not FuncCall:
+        yield from expr.iter_refs()
+        return
+    for arg in expr.args:
+        if type(arg) is not ListExpr:
+            yield from arg.iter_refs()
+        elif id(arg) not in clean:
+            yield from arg.iter_refs()
+            yield arg
 
 
 def _has_tracked(mv: "MultiVariableBase") -> bool:
@@ -441,8 +514,8 @@ def _section_total_of(child):
                 or getattr(node, '_owner', None))
     while node is not None:
         if isinstance(node, MultiVariableBase):
-            total = next((node._components[n] for n in _TOTAL_NAMES
-                          if n in node._components), None)
+            total = next((node._component(n) for n in _TOTAL_NAMES
+                          if node._has_component(n)), None)
             if (total is not None and total is not child
                     and isinstance(total, Variable)):
                 return total
@@ -541,6 +614,41 @@ def _compare_plan(decl, selection, roles,
     )
 
 
+def _growth_by_calendar(child, window, grain, n, shown_vals):
+    """``growth%`` on a grain with no fixed step a year back (a day):
+    each period over the period the calendar puts a year before it in
+    this window (:func:`~modeleon.core.time.year_back_index`), empty
+    where the window does not reach one. ``None`` when no period has."""
+    from ...core.expr import BinOp, ListExpr, Literal, Subscript, VarRef
+    from ...core.time import year_back_index
+    try:
+        backs = year_back_index(str(window.start), grain, n)
+    except (ValueError, TypeError):
+        return None
+    if all(b is None for b in backs):
+        return None
+    items = []
+    vals = []
+    for t, b in enumerate(backs):
+        if b is None:
+            items.append(Literal(value=None))
+            vals.append(None)
+            continue
+        items.append(BinOp(
+            op='/',
+            left=Subscript(base=VarRef(var=child), key=t),
+            right=Subscript(base=VarRef(var=child), key=b),
+        ))
+        a, d = shown_vals[t], shown_vals[b]
+        vals.append((a / d) if (a is not None and d not in (None, 0)) else None)
+    out = Variable(display_name='')
+    out._value = vals
+    out.var_type = 'list'
+    out._set_expr(ListExpr(items=items))
+    out._metric_no_bucket = True
+    return out
+
+
 def _metric_variable(key, child, default_role, value, copies, plan, decl):
     """One metric COLUMN as a live Variable — one of the four in the
     registry, each an expression the file can hold:
@@ -627,7 +735,15 @@ def _metric_variable(key, child, default_role, value, copies, plan, decl):
         from ...core.time import resolve_default_window
         window = resolve_default_window(child)
         grain = getattr(window, 'grain', None) or 'month'
-        steps = {'month': 12, 'quarter': 4, 'year': 1}.get(grain)
+        # Periods in a year: a growth compares a period with the one a
+        # year before it. A grain of no whole months has no such step.
+        from ...core.calendar import GREGORIAN as _cal
+        months = _cal.ruler(grain).months if _cal.knows(grain) else None
+        steps = 12 // months if months else None
+        if steps is None and _cal.knows(grain) and getattr(window, 'start', None):
+            # No fixed step (a year of days is 365 or 366 of them): the
+            # calendar says which period a year back each one has.
+            return _growth_by_calendar(child, window, grain, n, shown_vals)
         if not steps or n <= steps:
             return None
         # A short first period is no base for a year's growth: the period
@@ -711,6 +827,9 @@ def expand_tracked_tree(root: "MultiVariableBase",
         flat._unit = var._unit
         flat._start = var._start
         flat._grain = var._grain
+        # A line read by date onto its window (a plain line beside a
+        # tracked one) is written so: each operand's cell of the same date.
+        flat._read_by_date = var._read_by_date
         # The coarsening rule MUST ride the emission copy: the totals
         # writer spells a ruled line's bucket as its own arithmetic
         # (=SUM over the month cells). Dropped, the bucket fell to the
@@ -995,7 +1114,7 @@ def _collect_root_sheets(root: "MultiVariableBase") -> list[MultiVariableBase]:
         root, "_is_context", False
     ):
         label = root.display_name or root.python_name or "Sheet1"
-        items = [(n, root._components[n]) for n in root._component_order]
+        items = [(n, root._component(n)) for n in root._component_order]
         claimed = [
             comp
             for _n, comp in items
@@ -1034,7 +1153,7 @@ def _collect_root_sheets(root: "MultiVariableBase") -> list[MultiVariableBase]:
             # Promote a plain MV to a virtual Sheet without mutating the
             # user's model — new wrapper, same components by reference.
             label = mv.display_name or mv.python_name or mv.id
-            items = [(n, mv._components[n]) for n in mv._component_order]
+            items = [(n, mv._component(n)) for n in mv._component_order]
             sheets.append((name, _make_virtual_sheet(label, items, source=mv)))
     from .view import in_sheet_order
 
@@ -1052,7 +1171,7 @@ def _root_parts(
     direct_vars: list[tuple[str, Variable]] = []
     sub_mvs: list[tuple[str, MultiVariableBase]] = []
     for name in root._component_order:
-        comp = root._components[name]
+        comp = root._component(name)
         if isinstance(comp, Variable):
             direct_vars.append((name, comp))
         elif isinstance(comp, MultiVariableBase) and not isinstance(comp, ExcelView):
@@ -1276,6 +1395,8 @@ def _nesting_level(comp: Variable) -> int:
 #: Number formats a period caption wears when it is the period's end
 #: date (``=Time!C3``): what the text caption said, as a date format.
 _LABEL_FORMATS = {
+    'hour': {'iso': 'yyyy-mm-dd"T"hh', 'finance': 'dd mmm yyyy hh:mm',
+             'compact': 'dd-mmm-yy hh:mm'},
     'day': {'iso': 'yyyy-mm-dd', 'finance': 'dd mmm yyyy', 'compact': 'dd-mmm-yy'},
     'month': {'iso': 'yyyy-mm', 'finance': 'mmm yyyy', 'compact': 'mmm-yy'},
     'year': {'iso': 'yyyy', 'finance': 'yyyy', 'compact': 'yyyy'},
@@ -1293,9 +1414,13 @@ def _label_source(translator: Any, sheet_name: str, grain: str) -> Any:
     own = book.sheets.get(sheet_name)
     if own is None:
         return None
-    vid = own.fields.get('end')
+    # The caption shows the period itself: its last day, or — a clock
+    # ruler's period ends where the next starts — its first instant.
+    from ...core.calendar import GREGORIAN
+    shown = 'start' if GREGORIAN.knows(grain) and GREGORIAN.ruler(grain).sub_day else 'end'
+    vid = own.fields.get(shown)
     if vid is None and own.anchor is not None and own.anchor.key == own.key:
-        vid = own.anchor.fields.get('end')
+        vid = own.anchor.fields.get(shown)
     if vid is None:
         return None
     resolve = translator.renderer._resolve_var_addr
@@ -1387,6 +1512,33 @@ def resolve_number_format(comp: Variable) -> str | None:
     return quote_bare_literals(fmt) if fmt else fmt
 
 
+#: Keys of ``ExcelView(formats=...)`` that name a kind of value, not a unit.
+_NOT_UNIT_KEYS = frozenset({"number", "date"})
+
+
+@functools.lru_cache(maxsize=512)
+def _unit_key_of(text: str) -> Optional[tuple]:
+    """A format key read as a unit, for :func:`_format_by_unit`."""
+    from ...core.unit import Unit, unit_key
+    try:
+        return unit_key(Unit.parse(text))
+    except (TypeError, ValueError):
+        return None
+
+
+def _format_by_unit(fmts: dict, unit: Any) -> Optional[str]:
+    """The format keyed by a unit EQUAL to ``unit``: a derived line whose
+    unit prints canonically (``USD/(month * kW)``) finds the one keyed
+    ``'USD/kW/month'``. A pure number matches by its label too, so a
+    ``'%'`` format never dresses a ``'bps'`` line."""
+    from ...core.unit import unit_key
+    want = unit_key(unit)
+    for key, fmt in fmts.items():
+        if fmt and key not in _NOT_UNIT_KEYS and _unit_key_of(key) == want:
+            return fmt
+    return None
+
+
 def _resolve_number_format(comp: Variable) -> str | None:
     layout = getattr(comp, "_excel_layout", None)
     if layout is not None:
@@ -1431,18 +1583,30 @@ def _resolve_number_format(comp: Variable) -> str | None:
             # the generic floor for unitless numerics.
             unit = getattr(comp, "_unit", None)
             if unit is not None:
-                by_unit = fmts.get(str(unit))
+                by_unit = fmts.get(str(unit)) or _format_by_unit(fmts, unit)
                 if by_unit:
                     return by_unit
             number = fmts.get("number")
             if number:
                 return number
         from ...core.time import time_field_of
-        if time_field_of(comp) in ("days", "months", "index"):
+        field = time_field_of(comp)
+        if field in ("days", "months", "index"):
             # A count of days or months spelled as date arithmetic
-            # (end - start + 1) would otherwise show as a date.
+            # (end - start + 1) would otherwise show as a date. An hour's
+            # days are its fraction of a day: shown, not rounded to 0.
+            if field == "days" and _on_clock(comp):
+                return "0.0000"
             return "0"
     return None
+
+
+def _on_clock(comp: Variable) -> bool:
+    """Whether ``comp`` lives on a clock ruler's periods (hours)."""
+    from ...core.calendar import GREGORIAN
+    loc = getattr(comp, "time", None)
+    grain = getattr(loc, "grain", None)
+    return bool(grain) and GREGORIAN.knows(grain) and GREGORIAN.ruler(grain).sub_day
 
 
 def _date_format_of(value: object) -> str | None:
@@ -2132,9 +2296,9 @@ def _write_sheet(
                 # the workbook itself. Summary RIGHT of detail — where
                 # our totals stand.
                 ws.sheet_properties.outlinePr.summaryRight = True
-                _kinds_depth = {"quarter": 0, "year": 0}
-                _enclosers = [k for k in ("year", "quarter")
-                              if k in _plan.buckets]
+                from ...core.calendar import GREGORIAN as _cal
+                from .totals import NATIVE as _native
+                _enclosers = sorted(_plan.buckets, key=_cal.rank, reverse=True)
                 # A period is a GROUP of ``stride`` columns and the
                 # bracket must cover all of them — a level on the
                 # first column alone drew Excel brackets over one
@@ -2146,12 +2310,12 @@ def _write_sheet(
                 _hidden_o = set(group_plan[2]) if group_plan else set()
                 for _ci, (_kind, _bi) in enumerate(_plan.columns):
                     _col_num = _plan.col_of[(_kind, _bi)]
-                    if _kind == "month":
+                    if _kind == _native:
                         _level = len(_enclosers)
-                    elif _kind == "quarter":
-                        _level = 1 if "year" in _plan.buckets else 0
                     else:
-                        _level = 0
+                        # A bucket's total column sits inside the buckets
+                        # coarser than it: a quarter's inside the year.
+                        _level = sum(1 for k in _enclosers if _cal.rank(k) > _cal.rank(_kind))
                     for _si in range(_stride_o):
                         _lv = _level + (1 if _si in _hidden_o else 0)
                         if _lv > 0:
@@ -2919,8 +3083,11 @@ def opening_content(var: Variable, translator: ExcelTranslator, sheet_name: str)
 
 def opening_value(var: Variable) -> Any:
     """The value an opening cell holds (see :func:`opening_content`): the
-    day before the first period for an end row, 0 for a period number —
-    of the row itself, or of the row a header mirror repeats."""
+    day before the first period for an end row (on a clock ruler the
+    instant the first period starts — "period 0" stops there), 0 for a
+    period number — of the row itself, or of the row a header mirror
+    repeats."""
+    from ...core.calendar import GREGORIAN
     from ...core.time import _first_day, _parse, resolve_default_window, time_field_of
     mirrored = getattr(var, "_mirror_of", None)
     src = var if mirrored is None else mirrored
@@ -2937,6 +3104,8 @@ def opening_value(var: Variable) -> Any:
     if not isinstance(first, date):
         first = (getattr(window, "first_day", None)
                  or _first_day(_parse(window.start, window.grain), window.grain))
+    if GREGORIAN.knows(window.grain) and GREGORIAN.ruler(window.grain).sub_day:
+        return first
     return first - timedelta(days=1)
 
 

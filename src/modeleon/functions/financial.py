@@ -1,15 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Financial formula helpers — IRR, NPV, XIRR, XNPV, PMT, FV, PV.
+"""Financial formula helpers — IRR, NPV, XIRR, XNPV, PMT, FV, PV; the
+loan schedule NPER, IPMT, PPMT, RATE, CUMIPMT, CUMPRINC; depreciation
+SLN, DB, DDB, SYD.
 
 Every function builds a live Excel formula (``=IRR(B2:B6)``, ``=PMT(...)``)
 alongside the Python-side value. Pass a Variable (including list-valued
 ones) to get the formula; pass a raw list to get a value-only result —
 the latter is useful for ad-hoc calculations outside the model tree.
+
+Units: the amounts a function reads together — a loan's present and
+future value, a payment and a balance, a cost and its salvage — are in
+one unit, and two are refused, as ``+`` refuses them; the result is in
+it (``NPV`` and ``XNPV`` in their flows'). A rate, a term, a period and
+a type are never the result's unit, and a rate (``IRR``, ``RATE``) or a
+count of periods (``NPER``) carries none.
 """
 
 from __future__ import annotations
 
+import decimal
+import functools
 import logging
+import math
 from datetime import date as _date_type
 from typing import Any, List, Optional, Union
 
@@ -17,13 +29,20 @@ import numpy as np
 
 from ..core.expr import FuncCall, Literal, VarRef
 from ..core.variable import Variable
-from ._helpers import val
+from ._helpers import (
+    elementwise, function_unit, is_series, operand_unit, same_unit, unit_law, val,
+    waits_on_loop)
+from .registry import register
 from .dates import _extract_date
+from .mathfn import _spreadsheet_round
+from .text import _number_of
 
 logger = logging.getLogger(__name__)
 
 
-__all__ = ['IRR', 'NPV', 'XIRR', 'XNPV', 'PMT', 'FV', 'PV']
+__all__ = ['IRR', 'NPV', 'XIRR', 'XNPV', 'PMT', 'FV', 'PV',
+           'NPER', 'IPMT', 'PPMT', 'RATE', 'CUMIPMT', 'CUMPRINC',
+           'SLN', 'DB', 'DDB', 'SYD']
 
 
 # ─── Shared helpers ───────────────────────────────────────────────
@@ -116,7 +135,8 @@ fall back to inlining ``_value``."""
 
 
 def _wrap_with_formula(value: float, func_name: str, args: list) -> Variable:
-    """Build a scalar-valued result Variable with an Excel FuncCall formula."""
+    """Build a scalar-valued result Variable with an Excel FuncCall formula,
+    in the unit the function's law gives."""
     result = Variable(value_type='float')
     result._set_expr(FuncCall(
         func_name, args,
@@ -125,12 +145,31 @@ def _wrap_with_formula(value: float, func_name: str, args: list) -> Variable:
     result._value = float(value)
     result.var_type = 'scalar'
     result.value_type = 'float'
+    try:
+        unit = function_unit(func_name, args, operand_unit)
+    except ValueError:
+        if not waits_on_loop(result):       # provisional until its loop closes
+            raise
+        unit = None
+    if unit is not None:
+        result._unit = unit
     return result
 
 
 def _formula_arg(value) -> "Literal | VarRef":
     """AST node for a function argument — VarRef if it's a Variable, else Literal."""
     return VarRef(value) if isinstance(value, Variable) else Literal(value)
+
+
+def _range_arg(value: Any) -> Any:
+    """AST node for a flows or dates argument: a row is its range; a list
+    holding lines is the list of their cells, each its own node, as a
+    criteria range is - the book writes their cells and the unit law
+    reads each flow's unit; a list of numbers typed in is a literal."""
+    from ..core.expr import ListExpr
+    if isinstance(value, (list, tuple)) and any(isinstance(x, Variable) for x in value):
+        return ListExpr([_formula_arg(x) for x in value])
+    return _formula_arg(value)
 
 
 # ─── Core algorithms ──────────────────────────────────────────────
@@ -331,6 +370,15 @@ def _years_from_first(dates, count: int, func: str, *, earlier_allowed: bool) ->
 # ─── Public functions ─────────────────────────────────────────────
 
 
+# The rate a search starts from is one number for the whole row.
+def _one_guess(guess: Any, func: str) -> None:
+    if isinstance(val(guess), (list, tuple)):
+        raise TypeError(
+            f"{func}'s guess is one number — the rate the search starts from — "
+            f"got a series. Give one value, or leave it out (0.1)."
+        )
+
+
 def IRR(
     cash_flows: Union[Variable, List[float]],
     guess: float = 0.1,
@@ -349,6 +397,7 @@ def IRR(
         cf = mo.Variable([-100_000, 30_000, 40_000, 50_000, 60_000])
         project_irr = mo.IRR(cf)       # Excel: =IRR(B2:F2, 0.1)
     """
+    _one_guess(guess, "IRR")
     cf_values = _present(_extract_cashflow_values(cash_flows, "IRR"))
     if len(cf_values) < 2:
         raise ValueError(
@@ -364,11 +413,9 @@ def IRR(
 
     irr_value = _irr_solve(cf_array, guess)
 
-    if isinstance(cash_flows, Variable):
-        return _wrap_with_formula(
-            irr_value, 'IRR',
-            [VarRef(cash_flows), Literal(guess)],
-        )
+    flows = _range_arg(cash_flows)
+    if not isinstance(flows, Literal):
+        return _wrap_with_formula(irr_value, 'IRR', [flows, Literal(guess)])
     # Raw list input — no cell range to reference; return value-only.
     return Variable(irr_value, value_type='float')
 
@@ -392,14 +439,17 @@ def NPV(
         # Excel: =B1 + NPV(B2, C3:E3)
     """
     rate_value = _arg(rate)
+    if isinstance(rate_value, (list, tuple)):
+        raise TypeError(
+            "NPV takes a single discount rate — got a series. For a rate that "
+            "changes over time, discount each flow explicitly."
+        )
     cf_values = _present(_extract_cashflow_values(cash_flows, "NPV"))
     npv_value = _npv(rate_value, np.array(cf_values, dtype=float))
 
-    if isinstance(rate, Variable) or isinstance(cash_flows, Variable):
-        return _wrap_with_formula(
-            npv_value, 'NPV',
-            [_formula_arg(rate), _formula_arg(cash_flows)],
-        )
+    flows = _range_arg(cash_flows)
+    if isinstance(rate, Variable) or not isinstance(flows, Literal):
+        return _wrap_with_formula(npv_value, 'NPV', [_formula_arg(rate), flows])
     return Variable(npv_value, value_type='float')
 
 
@@ -443,6 +493,7 @@ def XIRR(
         d  = mo.Variable([date(2025,1,1), date(2025,3,15), date(2025,7,10), date(2025,12,31)])
         project_xirr = mo.XIRR(cf, d)  # Excel: =XIRR(B2:E2, B3:E3, 0.1)
     """
+    _one_guess(guess, "XIRR")
     cf_array = np.array(_zero_blanks(_extract_cashflow_values(cash_flows, "XIRR")), dtype=float)
     years = _years_from_first(dates, len(cf_array), "XIRR", earlier_allowed=True)
     if not (np.any(cf_array < 0) and np.any(cf_array > 0)):
@@ -471,11 +522,9 @@ def XIRR(
             "cash flows and their dates."
         ) from exc
 
-    if isinstance(cash_flows, Variable) and isinstance(dates, Variable):
-        return _wrap_with_formula(
-            rate, 'XIRR',
-            [VarRef(cash_flows), VarRef(dates), _formula_arg(guess)],
-        )
+    flows, when = _range_arg(cash_flows), _range_arg(dates)
+    if not isinstance(flows, Literal) and not isinstance(when, Literal):
+        return _wrap_with_formula(rate, 'XIRR', [flows, when, _formula_arg(guess)])
     return Variable(float(rate), value_type='float')
 
 
@@ -524,12 +573,44 @@ def XNPV(
     years = _years_from_first(dates, len(cf_array), "XNPV", earlier_allowed=False)
     xnpv_value = float(np.sum(cf_array / (1 + rate_value) ** years))
 
-    if isinstance(cash_flows, Variable) and isinstance(dates, Variable):
-        return _wrap_with_formula(
-            xnpv_value, 'XNPV',
-            [_formula_arg(rate), VarRef(cash_flows), VarRef(dates)],
-        )
+    flows, when = _range_arg(cash_flows), _range_arg(dates)
+    if not isinstance(flows, Literal) and not isinstance(when, Literal):
+        return _wrap_with_formula(xnpv_value, 'XNPV', [_formula_arg(rate), flows, when])
     return Variable(xnpv_value, value_type='float')
+
+
+# The payment, future value and present value of one period's numbers —
+# the arithmetic of a call over scalars, and of each period's cell of a
+# call over a series.
+def _pmt(r: Any, n: Any, v: Any, f: Any, w: Any) -> Any:
+    if r == 0:
+        return -(v + f) / n
+    return -(f + v * (1 + r) ** n) * r / ((1 + r * w) * ((1 + r) ** n - 1))
+
+
+def _fv(r: Any, n: Any, p: Any, v: Any, w: Any) -> Any:
+    if r == 0:
+        return -(v + p * n)
+    return -(v * (1 + r) ** n + p * (1 + r * w) * ((1 + r) ** n - 1) / r)
+
+
+def _pv(r: Any, n: Any, p: Any, f: Any, w: Any) -> Any:
+    if r == 0:
+        return -(f + p * n)
+    return -(f + p * (1 + r * w) * ((1 + r) ** n - 1) / r) / (1 + r) ** n
+
+
+def _series_among(*args: Any) -> bool:
+    return any(is_series(a) for a in args)
+
+
+# A call with a series among its arguments: one per period, every argument
+# written as the call over scalars writes it, read as ``a + b`` reads its
+# operands (a scalar in every period, lines on other windows by date,
+# lines along keys key by key).
+def _each_period(func: str, kernel: Any, *args: Any) -> Variable:
+    return elementwise(func, kernel, list(args), blank=0, value_type='float',
+                       render_backends=_EXCEL_ONLY)
 
 
 def PMT(
@@ -549,12 +630,14 @@ def PMT(
 
         # Monthly payment on a $300k 30-year loan at 6% annual
         monthly = mo.PMT(0.06 / 12, 30 * 12, 300_000)  # ≈ -1,798.65
+
+    Any argument may vary by period: a series among them makes the call
+    one per period, ``=PMT(C9 / 100, 12, 1000, 0, 0)`` in every column.
     """
+    if _series_among(rate, nper, pv, fv, when):
+        return _each_period('PMT', _pmt, rate, nper, pv, fv, when)
     r, n, pv_v, fv_v, w = _arg(rate), _arg(nper), _arg(pv), _arg(fv), _arg(when)
-    if r == 0:
-        pmt_val = -(pv_v + fv_v) / n
-    else:
-        pmt_val = -(fv_v + pv_v * (1 + r) ** n) * r / ((1 + r * w) * ((1 + r) ** n - 1))
+    pmt_val = _pmt(r, n, pv_v, fv_v, w)
 
     result = _wrap_with_formula(
         pmt_val, 'PMT',
@@ -577,12 +660,14 @@ def FV(
 
         # $500/month into 7%-return account for 30 years, starting from $0
         retirement = mo.FV(0.07 / 12, 30 * 12, -500)  # ≈ 611,729
+
+    Any argument may vary by period, one call per period as for
+    :func:`PMT`.
     """
+    if _series_among(rate, nper, pmt, pv, when):
+        return _each_period('FV', _fv, rate, nper, pmt, pv, when)
     r, n, p, pv_v, w = _arg(rate), _arg(nper), _arg(pmt), _arg(pv), _arg(when)
-    if r == 0:
-        fv_val = -(pv_v + p * n)
-    else:
-        fv_val = -(pv_v * (1 + r) ** n + p * (1 + r * w) * ((1 + r) ** n - 1) / r)
+    fv_val = _fv(r, n, p, pv_v, w)
 
     result = _wrap_with_formula(
         fv_val, 'FV',
@@ -605,12 +690,14 @@ def PV(
 
         # PV of $1000/yr for 20 years at 5% discount
         pv = mo.PV(0.05, 20, -1000)  # ≈ 12,462
+
+    Any argument may vary by period, one call per period as for
+    :func:`PMT`.
     """
+    if _series_among(rate, nper, pmt, fv, when):
+        return _each_period('PV', _pv, rate, nper, pmt, fv, when)
     r, n, p, fv_v, w = _arg(rate), _arg(nper), _arg(pmt), _arg(fv), _arg(when)
-    if r == 0:
-        pv_val = -(fv_v + p * n)
-    else:
-        pv_val = -(fv_v + p * (1 + r * w) * ((1 + r) ** n - 1) / r) / (1 + r) ** n
+    pv_val = _pv(r, n, p, fv_v, w)
 
     result = _wrap_with_formula(
         pv_val, 'PV',
@@ -618,3 +705,574 @@ def PV(
     )
     result._source_code = f"PV({r}, {n}, {p}, {fv_v}, {w})"
     return result
+
+
+# ─── Loan schedules and depreciation ──────────────────────────────
+#
+# ``NPER``, ``IPMT``, ``PPMT``, ``RATE``, ``CUMIPMT``, ``CUMPRINC`` and
+# the depreciation functions ``SLN``, ``DB``, ``DDB``, ``SYD`` are each
+# one call per period through the shared :func:`elementwise` helper,
+# over a kernel that takes one period's numbers: scalars give one
+# number, a period-shaped operand (``per=mo.time.index``) a schedule
+# row. A kernel reads a cell as the spreadsheet does (``_number``) — a
+# blank is 0, a boolean 1 or 0, numeric text its number, other text
+# ``#VALUE!``, an error cell passes through — and a number outside the
+# function's domain is ``#NUM!``. An optional argument is written only
+# when given.
+
+Numeric = Variable | int | float
+
+
+def _number(v: Any) -> int | float:
+    """A cell's number as the spreadsheet reads it, as a plain Python
+    number: numpy's float warns and gives ``inf`` where Python raises
+    the division by zero or the overflow the helper reads as an error."""
+    x = _number_of(v)
+    return x if type(x) is int else float(x)
+
+
+def _whole(v: Any) -> int:
+    """A period, a month or a type read whole: the number as a cell shows
+    it (15 significant digits), its fraction dropped — 12.999999999999998
+    is period 13, as the spreadsheet counts it."""
+    x = _number(v)
+    if not math.isfinite(x):
+        raise OverflowError(f"not a finite number: {v!r}")   # the helper's #NUM!
+    return int(_spreadsheet_round(x, 0, decimal.ROUND_DOWN))
+
+
+def _advance(when: Any) -> int:
+    """Excel's ``type``: 1 for a payment at the start of the period, 0
+    at its end. Any other number reads as 1, as the spreadsheet reads it."""
+    return 1 if _number(when) else 0
+
+
+def _written(*args: Any) -> list[Any]:
+    """The arguments as the cell writes them: an optional one that is
+    omitted (None) is dropped from the end; one before a given one is
+    its default, 0."""
+    out = list(args)
+    while out and out[-1] is None:
+        out.pop()
+    return [0 if a is None else a for a in out]
+
+
+def _payment(r: Any, n: Any, v: Any, f: Any, w: int) -> Any:
+    """The payment ``PMT`` computes — the kernel the schedule functions
+    share. ``(1 + r) ** n - 1`` is ``expm1``, as the spreadsheet computes
+    it: at a rate of 1e-12 the subtraction would keep four digits."""
+    if r == 0:
+        return -(v + f) / n
+    if r == -1:
+        t, t_less_one = 0.0, -1.0               # every amount gone after a period
+    else:
+        growth = n * math.log1p(r)
+        t, t_less_one = math.exp(growth), math.expm1(growth)
+    return -(f + v * t) * r / ((1 + r * w) * t_less_one)
+
+
+def _balance(r: Any, k: Any, payment: Any, v: Any, w: int) -> Any:
+    """``FV`` after ``k`` payments: minus the balance the loan still carries."""
+    if r == 0:
+        return -(v + payment * k)
+    t = (1 + r) ** k
+    return -(v * t + payment * (1 + r * w) * (t - 1) / r)
+
+
+def _nper(rate: Any, pmt: Any, pv: Any, fv: Any = 0, when: Any = 0) -> Any:
+    r, p, v, f = (_number(x) for x in (rate, pmt, pv, fv))
+    w = _advance(when)
+    if v + f == 0:
+        return 0.0                              # nothing to pay off
+    if r == 0:
+        return -(v + f) / p + 0.0 if p else '#NUM!'
+    if r <= -1:
+        return '#NUM!'
+    z = p * (1 + r * w) / r
+    if v + z == 0:
+        return '#NUM!'                          # the payment only ever covers the interest
+    ratio = (z - f) / (v + z)
+    # ``+ 0.0`` throughout: -0.0 + 0.0 is 0.0, and a cell shows 0, not -0.
+    return math.log(ratio) / math.log1p(r) + 0.0 if ratio > 0 else '#NUM!'
+
+
+def _ipmt(rate: Any, per: Any, nper: Any, pv: Any, fv: Any = 0, when: Any = 0) -> Any:
+    r, p, n, v, f = (_number(x) for x in (rate, per, nper, pv, fv))
+    w = _advance(when)
+    if p < 1 or p > n or r < -1:
+        return '#NUM!'
+    if r == 0 or (w and p == 1):
+        return 0.0
+    if p == 1:
+        # The interest on the loan itself, the payment not needed: a term
+        # too long for (1 + rate) ** nper still has a first period.
+        return -v * r + 0.0
+    interest = _balance(r, p - 1, _payment(r, n, v, f, w), v, w) * r
+    return (interest / (1 + r) if w else interest) + 0.0
+
+
+def _ppmt(rate: Any, per: Any, nper: Any, pv: Any, fv: Any = 0, when: Any = 0) -> Any:
+    interest = _ipmt(rate, per, nper, pv, fv, when)
+    if isinstance(interest, str):
+        return interest
+    r, n, v, f = (_number(x) for x in (rate, nper, pv, fv))
+    return _payment(r, n, v, f, _advance(when)) - interest + 0.0
+
+
+#: ``RATE`` iterates as LibreOffice's source does: Newton's method on the
+#: balance from the guess, at most 150 steps, done when a step is under
+#: 1e-7 or the balance under 1e-14. With no guess given, 0.1 is tried
+#: and then, in turn, 0.2, 0.05, 0.3, 0.1/3, ... 1.0, 0.01, each where
+#: the last found no rate. An end that is no rate (-100%, or a point
+#: that does not balance the flows) is a start that found none: the
+#: spreadsheet stops there and shows it.
+_RATE_STEPS = 150
+_RATE_STEP_DONE = 1e-7
+_RATE_BALANCE_DONE = 1e-14
+_RATE_GUESSES = (0.1,) + tuple(g for k in range(2, 11) for g in (0.1 * k, 0.1 / k))
+
+
+def _rate_iteration(n: float, p: float, v: float, f: float, x: float) -> float | None:
+    """The rate Newton's method reaches from ``x`` on the end-of-period
+    balance ``f + v (1+x)^n + p ((1+x)^n - 1) / x``, or None: LibreOffice's
+    arithmetic and stopping rules, step for step, so it settles where the
+    spreadsheet settles and fails where it fails. A whole ``n`` may pass
+    below -100% on the way (a whole power of a negative number is real);
+    a fractional one may not."""
+    whole = float(n).is_integer()
+    if not whole:
+        x = max(x, -1.0)
+    try:
+        for _ in range(_RATE_STEPS):
+            if whole:
+                t1 = (1.0 + x) ** (n - 1.0)
+                t = t1 * (1.0 + x)
+            else:
+                t, t1 = (1.0 + x) ** n, (1.0 + x) ** (n - 1.0)
+            if x == 0:
+                series, slope = float(n), n * (n - 1.0) / 2.0
+            else:
+                series = (t - 1.0) / x
+                slope = n * t1 / x - series / x
+            balance = f + v * t + p * series
+            if abs(balance) < _RATE_BALANCE_DONE:
+                break
+            d_balance = v * n * t1 + p * slope
+            x_new = x - balance / d_balance if d_balance else x + 1.1 * _RATE_STEP_DONE
+            done = abs(x_new - x) < _RATE_STEP_DONE
+            x = x_new
+            if not whole and not x >= -1.0:
+                return None
+            if done:
+                break
+        else:
+            return None
+    except (OverflowError, ZeroDivisionError):
+        return None                             # the spreadsheet's inf / nan: no root
+    return x if not whole or x > -1.0 else None
+
+
+def _rate_gap(n: float, p: float, v: float, f: float, r: float) -> tuple[float, float, float]:
+    """The balance ``f + v (1+r)^n + p ((1+r)^n - 1) / r`` a rate leaves
+    (zero at the rate sought), its slope, and the size of its terms;
+    infinite where they overflow. log1p / expm1 keep the series exact at
+    a small rate, where the slope is read at its limit, n (n-1) / 2."""
+    try:
+        lg = math.log1p(r)
+        t1, t2 = math.exp(n * lg), math.exp((n - 1) * lg)
+        series = n if r == 0 else math.expm1(n * lg) / r
+    except OverflowError:
+        return math.inf, math.inf, math.inf
+    slope = (n * t2 - series) / r if abs(r) > 1e-8 else n * (n - 1) / 2
+    size = abs(f) + abs(v * t1) + abs(p * series)
+    return f + v * t1 + p * series, v * n * t2 + p * slope, size
+
+
+def _settled_rate(n: float, p: float, v: float, f: float, x: float,
+                  at_minus_one: bool) -> float | None:
+    """The rate the iteration ended on, polished on the exact series, or
+    None where it is no rate: -100% (every amount gone — a root of the
+    flows ``at_minus_one``), or a point that does not balance them (an
+    iteration that stalled far out)."""
+    if not 1.0 + x > (1e-5 if at_minus_one else 0.0):
+        return None
+    g, dg, size = _rate_gap(n, p, v, f, x)
+    if not (math.isfinite(size) and abs(g) <= 1e-6 * size):
+        return None
+    # The spreadsheet stops within 1e-7; a few exact steps settle the
+    # last digits (a rate of 0 is 0, not 1e-11), never past -100%.
+    for _ in range(3):
+        step = g / dg if dg else 0.0
+        if not (abs(step) <= 1e-6 * (1 + abs(x)) and 1.0 + (x - step) > 0.0):
+            break
+        x -= step
+        if abs(step) <= 1e-15 * (1 + abs(x)):
+            break
+        g, dg, size = _rate_gap(n, p, v, f, x)
+    # A rate too small to move 1 + rate is the rate 0, as the cell shows it.
+    return x + 0.0 if 1.0 + x != 1.0 else 0.0
+
+
+def _rate(nper: Any, pmt: Any, pv: Any, fv: Any = 0, when: Any = 0, guess: Any = None) -> Any:
+    n, p, v, f = (_number(x) for x in (nper, pmt, pv, fv))
+    if n <= 0:
+        return '#NUM!'
+    w = _advance(when)
+    if v + p * w == 0 and f + p * (1 - w) == 0 and (n == 1 or p == 0):
+        # Every rate balances flows that are not there, or a single period
+        # repaid as it opens: the iteration stops where it starts.
+        start = 0.1 if guess is None else _number(guess)
+        return start + 0.0 if start > -1 else '#NUM!'
+    at_minus_one = f + p * (1 - w) == 0
+    # A payment at the start of the period is one made at time zero: it
+    # moves from the annuity into the present value and out of the
+    # future value, and the iteration is the end-of-period one.
+    v, f = v + p * w, f - p * w
+    for start in _RATE_GUESSES if guess is None else (_number(guess),):
+        x = _rate_iteration(n, p, v, f, start)
+        rate = None if x is None else _settled_rate(n, p, v, f, x, at_minus_one)
+        if rate is not None:
+            return rate
+    return '#NUM!'
+
+
+def _cumulative(kernel: Any, rate: Any, nper: Any, pv: Any, start: Any, end: Any,
+                when: Any) -> Any:
+    r, n, v = (_number(x) for x in (rate, nper, pv))
+    # The periods and the type are read whole, as Excel documents them.
+    s, e, w = (_whole(x) for x in (start, end, when))
+    if r <= 0 or n <= 0 or v <= 0 or s < 1 or e < s or e > n or w not in (0, 1):
+        return '#NUM!'
+    return sum(kernel(r, i, n, v, 0, w) for i in range(s, e + 1)) + 0.0
+
+
+def _sln(cost: Any, salvage: Any, life: Any) -> Any:
+    c, s, n = (_number(x) for x in (cost, salvage, life))
+    return (c - s) / n + 0.0                    # a life of 0 is the helper's #DIV/0!
+
+
+def _db(cost: Any, salvage: Any, life: Any, period: Any, month: Any = 12) -> Any:
+    c, s, n, p = (_number(x) for x in (cost, salvage, life, period))
+    m = _whole(month)
+    if c <= 0 or s < 0 or s > c or n <= 0 or p < 1 or p > n + 1 or m < 1 or m > 12:
+        return '#NUM!'
+    # Excel's documented formula: the rate rounded to three decimals as
+    # ROUND rounds it; the first period's charge over ``month`` months;
+    # each next period's on the balance; and in a period past ``life``
+    # the stub over the months the first year left. The period is read
+    # whole: 1.5 is the first period, even past a life shorter than that.
+    rate = _spreadsheet_round(1 - (s / c) ** (1 / n), 3)
+    first = c * rate * m / 12
+    if _whole(p) == 1:
+        return first + 0.0
+    charge, total = 0.0, first
+    for _ in range(2, _whole(min(n, p)) + 1):
+        charge = (c - total) * rate
+        total += charge
+    if p > n:
+        charge = (c - total) * rate * (12 - m) / 12
+    return charge + 0.0
+
+
+def _ddb(cost: Any, salvage: Any, life: Any, period: Any, factor: Any = 2) -> Any:
+    c, s, n, p, k = (_number(x) for x in (cost, salvage, life, period, factor))
+    if c < 0 or s < 0 or s > c or k <= 0 or p < 1 or p > n:
+        return '#NUM!'
+    # The book value before and after the period at the declining rate,
+    # the charge their difference, stopped at the salvage value.
+    rate = k / n
+    if rate >= 1:
+        rate, before = 1.0, (c if p == 1 else 0.0)
+    else:
+        before = c * (1 - rate) ** (p - 1)
+    after = c * (1 - rate) ** p
+    charge = before - s if after < s else before - after
+    return max(charge, 0.0) + 0.0
+
+
+def _syd(cost: Any, salvage: Any, life: Any, per: Any) -> Any:
+    c, s, n, p = (_number(x) for x in (cost, salvage, life, per))
+    if n <= 0 or p < 1 or p > n:
+        return '#NUM!'
+    return (c - s) * (n - p + 1) * 2 / (n * (n + 1)) + 0.0
+
+
+def NPER(
+    rate: Numeric,
+    pmt: Numeric,
+    pv: Numeric,
+    fv: Numeric | None = None,
+    when: Numeric | None = None,
+) -> Variable:
+    """Number of periods of a loan or an annuity (renders
+    ``=NPER(rate, pmt, pv, [fv], [type])``).
+
+    ``NPER(0.01, -100, -1000, 10000)`` is 60.08; a rate of 0 gives
+    ``-(pv + fv) / pmt``; ``when=1`` (Excel's ``type``) puts the payment
+    at the start of each period. A present and a future value that
+    cancel need 0 periods; a payment that never pays the balance down
+    (``NPER(0.1, 100, -1000)``), a zero payment at a zero rate, or a
+    rate of -100% or below is ``#NUM!``. The result carries no unit; the
+    payment and the values are in one. Element-wise over a period-shaped
+    operand.
+    """
+    return elementwise("NPER", _nper, _written(rate, pmt, pv, fv, when),
+                       blank=0, value_type='float')
+
+
+def IPMT(
+    rate: Numeric,
+    per: Numeric,
+    nper: Numeric,
+    pv: Numeric,
+    fv: Numeric | None = None,
+    when: Numeric | None = None,
+) -> Variable:
+    """Interest paid in period ``per`` (renders
+    ``=IPMT(rate, per, nper, pv, [fv], [type])``).
+
+    Signs as ``PMT``: a positive ``pv`` gives a negative payment.
+    ``IPMT(0.1, 3, 3, 8000)`` is -292.45. A rate of 0 is 0 interest;
+    with ``when=1`` the first period's interest is 0 and every later
+    one is discounted a period. ``per`` below 1 or above ``nper``, or a
+    rate below -100%, is ``#NUM!``. A series ``per`` — ``mo.time.index``
+    — makes the call a schedule row::
+
+        interest = mo.IPMT(inp.rate, mo.time.index, inp.term, inp.loan)
+    """
+    return elementwise("IPMT", _ipmt, _written(rate, per, nper, pv, fv, when),
+                       blank=0, value_type='float')
+
+
+def PPMT(
+    rate: Numeric,
+    per: Numeric,
+    nper: Numeric,
+    pv: Numeric,
+    fv: Numeric | None = None,
+    when: Numeric | None = None,
+) -> Variable:
+    """Principal paid in period ``per`` (renders
+    ``=PPMT(rate, per, nper, pv, [fv], [type])``).
+
+    The payment less :func:`IPMT`'s interest, with its rules:
+    ``PPMT(0.08, 10, 10, 200000)`` is -27,598.05; at a rate of 0 the
+    whole payment ``-(pv + fv) / nper``; ``per`` outside 1 .. ``nper``
+    is ``#NUM!``. A series ``per`` makes the call a schedule row.
+    """
+    return elementwise("PPMT", _ppmt, _written(rate, per, nper, pv, fv, when),
+                       blank=0, value_type='float')
+
+
+def RATE(
+    nper: Numeric,
+    pmt: Numeric,
+    pv: Numeric,
+    fv: Numeric | None = None,
+    when: Numeric | None = None,
+    guess: Numeric | None = None,
+) -> Variable:
+    """The rate per period of a loan or an annuity (renders
+    ``=RATE(nper, pmt, pv, [fv], [type], [guess])``).
+
+    ``RATE(48, -200, 8000)`` is 0.77% a month. Found as LibreOffice
+    finds it: Newton's iteration from ``guess``, at most 150 steps,
+    settled when a step is under 1e-7; with no guess it starts at 0.1
+    (Excel's default) and, should that find no rate, at 0.2, 0.05, 0.3,
+    0.033, ... 1.0, 0.01 in turn, so of several roots it finds the
+    spreadsheet's (``RATE(5, -1000, 1000)`` is 96.6%). The rate settled
+    on is refined to full precision; payments that repay the loan exactly
+    have a rate of 0. An end at -100% or at a point that does not
+    balance the flows is no rate: the spreadsheet shows it, the engine
+    tries the next start. ``#NUM!`` when ``nper`` is 0 or below, or when
+    no start finds a rate (``RATE(10, 100, 1000)``: every flow the same
+    way; a guess the iteration runs away from). With no flow at all
+    every rate balances, and the guess is the answer. Excel documents 20
+    steps, so a rate that takes more may be ``#NUM!`` in Excel. The
+    result carries no unit. Element-wise over a period-shaped operand.
+    """
+    return elementwise("RATE", _rate, _written(nper, pmt, pv, fv, when, guess),
+                       blank=0, value_type='float')
+
+
+def CUMIPMT(
+    rate: Numeric,
+    nper: Numeric,
+    pv: Numeric,
+    start_period: Numeric,
+    end_period: Numeric,
+    when: Numeric = 0,
+) -> Variable:
+    """Interest paid between two periods, both included (renders
+    ``=CUMIPMT(rate, nper, pv, start_period, end_period, type)``).
+
+    The sum of :func:`IPMT` over the periods — ``CUMIPMT(0.09 / 12,
+    360, 125000, 13, 24, 0)`` is -11,135.23, the second year's interest.
+    The periods and ``when`` are read whole, as a cell shows them
+    (12.999999999999998 is period 13) and as Excel documents it, their
+    fractions dropped; LibreOffice refuses a fractional ``when``.
+    ``when`` is written always, as Excel requires it. A rate, term or
+    present value of 0 or below, a start before period 1 or after the
+    end, an end after ``nper``, or a ``when`` other than 0 and 1 is
+    ``#NUM!``.
+    """
+    return elementwise(
+        "CUMIPMT", functools.partial(_cumulative, _ipmt),
+        [rate, nper, pv, start_period, end_period, 0 if when is None else when],
+        blank=0, value_type='float',
+    )
+
+
+def CUMPRINC(
+    rate: Numeric,
+    nper: Numeric,
+    pv: Numeric,
+    start_period: Numeric,
+    end_period: Numeric,
+    when: Numeric = 0,
+) -> Variable:
+    """Principal paid between two periods, both included (renders
+    ``=CUMPRINC(rate, nper, pv, start_period, end_period, type)``).
+
+    The sum of :func:`PPMT` over the periods, with :func:`CUMIPMT`'s
+    rules — ``CUMPRINC(0.09 / 12, 360, 125000, 13, 24, 0)`` is -934.11.
+    """
+    return elementwise(
+        "CUMPRINC", functools.partial(_cumulative, _ppmt),
+        [rate, nper, pv, start_period, end_period, 0 if when is None else when],
+        blank=0, value_type='float',
+    )
+
+
+def SLN(cost: Numeric, salvage: Numeric, life: Numeric) -> Variable:
+    """Straight-line depreciation for one period (renders ``=SLN(cost, salvage, life)``).
+
+    ``(cost - salvage) / life``: ``SLN(30000, 7500, 10)`` is 2,250. A
+    life of 0 is ``#DIV/0!``; a negative cost or a salvage above the
+    cost is computed as written. Element-wise over a period-shaped
+    operand; the result keeps the unit the amounts share.
+    """
+    return elementwise("SLN", _sln, [cost, salvage, life], blank=0, value_type='float')
+
+
+def DB(
+    cost: Numeric,
+    salvage: Numeric,
+    life: Numeric,
+    period: Numeric,
+    month: Numeric | None = None,
+) -> Variable:
+    """Fixed-declining-balance depreciation for ``period`` (renders
+    ``=DB(cost, salvage, life, period, [month])``).
+
+    Excel's formula: the rate ``1 - (salvage / cost) ** (1 / life)``
+    rounded to three decimals, the first period's charge over ``month``
+    months (12 when omitted), each next period's on the remaining
+    balance, and in a period past ``life`` the stub over the months the
+    first year left. ``DB(1000000, 100000, 6, 1, 7)`` is 186,083.33.
+    ``period`` and ``month`` are read whole, as a cell shows them: 1.5 is
+    the first period, whatever the life. A cost of 0 or below, a salvage
+    below 0 or above the cost, a life of 0 or below, a period below 1 or
+    above ``life + 1``, or a month outside 1 .. 12 is ``#NUM!`` (a period
+    between 0 and 1 is outside Excel's domain; LibreOffice computes it as
+    0). A series ``period`` — ``mo.time.index`` — makes the call a
+    schedule row.
+    """
+    return elementwise("DB", _db, _written(cost, salvage, life, period, month),
+                       blank=0, value_type='float')
+
+
+def DDB(
+    cost: Numeric,
+    salvage: Numeric,
+    life: Numeric,
+    period: Numeric,
+    factor: Numeric | None = None,
+) -> Variable:
+    """Double-declining-balance depreciation for ``period`` (renders
+    ``=DDB(cost, salvage, life, period, [factor])``).
+
+    The charge at the rate ``factor / life`` (``factor`` 2 when omitted)
+    on the book value, never past the salvage value:
+    ``DDB(2400, 300, 10, 1)`` is 480, ``DDB(2400, 300, 10, 10)`` is
+    22.12 (the balance stops at 300). A fractional period is charged
+    along the declining curve, as the spreadsheet charges it. A cost or
+    salvage below 0, a salvage above the cost, a factor of 0 or below,
+    or a period below 1 or above ``life`` is ``#NUM!``. A series
+    ``period`` makes the call a schedule row.
+    """
+    return elementwise("DDB", _ddb, _written(cost, salvage, life, period, factor),
+                       blank=0, value_type='float')
+
+
+def SYD(cost: Numeric, salvage: Numeric, life: Numeric, per: Numeric) -> Variable:
+    """Sum-of-years'-digits depreciation for ``per`` (renders
+    ``=SYD(cost, salvage, life, per)``).
+
+    ``(cost - salvage) * (life - per + 1) * 2 / (life * (life + 1))``:
+    ``SYD(30000, 7500, 10, 1)`` is 4,090.91, the tenth year 409.09. A
+    life of 0 or below, or a period below 1 or above ``life``, is
+    ``#NUM!`` — Excel's domain; LibreOffice computes the formula as
+    written there (0 the period after the life, negative after that). A
+    series ``per`` makes the call a schedule row.
+    """
+    return elementwise("SYD", _syd, [cost, salvage, life, per], blank=0, value_type='float')
+
+
+# The cash-flow functions take their flows as a range; a rate or a date
+# argument that is one value is written as its cell.
+register("IRR", shape="range")
+register("NPV", shape="range")
+register("XIRR", shape="range")
+register("XNPV", shape="range")
+register("PMT", shape="scalar")
+register("FV", shape="scalar")
+register("PV", shape="scalar")
+# The schedule and depreciation functions are one call per period.
+register("NPER", shape="elementwise")
+register("IPMT", shape="elementwise")
+register("PPMT", shape="elementwise")
+register("RATE", shape="elementwise")
+register("CUMIPMT", shape="elementwise")
+register("CUMPRINC", shape="elementwise")
+register("SLN", shape="elementwise")
+register("DB", shape="elementwise")
+register("DDB", shape="elementwise")
+register("SYD", shape="elementwise")
+
+
+# ─── Units ──────────────────────────────────────────────────────────
+
+
+def _amounts(func: str, first: int, stop: int, *, gives: bool = True) -> Any:
+    """The law of a function reading amounts at ``first:stop`` of its
+    written arguments: one unit among them, the result's — none for a
+    rate or a count (``gives=False``)."""
+    from ..core.expr import ListExpr
+
+    def law(args: Any, unit_of: Any) -> Any:
+        # A list of lines (``NPV(rate, [y1, y2])``) is read line by line.
+        nodes = [n for a in args[first:stop]
+                 for n in (a.items if isinstance(a, ListExpr) else (a,))]
+        unit = same_unit(func, nodes, unit_of)
+        return unit if gives else None
+    return law
+
+
+unit_law("IRR", _amounts("IRR", 0, 1, gives=False))     # (flows, guess)
+unit_law("XIRR", _amounts("XIRR", 0, 1, gives=False))   # (flows, dates, guess)
+unit_law("NPV", _amounts("NPV", 1, 2))              # (rate, flows)
+unit_law("XNPV", _amounts("XNPV", 1, 2))            # (rate, flows, dates)
+unit_law("PMT", _amounts("PMT", 2, 4))              # (rate, nper, pv, fv, type)
+unit_law("FV", _amounts("FV", 2, 4))                # (rate, nper, pmt, pv, type)
+unit_law("PV", _amounts("PV", 2, 4))                # (rate, nper, pmt, fv, type)
+unit_law("NPER", _amounts("NPER", 1, 4, gives=False))   # (rate, pmt, pv, fv, type)
+unit_law("RATE", _amounts("RATE", 1, 4, gives=False))   # (nper, pmt, pv, fv, type, guess)
+unit_law("IPMT", _amounts("IPMT", 3, 5))            # (rate, per, nper, pv, fv, type)
+unit_law("PPMT", _amounts("PPMT", 3, 5))
+unit_law("CUMIPMT", _amounts("CUMIPMT", 2, 3))      # (rate, nper, pv, start, end, type)
+unit_law("CUMPRINC", _amounts("CUMPRINC", 2, 3))
+unit_law("SLN", _amounts("SLN", 0, 2))              # (cost, salvage, life)
+unit_law("DB", _amounts("DB", 0, 2))                # (cost, salvage, life, period, month)
+unit_law("DDB", _amounts("DDB", 0, 2))              # (cost, salvage, life, period, factor)
+unit_law("SYD", _amounts("SYD", 0, 2))              # (cost, salvage, life, per)

@@ -13,7 +13,7 @@ Constructors::
     regrain=mo.up('sum')                       # a flow
     regrain=mo.up('last')                       # a stock (period-end)
     regrain=mo.up(lambda g: mo.SUM(g.price * g.volume) / mo.SUM(g.volume))
-    regrain=mo.up({('day', 'week'): 'last', ('week', 'month'): 'mean'})
+    regrain=mo.up({('day', 'month'): 'last', ('month', 'year'): 'mean'})
     regrain=mo.ratio('rev', 'users')            # sum(num)/sum(den) per bucket
     regrain=mo.frozen()                          # grain-frozen (recurrence)
 

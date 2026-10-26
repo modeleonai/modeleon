@@ -1,11 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """ExcelView value object + the declared-once cascade resolver."""
 
+import warnings
+
 import pytest
 from openpyxl import load_workbook
 
 import modeleon as mo
-from modeleon.compile.excel.view import ExcelView, resolve_excel_view
+from modeleon.compile.excel.view import (
+    ExcelView,
+    UnreadViewWarning,
+    resolve_excel_view,
+    unread_view_notes,
+    view_pass,
+)
 
 
 class TestExcelViewValueObject:
@@ -173,6 +181,68 @@ class TestResolveCascade:
         r = resolve_excel_view(m.pnl.x)
         assert r.base_font == {"name": "Arial Narrow", "size": 10}  # inherited via extend
         assert r.format_by_type is True
+
+
+class TestViewPass:
+    """``view_pass`` keeps each node's resolved view for a read-only pass:
+    the same answers as without it, and nothing kept past what it read."""
+
+    @pytest.fixture(autouse=True)
+    def _restore_global(self):
+        import modeleon
+        saved = modeleon.default_excel_view
+        yield
+        modeleon.default_excel_view = saved
+
+    @staticmethod
+    def _model():
+        m = mo.Model("m")
+        m.default_excel_view = ExcelView(
+            font={"name": "Arial Narrow"}, formats={"date": "dd mmm yyyy"})
+        m.sec = mo.MultiVariable("Sec")
+        m.sec.default_excel_view = ExcelView(formats={"number": "#,##0"})
+        m.sec.x = mo.Variable(1)
+        m.y = mo.Variable(2)
+        return m
+
+    def test_same_answers_as_without_a_pass(self):
+        m = self._model()
+        nodes = (m.sec.x, m.y, m.sec, m, None)
+        outside = [resolve_excel_view(n) for n in nodes]
+        with view_pass():
+            assert [resolve_excel_view(n) for n in nodes] == outside
+            assert [resolve_excel_view(n) for n in nodes] == outside
+
+    def test_a_node_resolves_once_per_pass(self):
+        m = self._model()
+        with view_pass():
+            first = resolve_excel_view(m.sec.x)
+            assert resolve_excel_view(m.sec.x) is first
+
+    def test_a_view_edited_in_the_pass_is_read_again(self):
+        m = self._model()
+        with view_pass():
+            assert resolve_excel_view(m.y).orient == "across"     # the house default's
+            m.default_excel_view.orient = mo.Variable("down")
+            assert resolve_excel_view(m.y).orient == "down"
+
+    def test_a_house_view_or_a_new_default_in_the_pass_is_honoured(self):
+        import modeleon
+        m = self._model()
+        with view_pass():
+            assert resolve_excel_view(m.y).time_label_format == "finance"
+            with mo.house_view(ExcelView(timeline={"label_format": "iso"})):
+                assert resolve_excel_view(m.y).time_label_format == "iso"
+            assert resolve_excel_view(m.y).time_label_format == "finance"
+            modeleon.default_excel_view = ExcelView(timeline={"label_format": "compact"})
+            assert resolve_excel_view(m.y).time_label_format == "compact"
+
+    def test_the_pass_ends_with_the_block(self):
+        m = self._model()
+        with view_pass():
+            assert resolve_excel_view(m.y).base_font == {"name": "Arial Narrow"}
+        m.default_excel_view = ExcelView(font={"name": "Calibri"})
+        assert resolve_excel_view(m.y).base_font == {"name": "Calibri"}
 
 
 class TestBaseFontWiring:
@@ -1096,3 +1166,151 @@ class TestCtorKwargViewIsASlot:
         assert "default_excel_view" not in load_workbook(
             tmp_path / "v.xlsx"
         ).sheetnames
+
+
+
+class TestAViewHungWhereNothingReadsIt:
+    """An unnamed view under a name that says "view", held by no
+    ``default_excel_view`` slot, is a container nobody reads — the book
+    keeps its look, no total column appears — so the book warns with the
+    slot to use. A view the slot points at (also through ``extend``), a
+    named view (for ``applied_view``) and a view kept under another name pass; and a
+    view's settings are words, never a series placed on the window
+    (``totals=['quarter', 'year']`` was once refused as "2 values
+    in a 24-period window")."""
+
+    @staticmethod
+    def _model(**kw):
+        m = mo.Model("m", default_grain="month", default_start="2026-01",
+                     default_periods=24, **kw)
+        with m:
+            m.pnl = mo.MultiVariable("P&L")
+            with m.pnl as pnl:
+                pnl.revenue = mo.Variable([1.0] * 24, regrain=mo.up("sum"))
+        return m
+
+    def test_a_view_under_a_name_that_says_view_is_noted_with_the_slot(self):
+        m = self._model()
+        m.excel_view = ExcelView(timeline={"totals": ["quarter", "year"]})
+        (path, note), = unread_view_notes([m])
+        assert path == "m.excel_view"
+        assert note.startswith("`m.excel_view = mo.ExcelView(...)` hangs the view on m ")
+        assert "`m.default_excel_view = mo.ExcelView(...)`" in note
+        assert "mo.ExcelView('Quarterly', ...)" in note
+
+    def test_the_sentence_spells_the_holder_by_the_author_s_name(self, tmp_path):
+        # ``model = mo.Model('Acme Corp')``: the slot line the sentence says
+        # to write is the author's binding, never the declared name.
+        model = mo.Model("Acme Corp", default_grain="month", default_start="2026-01",
+                         default_periods=3)
+        model.pnl = mo.MultiVariable("P&L")
+        model.pnl.revenue = mo.Variable([1.0] * 3, regrain=mo.up("sum"))
+        model.view = ExcelView(timeline={"totals": ["year"]})
+        with pytest.warns(UnreadViewWarning, match=r"`model\.view = mo\.ExcelView") as rec:
+            model.to_excel(tmp_path / "t.xlsx")
+        assert "`model.default_excel_view = mo.ExcelView(...)`" in str(rec[0].message)
+        # the warning lands on the author's line, not inside the engine
+        assert rec[0].filename == __file__
+
+    def test_a_projection_keeps_what_the_slot_reads(self):
+        # ``.at('quarter')`` (a projection to a coarser grain) copies a hung view on adoption:
+        # the copy is the same view — pointed at, named, extended — and a
+        # view nothing reads is still noted on the projection.
+        m = self._model()
+        m.fin_view = ExcelView(timeline={"totals": ["year"]})
+        m.default_excel_view = m.fin_view
+        m.quarterly_view = ExcelView("Quarterly", timeline={"totals": ["year"]})
+        m.base_view = ExcelView(font={"name": "Arial Narrow", "size": 10})
+        m.pnl.default_excel_view = m.base_view.extend(cell_types={"on": True})
+        assert unread_view_notes([m]) == []
+        assert unread_view_notes([m.at("quarter")]) == []
+        hung = self._model()
+        hung.view = ExcelView(timeline={"totals": ["year"]})
+        assert [path for path, _ in unread_view_notes([hung.at("quarter")])] == ["m.view"]
+
+    def test_a_named_view_taken_by_a_second_model_keeps_its_name(self):
+        m = self._model()
+        m.board_view = ExcelView("Board", timeline={"totals": ["year"]})
+        m2 = self._model()
+        m2.board_view = m.board_view     # adopted by a second parent: a copy
+        assert unread_view_notes([m2]) == []
+
+    def test_an_ancestor_s_slot_reads_a_view_for_a_section_written_alone(self, tmp_path):
+        m = self._model()
+        m.pnl.fin_view = ExcelView(timeline={"totals": ["year"]})
+        m.default_excel_view = m.pnl.fin_view
+        assert unread_view_notes([m.pnl]) == []
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UnreadViewWarning)
+            m.pnl.to_excel(tmp_path / "t.xlsx")
+
+    def test_a_view_rendered_as_the_applied_look_is_read(self, tmp_path):
+        from modeleon.compile.excel.view import applied_view
+
+        m = self._model()
+        m.board_view = ExcelView(timeline={"totals": ["year"]})   # unnamed, applied
+        assert unread_view_notes([m]) != []
+        with applied_view(m.board_view):
+            assert unread_view_notes([m]) == []
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", UnreadViewWarning)
+                m.to_excel(tmp_path / "t.xlsx")
+        assert unread_view_notes([m]) != []
+
+    def test_a_view_rendered_under_the_house_layer_is_read(self, tmp_path):
+        m = self._model()
+        m.house_view = ExcelView(timeline={"totals": ["year"]})
+        assert unread_view_notes([m]) != []
+        with mo.house_view(m.house_view):
+            assert unread_view_notes([m]) == []
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", UnreadViewWarning)
+                m.to_excel(tmp_path / "t.xlsx")
+        assert unread_view_notes([m]) != []   # the layer ends with the block
+
+    def test_the_view_keyword_is_noted_and_the_book_warns(self, tmp_path):
+        m = self._model(view=ExcelView(timeline={"totals": ["year"]}))
+        assert [path for path, _ in unread_view_notes([m])] == ["m.view"]
+        with pytest.warns(UnreadViewWarning, match=r"`m\.view = mo\.ExcelView"):
+            m.to_excel(tmp_path / "t.xlsx")
+        ws = load_workbook(tmp_path / "t.xlsx")["P&L"]
+        heads = {ws.cell(r, c).value for r in range(1, 4) for c in range(1, ws.max_column + 1)}
+        assert "Total 2026" not in heads   # the book kept its look
+
+    def test_a_view_under_a_section_is_spelled_by_its_path(self):
+        m = self._model()
+        m.pnl.view = ExcelView(timeline={"totals": ["year"]})
+        (path, note), = unread_view_notes([m])
+        assert path == "m.pnl.view"
+        assert note.startswith("`m.pnl.view = mo.ExcelView(...)` hangs the view on m.pnl ")
+
+    def test_a_view_the_slot_points_at_is_read(self):
+        m = self._model()
+        m.fin_view = ExcelView(timeline={"totals": ["year"]})
+        m.default_excel_view = m.fin_view
+        assert unread_view_notes([m]) == []
+
+    def test_a_view_read_through_its_extension_is_read(self):
+        m = self._model()
+        m.base_view = ExcelView(font={"name": "Arial Narrow", "size": 10})
+        m.pnl.default_excel_view = m.base_view.extend(cell_types={"on": True})
+        assert unread_view_notes([m]) == []
+
+    def test_a_named_view_and_a_view_under_another_name_pass(self, tmp_path):
+        m = self._model()
+        m.quarterly_view = ExcelView("Quarterly", timeline={"totals": ["quarter", "year"]})
+        m.style = ExcelView(timeline={"totals": ["quarter", "year"]})
+        assert unread_view_notes([m]) == []
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UnreadViewWarning)
+            m.to_excel(tmp_path / "t.xlsx")
+
+    def test_the_slot_draws_the_total_columns(self, tmp_path):
+        m = self._model()
+        m.default_excel_view = ExcelView(timeline={"totals": ["quarter", "year"]})
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UnreadViewWarning)
+            m.to_excel(tmp_path / "t.xlsx")
+        ws = load_workbook(tmp_path / "t.xlsx")["P&L"]
+        heads = {ws.cell(r, c).value for r in range(1, 4) for c in range(1, ws.max_column + 1)}
+        assert {"Total Q1", "Total 2026", "Total 2027"} <= heads

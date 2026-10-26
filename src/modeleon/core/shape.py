@@ -19,7 +19,7 @@ broadcast order.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 if TYPE_CHECKING:
     from .variable import Variable
@@ -45,6 +45,37 @@ def reject_axised(value, where: str) -> None:
             f"coordinates with periods. Axised operands are not "
             f"supported here; slice one coordinate first."
         )
+
+
+def keys_along(var: Any) -> Optional[List[Any]]:
+    """The keys a line runs ALONG instead of periods — a keyed list
+    (``mo.Variable({'FY2023': 400, 'FY2024': 450})``) or a line on one
+    finite axis that is not time (``indexed_by=[regions]``) — one per
+    cell, in cell order, as given; ``None`` for a series, a constant and
+    a tracked line. The one predicate the layout, the operators and the
+    functions share for "this line is not a time series"."""
+    keys = getattr(var, '_keys', None)
+    if keys and isinstance(getattr(var, '_value', None), list):
+        return list(keys)
+    axes: Tuple[Any, ...] = tuple(getattr(var, '_indexed_by', None) or ())
+    if len(axes) == 1 and getattr(axes[0], '_axis_kind', None) != 'time':
+        labels = getattr(axes[0], '_value', None)
+        if isinstance(labels, list):
+            return list(labels)
+    return None
+
+
+def line_keys(var: "Variable") -> Optional[List[str]]:
+    """The keys a line runs ALONG instead of periods — a keyed list
+    (``mo.Variable({'FY2023': 400, 'FY2024': 450})``) or a line on one
+    finite axis that is not time (``indexed_by=[regions]``) — one per
+    cell, in cell order; ``None`` for a series, a constant and a
+    tracked line. Such a line stands under a caption row of these keys
+    (``key_captions_by_sheet``) and counts for no period column. Public
+    so a renderer captions the line by the keys the layout placed it
+    under."""
+    labels = keys_along(var)
+    return None if labels is None else [str(label) for label in labels]
 
 
 @dataclass(frozen=True, slots=True)

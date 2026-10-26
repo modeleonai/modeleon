@@ -127,13 +127,14 @@ class TestOneOperandOrScalarsOnlyAreUnchanged:
 
 
 class TestUnitsAndErrors:
-    def test_a_shared_unit_is_kept_and_a_mixed_one_dropped(self):
+    def test_a_shared_unit_is_kept_and_a_mixed_one_refused(self):
         a = mo.Variable([3.0, 8.0, 5.0], unit="$")
         b = mo.Variable([4.0, 4.0, 4.0], unit="$")
         c = mo.Variable([4.0, 4.0, 4.0], unit="hr")
         assert str(mo.MIN(a, b)._unit) == "$"
         assert str(mo.MAX(a, 0.0)._unit) == "$"
-        assert mo.MIN(a, c)._unit is None
+        with pytest.raises(ValueError, match="mo.MIN takes its values in one unit"):
+            mo.MIN(a, c)
 
     def test_an_error_cell_is_the_period_s_result(self):
         e = mo.Variable([2.0, 2.0, 2.0]) / mo.Variable([1.0, 0.0, 2.0])

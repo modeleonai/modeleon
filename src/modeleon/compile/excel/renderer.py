@@ -20,8 +20,9 @@ import contextlib
 import logging
 import re
 import warnings
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from .addresses import VariableAddresses
 from ...core.errors import CrossScopeReferenceWarning
@@ -44,6 +45,14 @@ from ...core.expr import (
     VarRef,
 )
 from ..renderer import RenderCtx
+from ...functions.registry import (
+    excel_name,
+    file_prefix,
+    is_passthrough,
+    is_range_taking,
+    per_period_arity,
+    range_positions,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +92,58 @@ def _fold_sum(parts: List[str]) -> Optional[str]:
         return None
     return "SUM({})".format(", ".join(
         f"{prefix}{first}:{last}" if last else f"{prefix}{first}" for first, last in runs))
+
+
+@dataclass(frozen=True)
+class _Frame:
+    """The value a formula is being written an element of, as Python
+    computed it: ``var`` (the cell's own line, or an unnamed intermediate
+    written inline) and the element's index less the period being written
+    (``offset``: a lag that writes the previous period moves both).
+    ``window`` is the window (a sheet window key) ``var``'s operands were
+    read onto by DATE — an operator or a function that is one call per
+    period aligning two windows — and None where they were read by
+    position (or by key)."""
+
+    var: Any
+    offset: int
+    window: Optional[tuple]
+
+
+def _aligned_key(var: Any) -> Optional[tuple]:
+    """The window a formula's operands were aligned onto by date — the
+    combined window an operator or a one-call-per-period function puts its
+    result on and marks (``_read_by_date``) — as a sheet window key; None
+    for a value its operands gave by position (a line on a window of its
+    own read otherwise: ``start=``, a re-grain, a copy)."""
+    if not getattr(var, '_read_by_date', False):
+        return None
+    if getattr(var, '_grain', None) is None or getattr(var, '_start', None) is None:
+        return None
+    value = getattr(var, '_value', None)
+    n = len(value) if isinstance(value, list) else getattr(value, 'time_length', None)
+    if not n:
+        return None
+    first_day = getattr(var, '_first_day', None)
+    key = (var._grain, var._start, n)
+    return key if first_day is None else (*key, first_day)
+
+
+def _by_position(var: Any) -> bool:
+    """A value whose elements are read at the cell's own period: not
+    aligned by date, along no keys — writing it needs no frame."""
+    return not getattr(var, '_read_by_date', False) and not getattr(var, '_keys', None)
+
+
+def _periods_from(a: tuple, b: tuple) -> int:
+    """The periods from window ``a``'s first to window ``b``'s, both of one
+    grain: negative when ``b`` starts earlier."""
+    from ...core.time import _count, _first_day, _parse
+    grain = a[0]
+    here, there = _parse(a[1], grain), _parse(b[1], grain)
+    if _first_day(here, grain) <= _first_day(there, grain):
+        return _count(here, there, grain) - 1
+    return 1 - _count(there, here, grain)
 
 
 _PY_TO_EXCEL_OP: Dict[str, str] = {
@@ -125,12 +186,14 @@ _CHAIN_LEVELS = (frozenset({"+", "-"}), frozenset({"*", "/"}))
 # The translator renders those args as ranges (``B2:F2``) and leaves
 # scalar VarRefs / literals as normal. Covers classic aggregates (SUM,
 # MAX, MIN, …) and financial-series funcs (IRR, NPV, XIRR) where Excel
-# expects a range for the cash-flow / dates argument. ``MIN`` / ``MAX``
-# over two or more operands with a series among them are the exception
-# (``_per_period_call``): one call per period, its operands this
-# period's cells.
+# expects a range for the cash-flow / dates argument. A call over enough
+# values with a series among them is the exception (``_per_period_call``):
+# one call per period, its operands this period's cells — ``SUM(a, b)``,
+# ``MIN`` / ``MAX`` over two or more operands, ``MEDIAN(a, b)``, a
+# percentile over a list of yearly lines.
 def _contiguous_run(refs: list) -> bool:
-    """Do these cell refs sit side by side on one row?
+    """Do these cell refs sit side by side on one row, or one under
+    another in one column, in order?
 
     A range is only honest when they do. The interleave that breaks it
     is ordinary — a declared quarter total puts a column between March
@@ -145,53 +208,69 @@ def _contiguous_run(refs: list) -> bool:
     except Exception:
         return True                    # unparseable: emit the plain range
     rows = {r for r, _c in cells}
-    if len(rows) != 1:
+    cols = {c for _r, c in cells}
+    if len(rows) == 1:
+        run = [c for _r, c in cells]
+    elif len(cols) == 1:
+        run = [r for r, _c in cells]
+    else:
         return False
-    cols = [c for _r, c in cells]
-    return all(b - a == 1 for a, b in zip(cols, cols[1:]))
+    return all(b - a == 1 for a, b in zip(run, run[1:]))
 
 
-_RANGE_TAKING_FUNCS = {
-    "SUM", "AVERAGE", "MIN", "MAX", "COUNT",
-    "IRR", "NPV", "XIRR", "XNPV",
-    # What ``SUM(a * b)`` over two rows is written as; its arrays are
-    # ranges only (a comma list would be read as more arrays).
-    "SUMPRODUCT",
-}
+# Which names are written as ranges, which pass through as ``=NAME(args)``,
+# and what the file stores before a name (``_xlfn.DAYS``) is the function
+# registry's to say (``modeleon.functions.registry``); each function
+# registers itself from its own module.
 
 
-def _per_period_call(call: FuncCall) -> bool:
-    """``MIN`` / ``MAX`` over two or more operands with a series among
-    them is a cap or a floor, one call per period, not a reduction: its
-    operands are written as this period's cells, never as ranges."""
-    if call.func.upper() not in ("MIN", "MAX") or len(call.args) < 2:
+def _per_period_call(call: FuncCall,
+                     lists_series: Optional[Callable[[ListExpr], bool]] = None) -> bool:
+    """A call over enough values to be one call per period, a series among
+    them (the registry's ``per_period_arity``) — ``SUM(a, b)`` is a
+    subtotal of a period's cells, ``MIN`` / ``MAX`` over two or more
+    operands are a cap or a floor, ``MEDIAN(a, b)`` the median of a
+    period's two cells, ``PERCENTILE_INC([a, b, c], k)`` the percentile of
+    a period's cells of three lines: its values are written as this
+    period's cells, never as the lines' ranges. The values are the
+    arguments read as ranges, each line a list of lines holds counted;
+    ``lists_series`` answers whether a list of lines holds a series."""
+    func = call.func.upper()
+    arity = per_period_arity(func)
+    if arity is None:
         return False
-    for arg in call.args:
-        if isinstance(arg, Literal) and isinstance(arg.value, list):
-            return True
-        if isinstance(arg, VarRef):
-            value = getattr(arg.var, "_value", None)
-            if isinstance(value, list) or hasattr(value, "roles"):
-                return True
-    return False
+    positions = range_positions(func)
+    values: List[Any] = []
+    lists: List[ListExpr] = []
+    count = 0
+    for i, arg in enumerate(call.args):
+        if positions is not None and i not in positions:
+            continue
+        if isinstance(arg, ListExpr):
+            lists.append(arg)
+            count += len(arg.items)
+        else:
+            values.append(arg)
+            count += 1
+    if count < arity:
+        return False
+    if any(isinstance(arg, Literal) and isinstance(arg.value, list) for arg in values):
+        return True
+    series = lists_series or _lists_series
+    return any(_is_series_ref(arg) for arg in values) or any(series(arg) for arg in lists)
 
 
-# Function names that pass through to Excel unchanged. AST FuncCall nodes
-# use Excel casing directly (``IF``, ``ABS``, ``ROUND``, etc.), so the
-# translator just emits them verbatim — no rename map needed.
-_PASSTHROUGH_FUNCS = _RANGE_TAKING_FUNCS | {
-    "IF", "AND", "OR", "NOT", "CHOOSE", "ISBLANK", "ABS", "ROUND", "INT",
-    "MOD",
-    "EDATE", "EOMONTH", "YEAR", "MONTH", "DAY", "DATE", "DAYS360", "TODAY",
-    "YEARFRAC", "DAYS",
-    "LEN", "UPPER", "LOWER", "TEXT",  # CONCAT renders as the `&` operator
-    "PMT", "FV", "PV", "RATE",
-}
+def _lists_series(node: ListExpr) -> bool:
+    return any(_is_series_ref(item) for item in node.items)
 
-#: Excel 2013+ functions are stored in the file with the ``_xlfn.`` prefix:
-#: written bare, Excel shows #NAME? (it reads ``_xlfn.DAYS`` and displays
-#: ``=DAYS(...)``).
-_FILE_PREFIX = {"DAYS": "_xlfn."}
+
+def _is_series_ref(node: Any) -> bool:
+    """A reference to a line holding a series (a row, or a row per track)."""
+    if not isinstance(node, VarRef):
+        return False
+    value = getattr(node.var, "_value", None)
+    return isinstance(value, list) or hasattr(value, "roles")
+
 
 
 def _value_at_period(value: Any, period_idx: int) -> Any:
@@ -218,6 +297,12 @@ def _value_to_excel_literal(value: Any) -> str:
     if isinstance(value, bool):
         return "TRUE" if value else "FALSE"
     if isinstance(value, datetime):
+        if value.hour or value.minute or value.second:
+            # An instant keeps its clock: 13:00 is not the day's start. A
+            # sum, it stands in brackets: ``x - start`` must not read
+            # ``(x - DATE(…)) + TIME(…)``.
+            return (f"(DATE({value.year}, {value.month}, {value.day})"
+                    f"+TIME({value.hour}, {value.minute}, {value.second}))")
         value = value.date()
     if isinstance(value, date):
         return f"DATE({value.year}, {value.month}, {value.day})"
@@ -369,6 +454,13 @@ class ExcelRenderer:
         #: before each walk.
         self.inlined: List[tuple[Expr, str]] = []
         self.lossy: List[Expr] = []
+        #: A list of lines many calls share (one range read once, see
+        #: ``functions.criteria``) is read once per render: whether it
+        #: holds a series, and the text of its cells per sheet and period —
+        #: keyed by the node, which each entry holds so its id stays its
+        #: own. Nothing a render reads moves while it lasts.
+        self._listed: Dict[int, tuple[ListExpr, bool]] = {}
+        self._ranges: Dict[tuple[Any, ...], tuple[ListExpr, Optional[str]]] = {}
         self.walker: Any = None  # set by Walker(renderer) constructor
 
     def _note_inlined(self, node: Expr, literal: str, ctx: RenderCtx) -> str:
@@ -458,7 +550,9 @@ class ExcelRenderer:
         anchor's own chain, this sheet's header row, the anchor's row,
         or the period spelled off its window's start — and only through a
         header or anchor that counts the same window as the formula."""
-        from ...core.time import _first_day, _parse, resolve_default_window, spelled_first_day
+        from ...core.time import (
+            GRAINS, _first_day, _parse, resolve_default_window, spelled_first_day,
+        )
         from .header import date_literal, spell_anchor, spell_inline, window_key
         i = ctx.period_idx
         self_var = ctx.self_var
@@ -467,8 +561,7 @@ class ExcelRenderer:
         window = resolve_default_window(self_var) if self_var is not None else None
         if window_key(window) is None:
             loc = getattr(host, 'time', None)
-            if loc is None or loc.start is None or loc.grain not in ('day', 'month',
-                                                                     'quarter', 'year'):
+            if loc is None or loc.start is None or loc.grain not in GRAINS:
                 return self._note_inlined(TimeRef(field), _value_to_excel_literal(
                     _value_at_period(getattr(host, '_value', None), i)), ctx)
             start = loc.first_day or _first_day(_parse(loc.start, loc.grain), loc.grain)
@@ -545,13 +638,18 @@ class ExcelRenderer:
         window = resolve_default_window(var)
         if window is None or window.start is None:
             return None
+        from ...core.calendar import GREGORIAN
+        if GREGORIAN.knows(window.grain) and GREGORIAN.ruler(window.grain).sub_day:
+            # "Period 0" of a clock ruler stops where the first period starts.
+            return f"{self._start_cell(window, sheet)}"
         return f"{self._start_cell(window, sheet)}-1"
 
     def render_varref(self, node: VarRef, ctx: RenderCtx) -> str:
         target = self._varref_target(node, ctx)
         if not isinstance(target, Expr):
             return target
-        with self._chain_passes(node, target, ctx):
+        inline = node.var if target is node.var._expr else None
+        with self._chain_passes(node, target, ctx), self._entered(inline, ctx):
             return self.walker.render(target, ctx)
 
     def _varref_target(self, node: VarRef, ctx: RenderCtx) -> Any:
@@ -572,6 +670,9 @@ class ExcelRenderer:
             if coord is not None:
                 return coord
         if var_id in self.addresses:
+            dated = self._dated_cell(node, var_id, ctx)
+            if dated is not None:
+                return dated
             return self._resolve_var_addr(var_id, ctx.period_idx, ctx.current_sheet)
         # An address-less operand may still LIVE in a laid-out row: a
         # loop-built per-month intermediate is the same object as that
@@ -902,27 +1003,44 @@ class ExcelRenderer:
         # outgrew Python's stack — the cell fell back to its number.
         level = next((ops for ops in _CHAIN_LEVELS if op in ops), ())
         chain = [node]
-        operand: Any = node.left
-        while True:
-            target = operand
-            if isinstance(operand, VarRef) and operand is not ctx.own_chain:
-                target = self._varref_target(operand, ctx)
-            if not (isinstance(target, BinOp) and target.op in level
-                    and self._folded_chain(target, ctx) is None):
-                break
-            chain.append(target)
-            operand = target.left
-        if target is operand:
-            rendered = self.walker.render(operand, ctx)
-        elif isinstance(target, Expr):
-            with self._chain_passes(operand, target, ctx):
-                rendered = self.walker.render(target, ctx)
-        else:
-            rendered = target
-        parts = [self._wrap_operand(operand, rendered, chain[-1].op, side="left")]
-        for step in reversed(chain):
-            parts.append(_PY_TO_EXCEL_OP.get(step.op, step.op))
-            parts.append(self._render_operand(step.right, step.op, ctx, side="right"))
+        # Each step of the run down an unnamed intermediate is written in
+        # that intermediate's element (``_entered``), its left side read
+        # in it too: entered on the way down, left on the way back up.
+        entered: List[Any] = []
+        try:
+            operand: Any = node.left
+            while True:
+                target = operand
+                if isinstance(operand, VarRef) and operand is not ctx.own_chain:
+                    target = self._varref_target(operand, ctx)
+                if not (isinstance(target, BinOp) and target.op in level
+                        and self._folded_chain(target, ctx) is None):
+                    break
+                chain.append(target)
+                step_in = self._entered(operand.var if isinstance(operand, VarRef)
+                                        and target is operand.var._expr else None, ctx)
+                step_in.__enter__()
+                entered.append(step_in)
+                operand = target.left
+            if target is operand:
+                rendered = self.walker.render(operand, ctx)
+            elif isinstance(target, Expr):
+                last = operand.var if (isinstance(operand, VarRef)
+                                       and target is operand.var._expr) else None
+                with self._chain_passes(operand, target, ctx), self._entered(last, ctx):
+                    rendered = self.walker.render(target, ctx)
+            else:
+                rendered = target
+            parts = [self._wrap_operand(operand, rendered, chain[-1].op, side="left")]
+            for k in range(len(chain) - 1, -1, -1):
+                while len(entered) > k:
+                    entered.pop().__exit__(None, None, None)
+                step = chain[k]
+                parts.append(_PY_TO_EXCEL_OP.get(step.op, step.op))
+                parts.append(self._render_operand(step.right, step.op, ctx, side="right"))
+        finally:
+            while entered:
+                entered.pop().__exit__(None, None, None)
         text = " ".join(parts)
         # A sum of a thousand rows outgrows Excel's formula: as a run
         # of cells it is ``SUM(B2:B1001)``, the way a hand-built book
@@ -1091,7 +1209,7 @@ class ExcelRenderer:
         if node.render_backends is not None and 'excel' not in node.render_backends:
             return self._fallback_funccall(node, ctx)
 
-        if func in _RANGE_TAKING_FUNCS and not _per_period_call(node):
+        if is_range_taking(func) and not _per_period_call(node, self._lists_series):
             # Reached here, the call is the cell's whole formula (a call
             # inside a larger one is met through its Variable first).
             inlined = self._inline_unlaid_aggregate(node, None, ctx)
@@ -1101,8 +1219,28 @@ class ExcelRenderer:
             ranges = self._product_ranges(node, ctx)
             if ranges is not None:
                 return f"SUMPRODUCT({', '.join(ranges)})"
-            parts = [self._render_range_or_cell(a, ctx, func) for a in node.args]
-            return f"{func}({', '.join(parts)})"
+            # A range position is the row's range; any other position
+            # is this period's cell (a per-period criterion, a key).
+            positions = range_positions(func)
+            parts = [
+                self._render_range_or_cell(a, ctx, func)
+                if positions is None or i in positions
+                else self.walker.render(a, ctx)
+                for i, a in enumerate(node.args)
+            ]
+            return f"{file_prefix(func)}{excel_name(func)}({', '.join(parts)})"
+
+        if is_range_taking(func):
+            # One call per period: a list of lines at a range position is
+            # the run of their cells in this period's column.
+            positions = range_positions(func)
+            parts = [
+                self._render_cell_list(a, ctx, func, ctx.period_idx)
+                if isinstance(a, ListExpr) and (positions is None or i in positions)
+                else self.walker.render(a, ctx)
+                for i, a in enumerate(node.args)
+            ]
+            return f"{file_prefix(func)}{excel_name(func)}({', '.join(parts)})"
 
         parts = [self.walker.render(a, ctx) for a in node.args]
 
@@ -1117,13 +1255,13 @@ class ExcelRenderer:
             ]
             return " & ".join(pieces)
 
-        if func in _PASSTHROUGH_FUNCS:
-            return f"{_FILE_PREFIX.get(func, '')}{func}({', '.join(parts)})"
+        if is_passthrough(func):
+            return f"{file_prefix(func)}{excel_name(func)}({', '.join(parts)})"
 
         logger.warning(
             "Unknown function %r in formula — emitting as-is. If this is a "
-            "valid Excel function, add it to _PASSTHROUGH_FUNCS; otherwise "
-            "the cell will be invalid.",
+            "valid Excel function, register it in modeleon.functions.registry; "
+            "otherwise the cell will be invalid.",
             node.func,
         )
         return f"{node.func}({', '.join(parts)})"
@@ -1441,6 +1579,9 @@ class ExcelRenderer:
     def _render_range_or_cell(
         self, arg: Expr, ctx: RenderCtx, func: Optional[str] = None,
     ) -> str:
+        if isinstance(arg, ListExpr):
+            block = self._render_block(arg, ctx)
+            return self._render_cell_list(arg, ctx, func) if block is None else block
         if isinstance(arg, VarRef):
             cid = self._coord_var_id(arg.var, ctx)
             if cid is None:
@@ -1489,14 +1630,190 @@ class ExcelRenderer:
                     )
         return self.walker.render(arg, ctx)
 
+    def _render_cell_list(
+        self, node: ListExpr, ctx: RenderCtx, func: Optional[str],
+        period: Optional[int] = None,
+    ) -> str:
+        """A list of scalar lines as one range argument: their cells, one
+        under another in a column (a field down the records of a table)
+        or side by side on a row, are the range ``Deals!C3:C5``. Cells
+        that form no run cannot be one range — a comma list is read as
+        further arguments by every function but the variadic ones — so
+        the cell carries its computed value. Given a ``period``, a line
+        holding a series stands for its cell of that period: a field of
+        yearly lines down the records is the run in that year's column."""
+        # A period's cells are those of the element being written: read by
+        # date or by position as Python read them (``_frame``).
+        frame = self._frame(ctx) if period is not None else None
+        key = (id(node), ctx.current_sheet, ctx.track_role, period,
+               func in self._LIST_SAFE_FUNCS,
+               None if frame is None else (frame.offset, frame.window,
+                                           tuple(getattr(frame.var, '_keys', None) or ())))
+        hit = self._ranges.get(key)
+        if hit is not None and hit[0] is node:
+            return self._ship_value(node, ctx) if hit[1] is None else hit[1]
+        text = self._cell_list_text(node, ctx, func, period)
+        if not self._mirrored(node, ctx):
+            self._ranges[key] = (node, text)
+        return self._ship_value(node, ctx) if text is None else text
+
+    # Does a list of lines hold a series — read once per render.
+    def _lists_series(self, node: ListExpr) -> bool:
+        hit = self._listed.get(id(node))
+        if hit is None or hit[0] is not node:
+            hit = self._listed[id(node)] = (node, _lists_series(node))
+        return hit[1]
+
+    # Is a line of ``node`` mirrored into this sheet's header? Its cell then
+    # depends on the formula being rendered (the mirror reads the row
+    # itself), so the text is read for each formula.
+    def _mirrored(self, node: ListExpr, ctx: RenderCtx) -> bool:
+        book = self.time
+        own = book.sheets.get(ctx.current_sheet) if book is not None else None
+        if own is None or not own.alias:
+            return False
+        return any(isinstance(item, VarRef) and item.var.id in own.alias
+                   for item in node.items)
+
+    # The text of ``_render_cell_list``, or None where the cell carries its
+    # computed value.
+    def _cell_list_text(
+        self, node: ListExpr, ctx: RenderCtx, func: Optional[str],
+        period: Optional[int],
+    ) -> Optional[str]:
+        cells: List[tuple[str, str]] = []
+        for item in node.items:
+            found = self._cell_of(item, ctx, period)
+            if found is None:
+                return None
+            cells.append(found)
+        refs = [cell for cell, _vid in cells]
+        sheets = {self.var_to_sheet.get(vid) for _cell, vid in cells}
+        first, vid = cells[0]
+        if len(sheets) == 1 and _contiguous_run(refs):
+            start = self._maybe_qualify(first, vid, ctx.current_sheet)
+            return start if len(refs) == 1 else f"{start}:{refs[-1]}"
+        if func in self._LIST_SAFE_FUNCS:
+            return ", ".join(
+                self._maybe_qualify(cell, vid, ctx.current_sheet) for cell, vid in cells
+            )
+        return None
+
+    def _render_block(self, node: ListExpr, ctx: RenderCtx) -> Optional[str]:
+        """A list of rows as one rectangular range argument — the records
+        of a table, each a list of its cells behind a literal label, or
+        laid-out rows one under another — ``Deals!A3:C5``, ``Inputs!B2:D3``.
+        A record's label is the cell before its first field, in the
+        sheet's first column, where the records layout writes it; with
+        anything between the two (a unit column) no cell can be named for
+        it. None when ``node`` is a list of cells, not of rows; when the
+        rows form no rectangle on one sheet the cell carries its computed
+        value."""
+        from openpyxl.utils.cell import coordinate_to_tuple
+
+        rows: List[List[str]] = []
+        owners: List[str] = []
+        for item in node.items:
+            if isinstance(item, ListExpr):
+                cells = item.items
+                labelled = bool(cells) and isinstance(cells[0], Literal) and isinstance(
+                    cells[0].value, str)
+                refs: List[str] = []
+                for sub in cells[1 if labelled else 0:]:
+                    found = self._cell_of(sub, ctx)
+                    if found is None:
+                        return self._ship_value(node, ctx)
+                    refs.append(found[0])
+                    owners.append(found[1])
+                if not refs:
+                    return self._ship_value(node, ctx)
+                if labelled:
+                    row_no, col = coordinate_to_tuple(refs[0])
+                    if col != 2:
+                        return self._ship_value(node, ctx)
+                    refs.insert(0, f"A{row_no}")
+                rows.append(refs)
+            elif isinstance(item, VarRef) and (
+                isinstance(item.var._value, list) or hasattr(item.var._value, "roles")
+            ):
+                vid = self._coord_var_id(item.var, ctx)
+                addr = self.addresses.get(vid) if vid is not None else None
+                if vid is None or addr is None:
+                    return self._ship_value(node, ctx)
+                rows.append(list(addr.values))
+                owners.append(vid)
+            else:
+                return None
+        if not rows:
+            return None
+        if len({self.var_to_sheet.get(vid) for vid in owners}) != 1:
+            return self._ship_value(node, ctx)
+        grid = [[coordinate_to_tuple(ref) for ref in refs] for refs in rows]
+        cols = [c for _r, c in grid[0]]
+        tops = [row[0][0] for row in grid]
+        if (
+            any([c for _r, c in row] != cols for row in grid)
+            or any(len({r for r, _c in row}) != 1 for row in grid)
+            or any(b - a != 1 for a, b in zip(cols, cols[1:]))
+            or any(b - a != 1 for a, b in zip(tops, tops[1:]))
+        ):
+            return self._ship_value(node, ctx)
+        first = self._maybe_qualify(rows[0][0], owners[0], ctx.current_sheet)
+        last = rows[-1][-1]
+        return first if rows[0][0] == last else f"{first}:{last}"
+
+    def _cell_of(self, item: Expr, ctx: RenderCtx,
+                 period: Optional[int] = None) -> Optional[tuple[str, str]]:
+        """The one cell ``item`` stands for — a scalar line's, one element
+        of a laid-out row (``flow[0]``), or, given a ``period``, a row's
+        cell of that period, as Python read it (``_read_index``: of the
+        same date where lines on other windows were aligned) — with the id
+        it is addressed through; None when no cell holds it."""
+        if isinstance(item, VarRef):
+            var_id = self._coord_var_id(item.var, ctx)
+            addr_obj = self.addresses.get(var_id) if var_id is not None else None
+            if addr_obj is not None and var_id is not None:
+                cells = addr_obj.values
+                read = (self._read_index(item.var, var_id, addr_obj, ctx)
+                        if period is not None and isinstance(item.var._value, list) else None)
+                if read is not None and read[1]:
+                    return (cells[read[0]], var_id) if 0 <= read[0] < len(cells) else None
+                if len(cells) == 1:
+                    return cells[0], var_id
+                if read is not None and 0 <= read[0] < len(cells):
+                    return cells[read[0]], var_id
+                return None
+            inner = getattr(item.var, "_expr", None)
+            if isinstance(inner, Subscript):
+                item = inner
+        if (
+            isinstance(item, Subscript)
+            and isinstance(item.base, VarRef)
+            and isinstance(item.key, int)
+            and not isinstance(item.key, bool)
+        ):
+            var_id = self._coord_var_id(item.base.var, ctx)
+            addr_obj = self.addresses.get(var_id) if var_id is not None else None
+            if addr_obj is not None and var_id is not None:
+                n = len(addr_obj.values)
+                key = item.key
+                idx = key + n if key < 0 and self._is_native_row(item.base.var, addr_obj) else key
+                if 0 <= idx < n:
+                    return addr_obj.values[idx], var_id
+        return None
+
     def _unlaid_list_arg(self, call: FuncCall, ctx: RenderCtx) -> Optional[Expr]:
         """The first list argument of ``call`` that has no cells in this
         workbook — a Variable never attached to the model, an
         intermediate such as ``x * 2`` or ``x[0:2]`` of one, a literal
         ``[10, 20, 30]`` — or None when every list can be written as a
         range. Scalar arguments never count: one value is one cell or
-        one literal either way."""
-        for arg in call.args:
+        one literal either way, and nor does a list at a position the
+        registry writes as a cell."""
+        positions = range_positions(call.func.upper())
+        for i, arg in enumerate(call.args):
+            if positions is not None and i not in positions:
+                continue
             if isinstance(arg, Literal):
                 if isinstance(arg.value, list):
                     return arg
@@ -1591,7 +1908,7 @@ class ExcelRenderer:
         of the formula stays live. When the call is the cell's whole
         formula (``owner`` None) the cell carries its computed value.
         """
-        if call.func.upper() not in _RANGE_TAKING_FUNCS or _per_period_call(call):
+        if not is_range_taking(call.func.upper()) or _per_period_call(call, self._lists_series):
             return None
         arg = self._unlaid_list_arg(call, ctx)
         if arg is None:
@@ -1649,6 +1966,122 @@ class ExcelRenderer:
                 return keys.index(key)
         return None
 
+    def _dated_cell(self, node: VarRef, var_id: str, ctx: RenderCtx) -> Optional[str]:
+        """The cell of ``node``'s line this formula reads, where it is not
+        the one of the formula's own column: the cell Python read for the
+        value being written (``_frame``). By DATE where two windows were
+        aligned — an operator or a one-call-per-period function over a
+        line on a window of its own inside the sheet's (a tranche from
+        March in a model from January: its cell of the same date, as
+        ``_onto_window`` reads it) — a period the line has no column for
+        continued by its declared ``extend=`` rule: ``0`` for a flow, its
+        first or last cell for a rate held, the value where no rule
+        continues it. By KEY where lines along the same keys in another
+        order were combined; by position otherwise — the column's cell,
+        so a formula over one other window, which Python read by
+        position, reads it by position too. ``None`` where that is the
+        cell of the formula's own column."""
+        if ctx.frame is None and _by_position(ctx.self_var):
+            return None                 # the column's own cell, as before
+        if not isinstance(getattr(node.var, '_value', None), list):
+            return None
+        addr_obj = self.addresses.get(var_id)
+        if addr_obj is None:
+            return None
+        read = self._read_index(node.var, var_id, addr_obj, ctx)
+        if read is None:
+            return None
+        j, dated = read
+        cells = addr_obj.values
+        if 0 <= j < len(cells):
+            if j == ctx.period_idx:
+                return None
+            return self._maybe_qualify(cells[j], var_id, ctx.current_sheet)
+        if not dated:
+            return None
+        rule = getattr(node.var, '_extend', None)
+        if rule == 'zero':
+            return "0"
+        if rule == 'hold':
+            held = cells[0] if j < 0 else cells[-1]
+            return self._maybe_qualify(held, var_id, ctx.current_sheet)
+        return self._ship_value(node, ctx)
+
+    def _frame(self, ctx: RenderCtx) -> _Frame:
+        """The value the walk is writing an element of: the intermediate
+        it entered (``_entered``), else the cell's own line."""
+        frame = ctx.frame
+        if isinstance(frame, _Frame):
+            return frame
+        return _Frame(ctx.self_var, 0, _aligned_key(ctx.self_var))
+
+    def _sheet_key(self, var_id: str) -> Optional[tuple]:
+        """The window of the sheet a line is written on (its cells run on
+        it), or None where its columns are not dated."""
+        book = self.time
+        sheet = self.var_to_sheet.get(var_id)
+        if book is None or sheet is None:
+            return None
+        st = book.sheets.get(sheet)
+        return None if st is None else st.key
+
+    @staticmethod
+    def _index_in(var: Any, window: Optional[tuple], frame: _Frame, i: int) -> int:
+        """The element of ``var`` (its values on ``window``) Python read
+        for ``frame``'s element ``i``: of the same date where ``frame``
+        was aligned by date, of the same key where the frame runs along
+        the same keys in another order, else of the same position."""
+        if frame.window is not None:
+            if window is None or window[0] != frame.window[0]:
+                return i
+            return i - _periods_from(frame.window, window)
+        keys = getattr(frame.var, '_keys', None)
+        own = getattr(var, '_keys', None)
+        if (keys and own and list(own) != list(keys) and 0 <= i < len(keys)
+                and keys[i] in own):
+            return list(own).index(keys[i])
+        return i
+
+    def _read_index(self, var: Any, var_id: str, addr_obj: Any,
+                    ctx: RenderCtx) -> Optional[tuple[int, bool]]:
+        """``(j, dated)``: the cell of ``var``'s row Python read for the
+        element being written, and whether by date (``j`` then may fall
+        outside the row: its ``extend=`` rule continues it); None where
+        the row's cells are not its own periods, read as before."""
+        frame = self._frame(ctx)
+        i = ctx.period_idx + frame.offset
+        if frame.window is not None:
+            window = self._sheet_key(var_id)
+            if (window is not None and window[0] == frame.window[0]
+                    and (window[2] is None or len(addr_obj.values) == window[2])):
+                return self._index_in(var, window, frame, i), True
+        if not self._is_native_row(var, addr_obj):
+            return None
+        return self._index_in(var, None, frame, i), False
+
+    def _entered(self, var: Any, ctx: RenderCtx) -> contextlib.AbstractContextManager[None]:
+        """While an unnamed intermediate's expression is written inline,
+        the walk writes ``var``'s element — the one Python read for the
+        enclosing element (``_index_in``). Where neither it nor the cell
+        reads anything but the column's own cells, there is no frame to
+        enter."""
+        if var is None or (ctx.frame is None and _by_position(ctx.self_var)
+                           and _by_position(var)):
+            return contextlib.nullcontext()
+        return self._entered_frame(var, ctx)
+
+    @contextlib.contextmanager
+    def _entered_frame(self, var: Any, ctx: RenderCtx) -> Iterator[None]:
+        parent = self._frame(ctx)
+        window = _aligned_key(var)
+        index = self._index_in(var, window, parent, ctx.period_idx + parent.offset)
+        previous = ctx.frame
+        ctx.frame = _Frame(var, index - ctx.period_idx, window)
+        try:
+            yield
+        finally:
+            ctx.frame = previous
+
     def _resolve_var_addr(
         self, var_id: str, period_idx: int, current_sheet: Optional[str] = None
     ) -> str:
@@ -1675,7 +2108,7 @@ class ExcelRenderer:
     #: ``XIRR`` are not among them: their second argument is a guess /
     #: a date range, so a comma list would be read as another argument
     #: entirely.
-    _LIST_SAFE_FUNCS = {"SUM", "AVERAGE", "MIN", "MAX", "COUNT", "NPV"}
+    _LIST_SAFE_FUNCS = {"SUM", "AVERAGE", "MIN", "MAX", "COUNT", "COUNTA", "NPV"}
 
     def _resolve_var_range(
         self,

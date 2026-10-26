@@ -28,6 +28,25 @@ class TestComponentInheritance:
         assert isinstance(m, Component)
 
 
+class TestBareVariableFields:
+    """``mo.Variable()`` with no label, props or description writes the
+    fields ``Component.__init__`` would, without walking the chain (every
+    operator result is built that way). A subclass always walks it, so
+    comparing the two pins the shortcut to what it stands for."""
+
+    def test_same_fields_in_the_same_order(self):
+        class Walked(mo.Variable):
+            pass
+
+        bare, walked = mo.Variable(), Walked()
+        assert list(vars(bare)) == list(vars(walked))
+        assert vars(bare) == vars(walked)
+
+    def test_each_variable_gets_its_own_props_dict(self):
+        a, b = mo.Variable(), mo.Variable()
+        assert a.excel_props is not b.excel_props
+
+
 class TestComponentTypingTarget:
     """Functions that should accept any model-tree node take ``Component``
     as their parameter type. This pins that Variable and MultiVariable

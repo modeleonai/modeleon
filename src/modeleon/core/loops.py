@@ -57,6 +57,7 @@ from .expr import (
     BinOp, Compare, Expr, FuncCall, ListExpr, Literal, MethodCall, Paren,
     SelfRef, Subscript, UnaryOp, VarRef,
 )
+from .unit import UNSETTLED
 
 
 class Dependents:
@@ -89,17 +90,13 @@ class Dependents:
         return (Dependents, (list(self._items.values()),))
 
 
-#: Functions that map one period to one period, so the loop can call
-#: them with this period's numbers. Everything else — ``SUM``, ``NPV``,
-#: ``MAX`` over one operand, … — reads a whole series and cannot sit
-#: inside the loop. ``MAX`` / ``MIN`` over two or more operands (a floor,
-#: a cap) are per period as well; :func:`_check_elementwise` admits them
-#: by their arity.
-_ELEMENTWISE = frozenset({
-    'IF', 'AND', 'OR', 'NOT', 'ABS', 'ROUND', 'INT', 'MOD', 'CHOOSE',
-    'ISBLANK', 'EDATE', 'EOMONTH', 'YEAR', 'MONTH', 'DAY', 'DATE',
-    'DAYS360', 'TODAY', 'LEN', 'UPPER', 'LOWER', 'CONCAT',
-})
+# Which functions the loop may call with this period's numbers is the
+# function registry's to say (``modeleon.functions.registry.admits_in_loop``):
+# the element-wise ones, and a call over two or more values that is one
+# call per period — ``MAX`` / ``MIN`` over two or more operands (a floor, a
+# cap), ``SUM(a, b)``, ``MEDIAN(a, b)``, ``PERCENTILE_INC([a, b, c], k)``.
+# Everything else — ``NPV``, ``SUM`` or ``MAX`` over one operand, … — reads
+# a whole series and cannot sit inside the loop.
 
 _BINOPS = {
     '+': operator.add, '-': operator.sub, '*': operator.mul,
@@ -380,16 +377,26 @@ def _resolve(nodes: List[Any], horizon: Optional[int]) -> None:
             )
 
     if periodic:
-        order = _order(periodic, same)
+        order = _order([v for v in nodes if v in periodic], same)
         n = horizon or _horizon_of(order)
         _evaluate_periodic(order, n)
         for v in order:
-            v._awaits = None
             v._loop_error = None
         # The loop's own units: its rows were built on placeholders,
         # which carry none, so they are derived again from the formulas —
-        # to a fixed point, as the rows depend on each other.
+        # to a fixed point, as the rows depend on each other. The rows
+        # wait until their units settle: a loop refused here leaves them
+        # without values, its refusal on each (``_settle_nodes``).
         _rederive_units(order)
+        # The check + makes of a count added to a share waited while the
+        # loop was open; it is made on the settled lines.
+        for v in order:
+            try:
+                _check_counts(v, order)
+            except ValueError as exc:
+                raise ValueError(f"{_label(v)}: {exc}") from exc
+        for v in order:
+            v._awaits = None
     if downstream:
         deps = {v: same[v] + lagged[v] + led[v] for v in downstream}
         # A downstream temporary that no row holds (an expression built and
@@ -406,9 +413,11 @@ def _resolve(nodes: List[Any], horizon: Optional[int]) -> None:
                 if r not in held:
                     held.add(r)
                     stack.append(r)
-        for v in _order(set(downstream), deps):
+        for v in _order(downstream, deps):
             try:
-                value, unit = _eval_row(v._expr)
+                declared = v._unit if getattr(v, '_unit_declared', False) else None
+                value, unit = _eval_row(v._expr, declared)
+                _check_counts(v)
             except (ValueError, TypeError) as exc:
                 if v in held:
                     raise ValueError(f"{_label(v)}: {exc}") from exc
@@ -424,69 +433,290 @@ def _resolve(nodes: List[Any], horizon: Optional[int]) -> None:
 # ─── Units ─────────────────────────────────────────────────────────
 
 
-def _unit_of(node: Any) -> Any:
+#: No row is being derived: every unit read is the row's own.
+_SETTLED: frozenset = frozenset()
+
+
+def _unit_of(node: Any, unsettled: Any = _SETTLED) -> Any:
     """The unit a formula tree produces, by the rules the operators use
     (``_unit_add`` / ``_unit_mul`` / …) — so a mix that the operators
-    refuse is refused here with the same message."""
+    refuse is refused here with the same message. While a loop settles,
+    a row in ``unsettled`` (ids) reads as :data:`UNSETTLED`: ``+`` takes
+    the other side's unit, a product or a power of it stays unsettled,
+    and a comparison with it waits."""
     from .variable_ops import _VariableArithmetic as arith
+
+    def unit_of(n: Any) -> Any:
+        return _unit_of(n, unsettled)
 
     if isinstance(node, Literal):
         return None
     if isinstance(node, VarRef):
-        return getattr(node.var, '_unit', None)
+        if id(node.var) in unsettled:
+            return UNSETTLED
+        return getattr(_settled(node.var), '_unit', None)
     if isinstance(node, Paren):
-        return _unit_of(node.inner)
+        return unit_of(node.inner)
     if isinstance(node, UnaryOp):
-        return _unit_of(node.operand)
+        return unit_of(node.operand)
     if isinstance(node, BinOp):
-        left, right = _unit_of(node.left), _unit_of(node.right)
-        if node.op in ('+', '-'):
-            return arith._unit_add(left, right)
+        left, right = unit_of(node.left), unit_of(node.right)
+        if node.op in ('+', '-', '%'):
+            if left is UNSETTLED or right is UNSETTLED:
+                known = right if left is UNSETTLED else left
+                return UNSETTLED if known is None or known is UNSETTLED else known
+            return (arith._unit_mod if node.op == '%' else arith._unit_add)(left, right)
+        if left is UNSETTLED:
+            return UNSETTLED
+        if node.op == '**':
+            exponent = node.right.value if isinstance(node.right, Literal) else None
+            return arith._unit_pow(left, exponent)
+        if right is UNSETTLED:
+            return UNSETTLED
         if node.op == '*':
             return arith._unit_mul(left, right)
         if node.op in ('/', '//'):
             return arith._unit_div(left, right)
-        # ``%`` and ``**`` track no unit on the operators either.
         return None
     if isinstance(node, Compare):
+        left, right = unit_of(node.left), unit_of(node.right)
+        if (left is not None and right is not None and UNSETTLED not in (left, right)
+                and left != right):
+            from .variable_ops import _incompatible_units
+            raise ValueError(_incompatible_units(left, right).replace(
+                "Cannot add/subtract", "Cannot compare", 1))
         return None
     if isinstance(node, FuncCall):
-        from ..functions._helpers import _UNITLESS_RESULTS, _shared_arg_unit
-        if node.func in _UNITLESS_RESULTS:
+        # The function's own law, the one its result was built by; an
+        # operand read here is often last period's value (a shift), not a
+        # line, so its unit comes from its formula, as for ``+``.
+        from ..functions._helpers import function_unit
+        return function_unit(node.func, node.args, unit_of,
+                             own_law=node.render_backends != frozenset())
+    if isinstance(node, MethodCall) and node.method == 'shift':
+        # A lag keeps its source's unit; its first cells hold the fill, so a
+        # fill in a unit is the source's (a pick, as ``mo.lag`` builds it),
+        # and a source not derived yet takes the fill's.
+        if unit_of(node.base) is None:
             return None
-        return _shared_arg_unit(node.args)
-    if isinstance(node, MethodCall) and node.method in ('shift', 'copy'):
-        return _unit_of(node.base)
+        from ..functions._helpers import same_unit
+        fill = node.kwargs.get('fill_value')
+        return same_unit('lag', [node.base, *([fill] if isinstance(fill, Expr) else [])],
+                         unit_of)
+    if isinstance(node, MethodCall) and node.method == 'copy':
+        return unit_of(node.base)
+    if isinstance(node, Subscript):
+        # A period, a key or a slice of a line is in the line's unit, as
+        # ``line[0]`` builds it.
+        return unit_of(node.base)
+    if isinstance(node, SelfRef):
+        # A recurrence is in the unit its template gives from its start,
+        # by the one rule ``mo.recurrence`` builds it by - read here with
+        # the rows not settled yet; a declared unit= is the row's own, and
+        # the row's dimension is checked where that unit is known.
+        from ..functions.recurrence import template_unit
+        return template_unit(node, unit_of(node.start), None,
+                             unsettled=unsettled, check_dimension=False)
     return None
 
 
 def _rederive_units(nodes: List[Any]) -> None:
     """Units were derived while the loop's rows were placeholders, which
-    carry none. Re-derive them from the final formulas — to a fixed
-    point, because a loop's units depend on each other the way its
-    values do. A unit the author declared stays as declared: a label on
-    a pure number does not survive a product, so it cannot be derived."""
+    carry none. Derive them again from the final formulas, to a fixed
+    point, as the rows depend on each other: every row starts unsettled,
+    so none takes a unit from a placeholder — ``+`` gives the other
+    side's unit, a product waits. Rows nothing in the loop settles (a
+    flag, an index, a discount factor) are pure numbers, as their
+    placeholders were: read so, the derivation goes on, and a product
+    with one takes its other factor's unit. Then every row's formula is
+    checked with the settled units, and must give the unit its row
+    holds. A unit the author declared stays as declared: a label on a
+    pure number does not survive a product, so it cannot be derived."""
+    rows = [v for v in nodes if getattr(v, '_expr', None) is not None]
+    declared = {id(v) for v in rows if getattr(v, '_unit_declared', False)}
+    unsettled = {id(v) for v in rows if id(v) not in declared}
+    _settle(rows, declared, unsettled)
+    if unsettled:
+        seeded = set(unsettled)
+        for v in rows:
+            if id(v) in unsettled:
+                v._unit = None
+        unsettled.clear()
+        _settle(rows, declared, unsettled, seeded)
+    # Every row's formula is checked - a declared unit decides what the
+    # row prints, never what its formula may add.
+    units: Dict[int, Any] = {}
+    failed: List[Tuple[Any, ValueError]] = []
+    for v in rows:
+        try:
+            units[id(v)] = _unit_of(v._expr)
+        except ValueError as exc:
+            failed.append((v, exc))
+    if failed:
+        v, mix = _the_mix(rows, failed)
+        raise ValueError(f"{_label(v)}: {mix}") from mix
+    for v in rows:
+        unit = units[id(v)]
+        if id(v) in declared or _dimension(unit) == _dimension(v._unit):
+            continue
+        raise ValueError(
+            f"{_label(v)}: its unit does not settle - read through mo.lag, its "
+            f"formula gives {unit or 'no unit'} from a row in "
+            f"{v._unit or 'no unit'}. A row multiplied by a dimension every "
+            f"period grows a power of it: give the factor no unit, or "
+            f"declare the row's unit (.set_unit(...))."
+        )
+
+
+def _the_mix(rows: List[Any], failed: List[Tuple[Any, ValueError]]) -> Tuple[Any, ValueError]:
+    """The failing row whose own formula mixes units. A row that fails
+    keeps the unit an earlier pass gave it, and a row that reads it -
+    through mo.lag it may be checked first - fails on that unit: read
+    every failing row, and what takes its unit from one, as not settled,
+    and the mix is the row that still fails."""
+    unsettled = {id(v) for v, _exc in failed}
+    grew = True
+    while grew:
+        grew = False
+        for v in rows:
+            if id(v) in unsettled:
+                continue
+            try:
+                waits = _unit_of(v._expr, unsettled) is UNSETTLED
+            except ValueError:
+                waits = False
+            if waits:
+                unsettled.add(id(v))
+                grew = True
+    for v, _exc in failed:
+        try:
+            _unit_of(v._expr, unsettled - {id(v)})
+        except ValueError as exc:
+            return v, exc
+    return failed[0]
+
+
+def _check_counts(v: Any, loop: Optional[List[Any]] = None) -> None:
+    """The check ``+`` makes of a bps or pp count added to a % fraction
+    (:func:`~modeleon.core.variable_ops._refuse_a_count_added_to_a_share`),
+    which waits while an operand's loop is open, made on the settled
+    lines: over a row's ``+`` / ``-``, and over the lines a function adds,
+    compares or picks (``SUM``, ``MAX``, ``IF``, ``CHOOSE``, …). A side the
+    row itself feeds - its row read through mo.lag - holds the row's
+    numbers from the second period on, so it is judged by its first, the
+    one the row has not written into."""
+    from .variable_ops import (_numbers, _refuse_a_count_added_to_a_share,
+                               _refuse_counts_among_shares)
+    expr = v._expr
+    where = None
+    pairs: List[Tuple[Any, Any]] = []
+    if isinstance(expr, BinOp) and expr.op in ('+', '-'):
+        operands = [expr.left, expr.right]
+    elif isinstance(expr, FuncCall):
+        from ..functions._helpers import _SAME_UNIT_FROM
+        start = _SAME_UNIT_FROM.get(expr.func)
+        if start is None:
+            return
+        operands, where = list(expr.args[start:]), f"mo.{expr.func}"
+    elif isinstance(expr, MethodCall) and expr.method == 'shift':
+        # A lag's fill is its series' first cell: a count beside a fraction.
+        fill = expr.kwargs.get('fill_value')
+        operands, where = [expr.base, *([fill] if isinstance(fill, VarRef) else [])], "mo.lag"
+    elif isinstance(expr, SelfRef):
+        # The template's own + and -, {prev} read as the start.
+        from ..functions.recurrence import template_count_pairs
+        start = _settled(expr.start.var) if isinstance(expr.start, VarRef) else None
+        pairs = [(_settled(a), _settled(b)) for a, b in template_count_pairs(expr, start)]
+        operands = []
+    else:
+        return
+    sides = []
+    for node in operands:
+        while isinstance(node, Paren):
+            node = node.inner
+        if isinstance(node, VarRef):
+            sides.append(_settled(node.var))
+        elif where is None:
+            return
+    fed: List[Set[int]] = []
+
+    def numbers(side: Any) -> List[Any]:
+        value = side._value
+        if loop is not None and isinstance(value, list):
+            if not fed:
+                fed.append({id(r) for r in _dependents_of(v, loop)})
+            if id(side) in fed[0]:
+                value = value[:1]
+        return _numbers(value)
+
+    for a, b in pairs:
+        _refuse_a_count_added_to_a_share(a, b, numbers, where=where)
+    _refuse_counts_among_shares(sides, numbers, where=where)
+
+
+def _filled_source(v: Any, by_id: Dict[int, Any], unsettled: Set[int],
+                   seeded: Any, declared: Set[int]) -> Optional[Tuple[Any, Any]]:
+    """``(row, unit)`` when ``v`` lags a row of this loop that no formula has
+    settled yet (or only as a pure number for want of anything else) with
+    a fill whose unit is known: the row is in the fill's unit."""
+    expr = v._expr
+    if not (isinstance(expr, MethodCall) and expr.method == 'shift'
+            and isinstance(expr.base, VarRef)):
+        return None
+    row = by_id.get(id(expr.base.var))
+    if row is None or id(row) in declared:
+        return None
+    if id(row) not in unsettled and not (id(row) in seeded and row._unit is None):
+        return None
+    fill = expr.kwargs.get('fill_value')
+    if not isinstance(fill, VarRef) or id(fill.var) in unsettled:
+        return None
+    unit = getattr(_settled(fill.var), '_unit', None)
+    return None if unit is None else (row, unit)
+
+
+def _dimension(unit: Any) -> Dict[str, int]:
+    """What a unit measures, its label aside: none is a pure number."""
+    return {} if unit is None else unit._unit_components
+
+
+def _settle(rows: List[Any], declared: Set[int], unsettled: Set[int],
+            seeded: Set[int] | frozenset = _SETTLED) -> None:
+    """Derive the rows' units to a fixed point, reading a row in
+    ``unsettled`` as :data:`UNSETTLED` until its formula settles it; a
+    mismatch on the way is left for the check on settled units. A row
+    read through ``mo.lag`` with a fill in a unit is in that unit — the
+    lag's cells are the fill and the row — so the fill settles it, as
+    it does a row ``seeded`` as a pure number for want of anything else."""
     from .unit import unit_key
 
     def key(u: Any) -> Any:
         return None if u is None else unit_key(u)
 
-    rows = [v for v in nodes if getattr(v, '_expr', None) is not None]
-    declared = {id(v) for v in rows if getattr(v, '_unit_declared', False)}
+    by_id = {id(v): v for v in rows}
     for _pass in range(len(rows) + 1):
         changed = False
         for v in rows:
-            # Every row's formula is checked - a declared unit decides what
-            # the row prints, never what its formula may add.
-            try:
-                unit = _unit_of(v._expr)
-            except ValueError as exc:
-                raise ValueError(f"{_label(v)}: {exc}") from exc
+            source = _filled_source(v, by_id, unsettled, seeded, declared)
+            if source is not None:
+                row, unit = source
+                unsettled.discard(id(row))
+                if isinstance(seeded, set):
+                    seeded.discard(id(row))
+                row._unit = unit
+                changed = True
             if id(v) in declared:
+                continue
+            try:
+                unit = _unit_of(v._expr, unsettled)
+            except ValueError:
+                continue
+            if unit is UNSETTLED:
                 continue
             # By key, not equality: a pure number's label is part of what
             # the row prints, though every pure number equals every other.
-            if key(unit) != key(v._unit):
+            if id(v) in unsettled or key(unit) != key(v._unit):
+                unsettled.discard(id(v))
                 v._unit = unit
                 changed = True
         if not changed:
@@ -554,11 +784,14 @@ def _cyclic_nodes(nodes: List[Any], same: Dict[Any, List[Any]],
     return cyclic
 
 
-def _order(nodes: Set[Any], deps: Dict[Any, List[Any]]) -> List[Any]:
-    """Topological order over ``deps`` (edges restricted to ``nodes``);
-    a cycle that remains is refused by name."""
+def _order(nodes: List[Any], deps: Dict[Any, List[Any]]) -> List[Any]:
+    """Topological order over ``deps`` (edges restricted to ``nodes``),
+    rows that do not wait on each other kept in the order given — the
+    order they were built in, never their addresses; a cycle that
+    remains is refused by name."""
+    members: Set[Any] = set(nodes)
     pending: Dict[Any, Set[Any]] = {
-        v: {d for d in deps[v] if d in nodes and d is not v} for v in nodes
+        v: {d for d in deps[v] if d in members and d is not v} for v in nodes
     }
     self_reads = [v for v in nodes if any(d is v for d in deps[v])]
     if self_reads:
@@ -618,11 +851,45 @@ def _evaluate_periodic(order: List[Any], n: int) -> None:
     for v in order:
         _check_elementwise(v)
     values: Dict[Any, List[Any]] = {v: [None] * n for v in order}
+    _read_outside_by_date(order, values, n)
     for t in range(n):
         for v in order:
             values[v][t] = _eval_at(v._expr, t, values, n)
     for v in order:
         _write_back(v, values[v])
+
+
+def _read_outside_by_date(order: List[Any], values: Dict[Any, List[Any]], n: int) -> None:
+    """The lines outside the loop its rows read that run on windows of
+    their own, each materialized onto the loop's window by date
+    (:func:`_on_loop_window`) — as the operators read them when the rows
+    were built — so every period reads the line's value of its date; a
+    line read as it is (on the loop's window, a constant) is left to
+    :func:`_outside_at`."""
+    home = None
+    for v in order:
+        home = v.__dict__.get('_owner') or v.__dict__.get('_parent')
+        if home is not None:
+            break
+    from .time import resolve_default_window
+    window = resolve_default_window(home) if home is not None else None
+    if window is None or window.grain is None or window.start is None:
+        return
+    from .variable import TimeLoc
+    from .variable_ops import _on_loop_window
+    loop = TimeLoc(window.start, window.grain, window.first_day)
+    seen: Set[int] = set()
+    for v in order:
+        for ref in v._expr.iter_refs():
+            if ref in values or id(ref) in seen:
+                continue
+            seen.add(id(ref))
+            x = _settled(ref)._value
+            if not isinstance(x, list):
+                continue
+            aligned = _on_loop_window(ref, x, v, loop, n)
+            if aligned is not None:
+                values[ref] = aligned
 
 
 def _check_elementwise(v: Any) -> None:
@@ -639,8 +906,8 @@ def _check_elementwise(v: Any) -> None:
         elif isinstance(node, UnaryOp):
             walk(node.operand)
         elif isinstance(node, FuncCall):
-            per_period_pair = node.func in ('MAX', 'MIN') and len(node.args) >= 2
-            if node.func not in _ELEMENTWISE and not per_period_pair:
+            from ..functions.registry import admits_in_loop
+            if not admits_in_loop(node.func, _values_per_period(node)):
                 from .. import functions as fns
                 if not hasattr(fns, node.func):
                     raise ValueError(
@@ -648,17 +915,16 @@ def _check_elementwise(v: Any) -> None:
                         f"and {node.func} cannot be run one period at a time. "
                         f"Build that row after the loop closes."
                     )
-                hint = ""
-                if node.func in ('MAX', 'MIN'):
-                    hint = (" A per-period floor or cap is mo.MAX(x, 0) / "
-                            "mo.MIN(x, cap): two or more operands.")
                 raise ValueError(
                     f"{_label(v)} applies {node.func} to a row of the loop. "
                     f"{node.func} reads a whole series, and inside the loop "
-                    f"the series is still being computed.{hint}"
+                    f"the series is still being computed.{_per_period_hint(node.func)}"
                 )
-            for arg in node.args:
-                if isinstance(arg, Expr):
+            for i, arg in enumerate(node.args):
+                if isinstance(arg, ListExpr) and _reads_range(node.func, i):
+                    for item in arg.items:
+                        walk(item)
+                elif isinstance(arg, Expr):
                     walk(arg)
         elif isinstance(node, MethodCall):
             if node.method not in ('shift', 'copy'):
@@ -679,9 +945,55 @@ def _check_elementwise(v: Any) -> None:
     walk(expr)
 
 
+def _reads_range(func: str, i: int) -> bool:
+    """Is argument ``i`` of ``func`` read as a range — every argument of a
+    reduction, the positions the registry names of a range function?"""
+    from ..functions.registry import is_range_taking, range_positions
+    positions = range_positions(func)
+    return is_range_taking(func) and (positions is None or i in positions)
+
+
+def _values_per_period(call: FuncCall) -> int:
+    """The values a call combines, the count the registry admits it by:
+    the arguments it reads as ranges, a list of rows there counting each
+    row — or, reading none, its operands."""
+    ranged = [a for i, a in enumerate(call.args) if _reads_range(call.func, i)]
+    if not ranged:
+        return len(call.args)
+    return sum(len(a.items) if isinstance(a, ListExpr) else 1 for a in ranged)
+
+
+def _per_period_hint(func: str) -> str:
+    """How ``func`` is one call per period, when the registry says it can
+    be."""
+    from ..functions.registry import per_period_arity, range_positions, spec
+    s = spec(func)
+    if s is None or per_period_arity(func) is None:
+        return ""
+    if s.shape == 'reduction':
+        hint = f" Over two or more operands mo.{func} is one call per period, mo.{func}(a, b)"
+        if func in ('MAX', 'MIN'):
+            hint += "; a per-period floor or cap is mo.MAX(x, 0) / mo.MIN(x, cap)"
+        return hint + "."
+    rows = "[a, b]"
+    shown = f"{rows}, …" if (range_positions(func) or (0,))[0] == 0 else f"…, {rows}"
+    return (f" Over a list of two or more rows mo.{func} is one call per period, "
+            f"over each period's cells: mo.{func}({shown}).")
+
+
+def _settled(var: Any) -> Any:
+    """A Variable the loop reads as settled. One whose own recompute
+    failed (a temporary no row held when its loop closed) keeps its
+    error, never its placeholder numbers: its reader is refused with it."""
+    error = getattr(var, '_loop_error', None)
+    if error:
+        raise ValueError(error)
+    return var
+
+
 def _outside_at(var: Any, t: int, n: int) -> Any:
     """A settled Variable's value at period ``t``."""
-    x = var._value
+    x = _settled(var)._value
     from .tracks import TrackValues
     if isinstance(x, TrackValues):
         raise ValueError(
@@ -751,11 +1063,13 @@ def _eval_at(node: Any, t: int, values: Dict[Any, List[Any]], n: int) -> Any:
             left, right, _COMPARES[node.op], op_symbol=node.op,
         )
     if isinstance(node, FuncCall):
-        args = [
-            _eval_at(a, t, values, n) if isinstance(a, Expr) else a
-            for a in node.args
-        ]
-        out = _function(node.func)(*args)
+        from ..functions.registry import is_range_taking
+        if is_range_taking(node.func):
+            args = [_cell_at(a, t, values, n) for a in node.args]
+        else:
+            args = [_eval_at(a, t, values, n) if isinstance(a, Expr) else a
+                    for a in node.args]
+        out = _function(node)(*args)
         return out._value if isinstance(out, Variable) else out
     if isinstance(node, MethodCall):
         if node.method == 'copy':
@@ -775,7 +1089,7 @@ def _eval_at(node: Any, t: int, values: Dict[Any, List[Any]], n: int) -> Any:
         if var in values:
             got = values[var][idx] if 0 <= idx < n else fill
         else:
-            x = var._value
+            x = _settled(var)._value
             if isinstance(x, list):
                 got = x[idx] if 0 <= idx < len(x) else fill
             else:
@@ -789,17 +1103,33 @@ def _eval_at(node: Any, t: int, values: Dict[Any, List[Any]], n: int) -> Any:
     raise ValueError(f"{type(node).__name__} expressions are not supported inside a loop yet.")
 
 
+def _cell_at(node: Any, t: int, values: Dict[Any, List[Any]], n: int) -> Any:
+    """What a call that reads ranges reads of an operand at period ``t``: a
+    row as its cell, a list of rows as the range of their cells. A number
+    or a date reads the same typed into the call or in a cell; a blank,
+    text, a boolean or an error is handed over as a line of that one value,
+    so it is read as the workbook reads the cell — never as a value typed
+    in (a blank as 0, an error as ``#VALUE!``)."""
+    from .variable import Variable
+    if isinstance(node, VarRef):
+        value = _eval_at(node, t, values, n)
+        return Variable(value) if value is None or isinstance(value, (str, bool)) else value
+    if isinstance(node, ListExpr):
+        return tuple(_cell_at(item, t, values, n) for item in node.items)
+    return _eval_at(node, t, values, n) if isinstance(node, Expr) else node
+
+
 # ─── Whole-series evaluation, for the rows downstream of a loop ─────
 
 
-def _eval_whole(node: Any) -> Any:
+def _eval_whole(node: Any, declared_unit: Any = None) -> Any:
     from .variable import Variable
     from .variable_ops import _VariableArithmetic as arith
 
     if isinstance(node, Literal):
         return node.value
     if isinstance(node, VarRef):
-        return node.var._value
+        return _settled(node.var)._value
     if isinstance(node, Subscript):
         base = _eval_whole(node.base)
         key = node.key
@@ -831,8 +1161,7 @@ def _eval_whole(node: Any) -> Any:
         items = [_eval_whole(item) for item in node.items]
         return [x[0] if isinstance(x, list) and len(x) == 1 else x for x in items]
     if isinstance(node, FuncCall):
-        args = [_as_argument(a) for a in node.args]
-        out = _function(node.func)(*args)
+        out = _function(node)(*_call_arguments(node))
         return out._value if isinstance(out, Variable) else out
     if isinstance(node, MethodCall):
         if node.method == 'copy':
@@ -860,8 +1189,11 @@ def _eval_whole(node: Any) -> Any:
             periods = periods.var
         elif isinstance(periods, Expr):
             periods = _eval_whole(periods)
+        # Run again as the row was written: a declared unit= rides along,
+        # so the template's dimension check reads it as it did at first.
+        line = {'unit': declared_unit} if declared_unit is not None else {}
         return recurrence(
-            _as_argument(node.start), node.template, periods=periods, **variables,
+            _as_argument(node.start), node.template, periods=periods, **variables, **line,
         )._value
     raise ValueError(
         f"{type(node).__name__} expressions over a row of a loop are not "
@@ -869,10 +1201,13 @@ def _eval_whole(node: Any) -> Any:
     )
 
 
-def _function(name: str) -> Any:
-    """The ``mo.*`` function behind a formula's function name."""
+def _function(call: FuncCall) -> Any:
+    """The ``mo.*`` function behind a formula's call. A call native to no
+    renderer (a ``pyformula``) is not the engine's function of its name,
+    whatever the name, and cannot be run again."""
     from .. import functions as fns
-    fn = getattr(fns, name, None)
+    name = call.func
+    fn = None if call.render_backends == frozenset() else getattr(fns, name, None)
     if fn is None:
         raise ValueError(
             f"{name}(...) cannot be computed again when the loop closes — "
@@ -882,20 +1217,34 @@ def _function(name: str) -> Any:
     return fn
 
 
-def _eval_row(expr: Any) -> Tuple[Any, Any]:
-    """A downstream row's values and unit. A function or a recurrence at
-    the top is run again as itself, so its unit is the one it always
-    gives; arithmetic follows the operators' unit rules."""
+def _call_arguments(call: FuncCall) -> List[Any]:
+    """A formula call's arguments as its ``mo.*`` function takes them
+    (:func:`_as_argument`). An operator joined to a cell - the
+    ``CONCAT('>=', cap)`` a ``('>=', cap)`` criteria is written as - goes
+    back as that pair, so the function reads the criteria as it was given:
+    the cell's unit is compared with its range's and an error the cell
+    holds is the result, never the text the join gives."""
+    from ..functions.criteria import joined_criteria
+    out: List[Any] = []
+    for arg in call.args:
+        pair = joined_criteria(arg)
+        out.append(_as_argument(arg) if pair is None
+                   else (pair[0], _as_argument(pair[1])))
+    return out
+
+
+def _eval_row(expr: Any, declared_unit: Any = None) -> Tuple[Any, Any]:
+    """A downstream row's values and unit. A function at the top is run
+    again as itself, so its unit is the one it always gives; a recurrence,
+    a subscript and arithmetic follow the rules :func:`_unit_of` reads
+    them by."""
     from .variable import Variable
     if isinstance(expr, FuncCall):
-        out = _function(expr.func)(*[_as_argument(a) for a in expr.args])
+        out = _function(expr)(*_call_arguments(expr))
         if isinstance(out, Variable):
             return out._value, out._unit
         return out, None
-    if isinstance(expr, SelfRef):
-        value = _eval_whole(expr)
-        return value, None
-    return _eval_whole(expr), _unit_of(expr)
+    return _eval_whole(expr, declared_unit), _unit_of(expr)
 
 
 def _as_argument(node: Any) -> Any:
@@ -903,9 +1252,13 @@ def _as_argument(node: Any) -> Any:
     Variable itself for a reference (so the function sees its unit and
     shape), the constant for a literal."""
     if isinstance(node, VarRef):
-        return node.var
+        return _settled(node.var)
     if isinstance(node, Literal):
         return node.value
+    if isinstance(node, ListExpr) and all(isinstance(i, (VarRef, Literal)) for i in node.items):
+        # A list of lines and values, as the call was given it: the lines
+        # themselves (their units, their cells), never their values.
+        return [_as_argument(item) for item in node.items]
     if isinstance(node, Expr):
         return _eval_whole(node)
     return node
@@ -913,12 +1266,16 @@ def _as_argument(node: Any) -> Any:
 
 def _write_back(v: Any, value: Any) -> None:
     v._value = value
+    # Typed by the first cell that holds a value: the placeholder build
+    # may have typed the row by an error marker it no longer holds.
+    cells = value if isinstance(value, list) else [value]
     if isinstance(value, list):
         v.var_type = 'list'
-        sample = value[0] if value else None
-    else:
-        sample = value
+    sample = next((c for c in cells if c is not None
+                   and not (isinstance(c, str) and c.startswith('#'))), None)
     if isinstance(sample, bool):
         v.value_type = 'bool'
     elif isinstance(sample, (date, datetime)):
         v.value_type = 'datetime'
+    elif isinstance(sample, (int, float)) and v.value_type not in ('int', 'float'):
+        v.value_type = 'float'

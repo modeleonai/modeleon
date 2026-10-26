@@ -14,7 +14,7 @@ mutate ``self`` directly (setting ``_value``, ``_expr``,
 
 from __future__ import annotations
 
-from typing import Any, Dict, FrozenSet, List, Optional, TYPE_CHECKING
+from typing import Any, Dict, FrozenSet, List, Optional, Tuple, TYPE_CHECKING
 
 from .expr import Expr, ListExpr, Literal, VarRef
 
@@ -65,6 +65,7 @@ class _VariableInit:
     _EXCEL_PROP_KEYS: FrozenSet[str]
     pyformula: Optional[str]
     _source_code: Optional[str]
+    _source_items: Optional[Tuple["Variable", ...]]
     _value: Any
     _expr: Optional[Expr]
     _raw_formula_str: Optional[str]
@@ -108,8 +109,10 @@ class _VariableInit:
                 self._dependency_refs = list(formula._dependency_refs)
             else:
                 self._set_expr(VarRef(formula))
-            if formula._source_code is not None:
-                self._source_code = formula._source_code
+            # One read: the source text may be rendered on read.
+            source_code = formula._source_code
+            if source_code is not None:
+                self._source_code = source_code
             return var_type
 
         if isinstance(formula, list) and len(formula) > 0:
@@ -179,8 +182,18 @@ class _VariableInit:
             else:
                 self._set_expr(VarRef(value))
                 self._value = _blanks_read_as_zero(value._value)
-            if value._source_code is not None:
-                self._source_code = value._source_code
+            # A copy of a line still waiting on its loop waits with it, and
+            # one whose loop failed fails with it: its numbers are
+            # provisional, never a value to hand out.
+            awaits = getattr(value, '_awaits', None)
+            if awaits and not getattr(self, '_awaits', None):
+                setattr(self, '_awaits', set(awaits))      # declared on Variable
+            if getattr(value, '_loop_error', None):
+                self._loop_error = value._loop_error
+            # One read: the source text may be rendered on read.
+            source_code = value._source_code
+            if source_code is not None:
+                self._source_code = source_code
             return var_type, value_type
 
         if (isinstance(value, list) and len(value) > 0
@@ -211,13 +224,13 @@ class _VariableInit:
                 expr_items.append(Literal(item))
         self._set_expr(ListExpr(expr_items))
 
-        # Copy _source_code if every Variable item shares the same one
-        var_items = [v for v in items if isinstance(v, Variable)]
-        if var_items and all(v._source_code for v in var_items):
-            # ``all(...)`` above guarantees every entry is a non-empty str.
-            source_codes: List[str] = [v._source_code for v in var_items]  # type: ignore[misc]
-            if len(set(source_codes)) == 1:
-                self._source_code = source_codes[0]
+        # The compound's source text is the one its Variable items share,
+        # decided when someone reads it (``Variable._source_code``): an
+        # item's own text may be a formula rendered on read, and a list of
+        # conditions is a line nobody asks the source of in the usual run.
+        var_items = tuple(v for v in items if isinstance(v, Variable))
+        if var_items:
+            self._source_items = var_items
 
     @staticmethod
     def _coerce_literal(value, value_type: str):

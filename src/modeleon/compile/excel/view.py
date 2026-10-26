@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from dataclasses import fields as _dc_fields
 from html import escape
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, TypeVar
@@ -240,6 +240,26 @@ def _node_value(node: Any) -> Any:
     return node
 
 
+#: The kinds a view's ``timeline={'totals': [...]}`` may name — the
+#: subtotal columns the book knows how to draw. Anything else is refused
+#: by name: a word the book cannot draw must not vanish into "no totals".
+TOTALS_KINDS = ("day", "week", "month", "quarter", "half", "year", "iso_year")
+
+
+def totals_kinds(declared: Any) -> tuple:
+    """The declared totals kinds, in their order, or a refusal naming
+    the words the book does not draw."""
+    kinds = tuple(declared or ())
+    unknown = [k for k in kinds if k not in TOTALS_KINDS]
+    if unknown:
+        raise ValueError(
+            f"ExcelView timeline totals may name {', '.join(TOTALS_KINDS)}; "
+            f"got {', '.join(repr(k) for k in unknown)}. Nothing else is a "
+            f"totals kind."
+        )
+    return kinds
+
+
 class ExcelView(MultiVariable):
     """Presentation settings for the Excel + notebook renderers, as a model.
 
@@ -256,6 +276,10 @@ class ExcelView(MultiVariable):
     """
 
     _TRACK_MODES = ("blend", "rows", "compare")
+
+    #: Its children hold settings, not lines: a list in ``timeline`` or
+    #: ``sheet`` is a list of words, never a series placed on a window.
+    _settings_only = True
 
     def __init__(
         self,
@@ -274,6 +298,9 @@ class ExcelView(MultiVariable):
         sheet: Any = None,
     ) -> None:
         super().__init__(display_name or "ExcelView")
+        # A named view is one a caller applies; an unnamed one is
+        # meant as a model's own view (see :func:`unread_view_notes`).
+        self.__dict__['_named'] = display_name is not None
         if tracks is not None:
             # Two authoring forms: the mode string, or the dict form
             # {'mode': ..., 'shown': [...]} that also declares the
@@ -316,6 +343,8 @@ class ExcelView(MultiVariable):
                     f"ExcelView grain= must be one of {', '.join(GRAINS)}; "
                     f"got {grain!r}."
                 )
+        if isinstance(timeline, dict):
+            totals_kinds(timeline.get("totals"))     # refuses by name
         for name, value in (
             ("orient", orient),
             ("font", font),
@@ -337,8 +366,10 @@ class ExcelView(MultiVariable):
 
     def __setattr__(self, name: str, value: Any) -> None:
         # Any mutation (field set, sub-view adoption) invalidates the
-        # cached snapshot below — the cache must never outlive an edit.
+        # cached snapshot below — the cache must never outlive an edit —
+        # and whatever an open :func:`view_pass` resolved through it.
         self.__dict__.pop("_snapshot_cache", None)
+        _VIEW_EDITS[0] += 1
         super().__setattr__(name, value)
 
     def snapshot(self) -> ResolvedView:
@@ -403,10 +434,7 @@ class ExcelView(MultiVariable):
             type_styles=cell_types.get("styles"),
             time_header=timeline.get("header"),
             time_label_format=timeline.get("label_format"),
-            time_totals=tuple(
-                k for k in (timeline.get("totals") or ())
-                if k in ("quarter", "year")
-            ),
+            time_totals=totals_kinds(timeline.get("totals")),
             time_totals_word=timeline.get("totals_word"),
             time_opening=timeline.get("opening"),
             time_repeat_on_anchor=timeline.get("repeat_on_anchor"),
@@ -490,6 +518,16 @@ class ExcelView(MultiVariable):
             f"{body}</table>"
         )
 
+    def _clone(self) -> "ExcelView":
+        # A copy made on adoption (a projection carries the view over, a
+        # second parent takes it) is the same view: it keeps its name and
+        # remembers its source, so a slot pointing at the source reads
+        # the copy too (see :func:`unread_view_notes`).
+        view = super()._clone()
+        view.__dict__['_named'] = self.__dict__.get('_named', False)
+        view.__dict__['_base'] = self
+        return view  # type: ignore[return-value]
+
     def extend(self, **overrides: Any) -> "ExcelView":
         """Return a copy with ``overrides`` (whole sub-views) applied."""
         unknown = set(overrides) - set(_GROUPS)
@@ -500,7 +538,11 @@ class ExcelView(MultiVariable):
             )
         merged = self._grouped()
         merged.update(overrides)
-        return ExcelView(**{k: v for k, v in merged.items() if v is not None})
+        view = ExcelView(**{k: v for k, v in merged.items() if v is not None})
+        # The copy remembers what it extends: a view read through its
+        # extension is read (see :func:`unread_view_notes`).
+        view.__dict__['_base'] = self
+        return view
 
     @classmethod
     def engine_default(cls) -> "ExcelView":
@@ -574,6 +616,22 @@ def _layered(mine: Any, under: Any) -> Any:
 #: Context-local, so two threads or asyncio tasks rendering under
 #: different house views at once never see each other's.
 _HOUSE: ContextVar[Optional[ResolvedView]] = ContextVar("modeleon_house_view", default=None)
+#: The ExcelView objects the house layer was given, so a view a model keeps
+#: and renders under is read (:func:`unread_view_notes`).
+_HOUSE_VIEWS: ContextVar[Tuple[Any, ...]] = ContextVar("modeleon_house_views", default=())
+
+#: The memo of the read-only pass in force (:func:`view_pass`): each
+#: node's resolved view under the node's id, and each chain of views
+#: already folded under the tuple of their ids. Every entry holds the
+#: objects it is keyed by, so no id is reused while the pass lasts.
+#: Context-local like the house view; it ends with the pass.
+_PASS: ContextVar[Optional[Dict[Any, Any]]] = ContextVar("modeleon_view_pass", default=None)
+
+#: Edits of any :class:`ExcelView`, counted process-wide. A pass's memo
+#: carries the count it was filled under and starts over when it moved —
+#: an edit made in a nested pass or in another thread is seen, not only
+#: one made in the pass's own context.
+_VIEW_EDITS: List[int] = [0]
 
 
 def changes(view: ExcelView, base: Optional[ExcelView] = None) -> ResolvedView:
@@ -606,9 +664,11 @@ def house_view(*views: "ExcelView | ResolvedView") -> Iterator[None]:
     context-local (a thread or an asyncio task sees only its own), and
     it ends with the block."""
     snap: Optional[ResolvedView] = _HOUSE.get()
+    given: Tuple[Any, ...] = _HOUSE_VIEWS.get()
     for view in views:
         if isinstance(view, ExcelView):
             layer = view.snapshot()
+            given = (*given, view)
         elif isinstance(view, ResolvedView):
             layer = view
         else:
@@ -617,10 +677,66 @@ def house_view(*views: "ExcelView | ResolvedView") -> Iterator[None]:
             )
         snap = layer if snap is None else _merge(layer, snap)
     token = _HOUSE.set(snap)
+    views_token = _HOUSE_VIEWS.set(given)
     try:
         yield
     finally:
+        _HOUSE_VIEWS.reset(views_token)
         _HOUSE.reset(token)
+
+
+#: The view a caller applied to the book being written — the layer above every
+#: view the models declare. Context-local, like the house view.
+_APPLIED: ContextVar[Optional[ExcelView]] = ContextVar("modeleon_applied_view", default=None)
+
+
+@contextmanager
+def applied_view(view: ExcelView) -> Iterator[None]:
+    """Render under one of a model's named views::
+
+        model.board = mo.ExcelView('Board pack', font={'name': 'Georgia'})
+        with applied_view(model.board):
+            model.to_excel("board.xlsx")
+
+    A named view changes nothing until a caller applies it.
+    Inside the block it is the layer above every view the model declares:
+    where it sets a field it wins, on every sheet, and whatever it leaves
+    unset comes from the model's own views, the house view and
+    ``mo.default_excel_view`` as before. A ``sheet={'order': [...]}`` it
+    declares orders the book. The period axis is not a look: ``orient``
+    stays where the model states it.
+    One view at a time — an inner block's view replaces the outer one's.
+    Context-local; it ends with the block."""
+    if not isinstance(view, ExcelView):
+        raise TypeError(f"applied_view takes an ExcelView; got {type(view).__name__}.")
+    token = _APPLIED.set(view)
+    try:
+        yield
+    finally:
+        _APPLIED.reset(token)
+
+
+@contextmanager
+def view_pass() -> Iterator[None]:
+    """Resolve each node's view once for the length of the block.
+
+    A renderer asks for the view of every line several times over — for
+    its band, its number format, its cell type, its indent — and each ask
+    walks the line's whole owner chain and folds every view on it. Inside
+    this block a node's answer is kept and served again, and a chain of
+    views is folded once, whoever asks.
+
+    Only for a block that READS a built model: nothing in it may assign a
+    ``default_excel_view`` or move a node under another owner, which the
+    memo cannot see. An edit of an :class:`ExcelView` drops the memo, as
+    it drops the view's snapshot, and a different :func:`house_view` or
+    process-wide default is a miss. Context-local; it ends with the
+    block."""
+    token = _PASS.set({})
+    try:
+        yield
+    finally:
+        _PASS.reset(token)
 
 
 def resolve_excel_view(node: Any) -> ResolvedView:
@@ -631,8 +747,23 @@ def resolve_excel_view(node: Any) -> ResolvedView:
     cascade like CSS: the *closest* level that sets a field wins, falling back up
     the tree, with the process-wide ``mo.default_excel_view`` as the top-level
     default (the floor) and the :func:`house_view` in force, if any, right
-    above it. With no pointer anywhere, that floor is returned.
+    above it. With no pointer anywhere, that floor is returned. An
+    :func:`applied_view` in force lies over all of it. Inside a
+    :func:`view_pass` the answer for a node is kept for the pass.
     """
+    g = _global_default()
+    floor = g.snapshot() if g is not None else None
+    house = _HOUSE.get()
+    applied = _applied_snapshot()
+    memo = _PASS.get()
+    if memo is not None:
+        if memo.get("edits") != _VIEW_EDITS[0]:
+            memo.clear()
+            memo["edits"] = _VIEW_EDITS[0]
+        hit = memo.get(id(node))
+        if (hit is not None and hit[0] is node and hit[1] is floor and hit[2] is house
+                and hit[3] is applied):
+            return hit[4]
     seen: set[int] = set()
     n = node
     chain: list[ResolvedView] = []  # nearest-first
@@ -642,16 +773,162 @@ def resolve_excel_view(node: Any) -> ResolvedView:
         if isinstance(v, ExcelView):
             chain.append(v.snapshot())
         n = getattr(n, "_owner", None) or getattr(n, "_parent", None)
-    g = _global_default()
-    result = g.snapshot() if g is not None else ResolvedView()
-    house = _HOUSE.get()
+    if memo is None:
+        return _fold(floor, house, chain, applied)
+    key = (id(floor), id(house), id(applied), *map(id, chain))
+    folded = memo.get(key)
+    if folded is None:
+        folded = memo[key] = (
+            floor, house, applied, chain, _fold(floor, house, chain, applied))
+    memo[id(node)] = (node, floor, house, applied, folded[4])
+    return folded[4]
+
+
+def _applied_snapshot() -> Optional[ResolvedView]:
+    """The snapshot of the :func:`applied_view` in force, its ``orient``
+    dropped: the period axis is geometry a container states for itself
+    (the layout reads it off the container's own view), never a look a
+    caller lays over the book. The snapshot is cached on the view, so
+    the same object comes back while the view is unchanged."""
+    view = _APPLIED.get()
+    if view is None:
+        return None
+    snap = view.snapshot()
+    if snap.orient is None:
+        return snap
+    cached = view.__dict__.get("_applied_cache")
+    if cached is not None and cached[0] is snap:
+        return cached[1]
+    stripped = replace(snap, orient=None)
+    view.__dict__["_applied_cache"] = (snap, stripped)
+    return stripped
+
+
+def _fold(
+    floor: Optional[ResolvedView], house: Optional[ResolvedView],
+    chain: List[ResolvedView], applied: Optional[ResolvedView] = None,
+) -> ResolvedView:
+    """The applied view over the views of ``chain`` (nearest-first) over the
+    house view over ``floor``, the default (``mo.default_excel_view``)."""
+    result = floor if floor is not None else ResolvedView()
     if house is not None:
         result = _merge(house, result)
     # Fold top-down (root-most first) so each lower level overrides its ancestors
     # and the nearest level wins; the global default stays the floor.
     for snap in reversed(chain):
         result = _merge(snap, result)
+    if applied is not None:
+        result = _merge(applied, result)
     return result
+
+
+class UnreadViewWarning(UserWarning):
+    """A view hangs on a container under a name that says "view", and no
+    ``default_excel_view`` slot holds it: the workbook keeps its look."""
+
+
+def _spelled_node(node: Any) -> str:
+    """How a message names ``node``: its path from the model, or its name
+    when it floats."""
+    path = getattr(node, "path", None)
+    if path is not None and not getattr(path, "is_floating", False):
+        return str(getattr(node, "id", "") or path)
+    return str(
+        getattr(node, "python_name", None) or getattr(node, "display_name", None) or "model"
+    )
+
+
+def _sources(view: Any) -> Iterator[Any]:
+    """``view`` and what it was made from — the base it extends, the view
+    a copy was cloned from — each once."""
+    seen: set[int] = set()
+    while isinstance(view, ExcelView) and id(view) not in seen:
+        seen.add(id(view))
+        yield view
+        view = view.__dict__.get("_base")
+
+
+def _views_read(roots: Sequence[Any]) -> set[int]:
+    """The ids of every view some ``default_excel_view`` slot holds — under
+    ``roots`` and on the ancestors a root's lines resolve through — with
+    the views each was made from, the house layer's views and the
+    process-wide default."""
+    read: set[int] = set()
+
+    def note(view: Any) -> None:
+        read.update(id(v) for v in _sources(view))
+
+    note(_global_default())
+    for view in _HOUSE_VIEWS.get():
+        note(view)
+    # The look a caller applies for one book (``applied_view``) reads the
+    # view it was handed, named or not.
+    note(_APPLIED.get())
+    for node in _containers(roots):
+        note(node.__dict__.get("default_excel_view"))
+    for root in roots:
+        # A container written on its own still resolves its lines through
+        # its ancestors' slots (``resolve_excel_view`` walks up).
+        seen: set[int] = set()
+        n = getattr(root, "__dict__", {}).get("_owner") or getattr(root, "__dict__", {}).get("_parent")
+        while n is not None and id(n) not in seen:
+            seen.add(id(n))
+            note(getattr(n, "__dict__", {}).get("default_excel_view"))
+            n = getattr(n, "__dict__", {}).get("_owner") or getattr(n, "__dict__", {}).get("_parent")
+    return read
+
+
+def _containers(roots: Sequence[Any]) -> Iterator[Any]:
+    """``roots`` and every container under them, each once; a view's own
+    children (its setting groups) are not entered."""
+    seen: set[int] = set()
+    pending = list(roots)
+    while pending:
+        node = pending.pop()
+        if not isinstance(node, MultiVariableBase) or id(node) in seen:
+            continue
+        seen.add(id(node))
+        yield node
+        if getattr(type(node), "_settings_only", False):
+            continue
+        pending.extend(node._components.values())
+
+
+def unread_view_notes(
+    roots: Sequence[Any], spell: Optional[Any] = None,
+) -> List[Tuple[str, str]]:
+    """``(path, sentence)`` for every view hung on a container under
+    ``roots`` where nothing reads it — ``model.view = mo.ExcelView(...)``,
+    ``model.excel_view = …``, ``mo.Model(..., view=…)``: an unnamed view
+    under a name that says "view", held by no ``default_excel_view`` slot
+    (nor extended or copied into one). The workbook keeps its look and no
+    total column appears; the sentence says where a model's view goes,
+    the holder spelled by ``spell(node)`` when given (the author's own
+    name for it), else by its path. A named view is one a caller
+    applies, and a view kept under another name (a house style) is read
+    where it is kept: neither is noted."""
+    read = _views_read(roots)
+    notes: List[Tuple[str, str]] = []
+    for node in _containers(roots):
+        if getattr(type(node), "_settings_only", False):
+            continue
+        for name, child in node._components.items():
+            if not isinstance(child, ExcelView) or child.__dict__.get("_named"):
+                continue
+            if "view" not in name.lower() or any(id(v) in read for v in _sources(child)):
+                continue
+            holder = (spell(node) if spell is not None else None) or _spelled_node(node)
+            notes.append((
+                f"{holder}.{name}",
+                f"`{holder}.{name} = mo.ExcelView(...)` hangs the view on {holder} "
+                f"as a container, where nothing reads it: the workbook keeps its "
+                f"look and no total column appears. A model's view is its "
+                f"default_excel_view — `{holder}.default_excel_view = "
+                f"mo.ExcelView(...)`, or `mo.Model(..., "
+                f"default_excel_view=mo.ExcelView(...))`; a view kept for later "
+                f"is named, `mo.ExcelView('Quarterly', ...)`.",
+            ))
+    return notes
 
 
 class SheetOrderWarning(UserWarning):
@@ -664,8 +941,16 @@ def declared_sheet_order(root: Any) -> Optional[Tuple[str, ...]]:
     [...]}``), each name once, or ``None``. Read from the view's nodes, so a
     model that declares none is laid out exactly as before, whatever else
     its view holds. A container written on its own does not read its
-    parent's order: the order describes the whole book."""
-    view = getattr(root, "__dict__", {}).get("default_excel_view")
+    parent's order: the order describes the whole book. An
+    :func:`applied_view` that declares an order wins over the model's."""
+    for view in (_APPLIED.get(), getattr(root, "__dict__", {}).get("default_excel_view")):
+        order = _order_of(view)
+        if order:
+            return order
+    return None
+
+
+def _order_of(view: Any) -> Optional[Tuple[str, ...]]:
     if not isinstance(view, ExcelView):
         return None
     group = view._components.get("sheet")

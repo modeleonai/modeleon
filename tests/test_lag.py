@@ -171,6 +171,22 @@ class TestLagExcel:
     def _row(cells, label):
         return next(coord for coord, v in cells.items() if v == label)[1:]
 
+    def test_a_shift_fill_emits_a_cell_reference(self, tmp_path):
+        # As mo.lag keeps it: the head cell references the opening cell,
+        # never a frozen copy of its number.
+        model = mo.MultiVariable("m")
+        model.s = mo.MultiVariable("S", excel_props={"tab": True})
+        with model.s as s:
+            s.opening = mo.Variable(500.0, display_name="Opening")
+            s.closing = mo.Variable([90.0, 80.0], display_name="Closing")
+            s.prior = s.closing.shift(1, fill_value=s.opening).set_display_name("Prior")
+        path = tmp_path / "shift_fill.xlsx"
+        model.to_excel(path)
+        cells = self._formulas(path, "S")
+        opening_row = next(coord for coord, v in cells.items() if v == "Opening")[1:]
+        prior_row = next(coord for coord, v in cells.items() if v == "Prior")[1:]
+        assert cells[f"B{prior_row}"] == f"=B{opening_row}"
+
     def test_variable_fill_emits_cell_reference(self, tmp_path):
         model = mo.MultiVariable("m")
         model.s = mo.MultiVariable("S", excel_props={"tab": True})

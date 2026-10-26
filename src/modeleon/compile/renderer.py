@@ -92,6 +92,13 @@ class RenderCtx:
     # cell"; a roll-forward inlined anywhere else would read the ENCLOSING
     # row's previous cell and compute another number.
     own_chain: Optional[Any] = None
+    # Which value the walk is writing an element of, and which element —
+    # renderer-specific: the Excel renderer sets it on entering an unnamed
+    # intermediate written inline, whose element may sit elsewhere than
+    # the cell's own column (aligned onto a window of its own, or along
+    # keys in another order). None = the cell's own Variable at
+    # ``period_idx``.
+    frame: Optional[Any] = None
 
 
 class Renderer(Protocol):

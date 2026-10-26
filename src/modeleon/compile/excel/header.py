@@ -28,15 +28,70 @@ workbook's wiring depends on where the header is.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from typing import Any, Callable, Dict, List, Optional
 
+from ...core.calendar import GREGORIAN
 from ...core.multi_variable import MultiVariableBase
-from ...core.time import time_field_of
+from ...core.time import _has_stub, time_field_of
 from ...core.variable import Variable
 
-#: Months in one period of each grain.
-STEP = {'month': 1, 'quarter': 3, 'year': 12}
+#: Months in one period of each grain the header steps by months — the
+#: calendar's rulers of whole months (a day is stepped by days).
+STEP = {r.name: r.months for r in GREGORIAN.rulers if r.months}
+
+
+def _months_per(grain: str) -> int:
+    """Months in one period of ``grain`` — the stride every header
+    formula steps by. A grain the book cannot step is refused by name,
+    never spelled as if it were a month."""
+    months = GREGORIAN.ruler(grain).months if GREGORIAN.knows(grain) else None
+    if not months:
+        spelled = [r.name for r in GREGORIAN.rulers
+                   if r.months or r.stride_days or r.stride_hours or r.week_years]
+        raise ValueError(
+            f"A workbook spells periods of {', '.join(spelled[:-1])} or "
+            f"{spelled[-1]}; got grain {grain!r}."
+        )
+    return months
+
+
+def _stride_days(grain: str) -> Optional[int]:
+    """Days in one period of a fixed-length ruler (a week: 7), else
+    ``None``. The day has its own branch in ``spell_inline`` /
+    ``spell_anchor``."""
+    if not GREGORIAN.knows(grain):
+        return None
+    d = GREGORIAN.ruler(grain).stride_days
+    return d if d and d > 1 else None
+
+
+def _week_years(grain: str) -> bool:
+    """Whether ``grain`` is the ISO week-numbering year: its bounds are
+    spelled off the ISO year number of a day (``YEAR(day + 3)`` — the
+    Thursday of a week lies in the week's ISO year)."""
+    return GREGORIAN.knows(grain) and GREGORIAN.ruler(grain).week_years
+
+
+def iso_year_start(year: str) -> str:
+    """The Monday ISO year ``year`` starts on: the Monday of the week
+    holding 4 January."""
+    return f"(DATE({year},1,4)-WEEKDAY(DATE({year},1,4),3))"
+
+
+def iso_year_end_of(day: str) -> str:
+    """The Sunday that ends the ISO year ``day`` lies in."""
+    return f"DATE(YEAR({day}+3)+1,1,4)-WEEKDAY(DATE(YEAR({day}+3)+1,1,4),3)-1"
+
+
+def _stride_hours(grain: str) -> Optional[int]:
+    """Hours in one period of a clock ruler (an hour: 1), else ``None``:
+    its time is the start cell plus i/24, one closed form across the
+    row — never a running chain, which would drift over thousands of
+    columns."""
+    if not GREGORIAN.knows(grain):
+        return None
+    return GREGORIAN.ruler(grain).stride_hours
 
 #: No ``default_header`` anywhere up the tree.
 UNSET = object()
@@ -161,7 +216,19 @@ def window_key(window: Any) -> Optional[tuple]:
 
 
 def date_literal(d: date) -> str:
-    return f"DATE({d.year},{d.month},{d.day})"
+    """A day as Excel writes it, ``DATE(2026,1,5)``; an instant off
+    midnight carries its clock, ``DATE(2026,1,5)+TIME(13,0,0)``."""
+    day = f"DATE({d.year},{d.month},{d.day})"
+    if isinstance(d, datetime) and (d.hour or d.minute or d.second):
+        return f"{day}+TIME({d.hour},{d.minute},{d.second})"
+    return day
+
+
+def _atom(ref: str) -> str:
+    """``ref`` fit to stand as one operand: a cell or a call as it is, an
+    instant's ``DATE(…)+TIME(…)`` in brackets — else ``x - start`` reads
+    ``(x - DATE(…)) + TIME(…)``."""
+    return f"({ref})" if "+" in ref else ref
 
 
 def _offset(start0: str, k: int, first_day: Optional[date]) -> str:
@@ -188,13 +255,38 @@ def spell_inline(field_: str, i: int, grain: str, start0: str,
                  first_day: Optional[date] = None) -> str:
     """``mo.time.<field>`` of period ``i``, off the start cell alone.
     ``first_day`` set: the window's first period is short — it starts at
-    ``start0`` and ends with its quarter / year."""
+    ``start0`` and ends with its quarter / year. A clock ruler's period
+    ends where the next starts (``start0 + (i+1)/24``)."""
+    h = _stride_hours(grain)
+    if h is not None:
+        def at(j: int) -> str:
+            return f"({start0}+{h * j}/24)" if j else _atom(start0)
+        return {'start': at(i), 'end': at(i + 1), 'days': f"{h}/24", 'months': '0',
+                'index': str(i + 1)}[field_]
+    if _week_years(grain):
+        # An ISO year: its number is the start cell's (YEAR(start + 3)),
+        # each later one a year on, every bound a closed form off the start
+        # cell. A first period opened on a Monday inside its ISO year runs
+        # from that Monday to the year's last Sunday.
+        def year(j: int) -> str:
+            return f"YEAR({start0}+3)+{j}" if j else f"YEAR({start0}+3)"
+        start = start0 if i == 0 else iso_year_start(year(i))
+        end = f"({iso_year_start(year(i + 1))}-1)"
+        return {'start': start, 'end': end, 'days': f"({end}-{start}+1)", 'months': '0',
+                'index': str(i + 1)}[field_]
     if grain == 'day':
         day = f"({start0}+{i})" if i else start0
         return {'start': day, 'end': day, 'days': '1', 'months': '0',
                 'index': str(i + 1)}[field_]
-    k = STEP[grain]
-    if first_day is not None and grain in ('quarter', 'year'):
+    d = _stride_days(grain)
+    if d is not None:
+        # A week: every period d days from the start cell, one closed
+        # form across the row (never a running chain).
+        start = f"({start0}+{d * i})" if i else start0
+        return {'start': start, 'end': f"({start0}+{d * i + d - 1})", 'days': str(d),
+                'months': '0', 'index': str(i + 1)}[field_]
+    k = _months_per(grain)
+    if first_day is not None and _has_stub(grain):
         off = _offset(start0, k, first_day)
 
         def end_at(j: int) -> str:
@@ -239,10 +331,43 @@ def spell_anchor(field_: str, i: int, grain: str, start0: str,
     with its quarter / year whatever month it starts in, and counts its
     months from its dates — again one formula across the row, which stays
     right when the start cell is edited in the workbook."""
-    if first_day is not None and grain in ('quarter', 'year'):
+    if _week_years(grain) and field_ != 'index':
+        # An ISO year, chained like a hand-built timing sheet: start = the
+        # previous end + 1, end = the last Sunday of the ISO year the start
+        # lies in, days = end - start + 1 — right for a first period opened
+        # on a Monday inside its year too.
+        own_start, own_end = cell('start', i), cell('end', i)
+        if field_ == 'start':
+            if i == 0:
+                opening = cell('end', -1)
+                return f"{opening}+1" if opening else start0
+            prev_end = cell('end', i - 1)
+            return f"{prev_end}+1" if prev_end else spell_inline('start', i, grain, start0)
+        if field_ == 'end':
+            return iso_year_end_of(own_start) if own_start else spell_inline('end', i, grain, start0)
+        if field_ == 'days':
+            if own_start and own_end:
+                return f"{own_end}-{own_start}+1"
+            return spell_inline('days', i, grain, start0)
+        return '0'   # months: an ISO year holds no calendar months
+    if first_day is not None and _has_stub(grain) and not _week_years(grain):
         stub = _spell_anchor_stub(field_, i, grain, start0, cell, first_day)
         if stub is not None:
             return stub
+    h = _stride_hours(grain)
+    if h is not None and field_ != 'index':
+        # An hour: every start a closed form off the start cell (never the
+        # previous cell plus 1/24 — thousands of columns would drift), the
+        # end where it stops, the days its fraction.
+        if field_ == 'start':
+            return start0 if i == 0 else f"{start0}+{h * i}/24"
+        if field_ == 'end':
+            own = cell('start', i)
+            return f"{own}+{h}/24" if own else spell_inline('end', i, grain, start0)
+        if field_ == 'days':
+            own_start, own_end = cell('start', i), cell('end', i)
+            return f"{own_end}-{own_start}" if own_start and own_end else f"{h}/24"
+        return '0'   # months: an hour holds none (mo.time.months is refused)
     if grain == 'day':
         if field_ == 'start':
             if i == 0:
@@ -256,7 +381,34 @@ def spell_anchor(field_: str, i: int, grain: str, start0: str,
             return '1'
         if field_ == 'months':
             return '0'
-    k = STEP.get(grain, 1)
+    d = _stride_days(grain)
+    if d is not None and field_ != 'index':
+        # A week, chained like a hand-built timing sheet: start = the
+        # previous end + 1, end = start + 6, days = end - start + 1.
+        if field_ == 'start':
+            if i == 0:
+                opening = cell('end', -1)
+                return f"{opening}+1" if opening else start0
+            prev_end = cell('end', i - 1)
+            if prev_end:
+                return f"{prev_end}+1"
+            prev_start = cell('start', i - 1)
+            return f"{prev_start}+{d}" if prev_start else spell_inline('start', i, grain, start0)
+        if field_ == 'end':
+            own = cell('start', i)
+            return f"{own}+{d - 1}" if own else spell_inline('end', i, grain, start0)
+        if field_ == 'days':
+            own_start, own_end = cell('start', i), cell('end', i)
+            return f"{own_end}-{own_start}+1" if own_start and own_end else str(d)
+        return '0'   # months: a week holds none (mo.time.months is refused)
+    if field_ == 'index':
+        # The period's number chains off the previous one whatever the
+        # grain — it needs no month stride (a day window has none).
+        prev = cell('index', i - 1)
+        if prev:
+            return f"{prev}+1"
+        return str(i + 1)
+    k = _months_per(grain)
     if field_ == 'start':
         if i == 0:
             opening = cell('end', -1)
@@ -285,13 +437,8 @@ def spell_anchor(field_: str, i: int, grain: str, start0: str,
         if own_start:
             return f"EOMONTH({own_start},{k - 1})-{own_start}+1"
         return spell_inline('days', i, grain, start0)
-    if field_ == 'months':
-        return _months_cell(i, start0, cell) or str(k)
-    # index
-    prev = cell('index', i - 1)
-    if prev:
-        return f"{prev}+1"
-    return str(i + 1)
+    # months
+    return _months_cell(i, start0, cell) or str(k)
 
 
 def _spell_anchor_stub(field_: str, i: int, grain: str, start0: str,
@@ -299,7 +446,7 @@ def _spell_anchor_stub(field_: str, i: int, grain: str, start0: str,
                        first_day: date) -> Optional[str]:
     """``spell_anchor`` for a window whose first period is short; ``None``
     where the whole-period chain is already right (start and index)."""
-    k = STEP[grain]
+    k = _months_per(grain)
     own_start, own_end = cell('start', i), cell('end', i)
     if field_ == 'end':
         if own_start:

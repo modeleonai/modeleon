@@ -22,6 +22,48 @@ from ..core.expr import MethodCall, VarRef
 from ..core.variable import Variable
 
 
+def check_fill(fill: Any, spelled: str) -> None:
+    """A lag's fill that is a line is kept as a reference to its cell, so it
+    is one value assigned above the lag: a fill assigned further down, or a
+    series, is refused (``spelled`` is how the call is written)."""
+    if not isinstance(fill, Variable):
+        return
+    if fill._forward_of is not None:
+        raise TypeError(
+            f"{spelled}{fill._forward_of[1]}): the fill is assigned "
+            f"further down — assign it above this line."
+        )
+    if isinstance(fill._value, list):
+        raise TypeError(
+            f"{spelled}) must be a number or a SCALAR Variable — "
+            f"a list fill has no single head value."
+        )
+
+
+def lag_unit(source: Variable, fill: Any, result: Variable) -> Any:
+    """The unit of a lag of ``source`` filled by ``fill`` — ``mo.lag``'s and
+    ``.shift``'s, by the law a loop container derives the row by again
+    (``core.loops._unit_of``). The source's unit; the fill is the series'
+    first cells, so a fill in a unit is in the source's, as the two values of
+    an ``IF`` share one (:func:`~modeleon.functions._helpers.same_unit`):
+    another dimension is
+    refused, two labels of a pure number name neither. A source read
+    before its line takes the fill's, and its mismatch waits for the loop
+    to close."""
+    from ._helpers import operand_unit, same_unit, waits_on_loop
+    waiting = waits_on_loop(source) or waits_on_loop(result)
+    unit = getattr(source, "_unit", None)
+    if unit is None and not waiting:
+        return None
+    fill_node = [VarRef(fill)] if isinstance(fill, Variable) else []
+    try:
+        return same_unit("lag", [VarRef(source), *fill_node], operand_unit)
+    except ValueError:
+        if not waiting:
+            raise
+        return None
+
+
 def lag(
     source: Variable,
     periods: int = 1,
@@ -37,7 +79,9 @@ def lag(
         fill: Value for the positions the shift exposes (the first
             ``periods`` cells of a lag, the last of a lead). A number
             or a SCALAR Variable — a Variable keeps the dependency
-            live, so editing the fill assumption reflows the model.
+            live, so editing the fill assumption reflows the model. The
+            result is in the source's unit, and a fill in a unit is too:
+            one in another is refused.
         display_name: Optional display label for the result.
 
     Excel: each cell references the source row's cell ``periods``
@@ -64,16 +108,7 @@ def lag(
         raise TypeError("lag(..., periods=) must be an int") from None
 
     fill_is_var = isinstance(fill, Variable)
-    if fill_is_var and fill._forward_of is not None:
-        raise TypeError(
-            f"lag(..., fill={fill._forward_of[1]}): the fill is assigned "
-            f"further down — assign it above this line."
-        )
-    if fill_is_var and isinstance(fill._value, list):
-        raise TypeError(
-            "lag(..., fill=) must be a number or a SCALAR Variable — "
-            "a list fill has no single head value."
-        )
+    check_fill(fill, "lag(..., fill=")
     fill_value = fill._value if fill_is_var else fill
 
     from ..core.regrain import hole_value
@@ -137,7 +172,7 @@ def lag(
         result.value_type = "float"
     else:
         result.value_type = "int"
-    unit = getattr(source, "_unit", None)
+    unit = lag_unit(source, fill, result)
     if unit is not None:
         result._unit = unit
 

@@ -37,6 +37,21 @@ class TestTimeLabels:
     def test_single_period(self):
         assert mo.Time('2024-01', '2024-01')._value == ['2024-01']
 
+    def test_a_window_ending_in_9999_stops_on_its_last_label(self, tmp_path):
+        # The labels step between periods, never past the last one: the
+        # period after December 9999 is one no date can hold.
+        assert mo.Time('9999-10', periods=3)._value == ['9999-10', '9999-11', '9999-12']
+        assert mo.Time('9999-Q3', periods=2, grain='quarter')._value == ['9999-Q3', '9999-Q4']
+        assert mo.Time('9998', periods=2, grain='year')._value == ['9998', '9999']
+        blend = mo.blend(given='actual', follow='plan', until='9999-10')
+        m = mo.Model('m', default_grain='month', default_start='9999-10', default_periods=3,
+                     tracks=mo.Tracks('plan', 'actual', blend=blend))
+        with m:
+            m.inp = mo.MultiVariable('Inputs')
+            m.inp.rev = mo.Variable(plan=[1.0, 2.0, 3.0], actual=[1.5, 0.0, 0.0])
+        assert m.inp.rev.value['live'] == [1.5, 2.0, 3.0]
+        m.to_excel(tmp_path / 'm.xlsx')
+
 
 class TestTimeIsAnAxisVariable:
     """``mo.Time`` is a Variable, so it works as an axis in ``indexed_by``
@@ -82,11 +97,14 @@ class TestTimeValidation:
             mo.Time('2024-01', periods=0)
 
     def test_unknown_grain_raises(self):
-        # 'week' is not a supported grain; 'fortnight' is nonsense — both refused.
-        with pytest.raises(ValueError):
+        # 'fortnight' is no ruler of the calendar; a week is, and reads
+        # an ISO week label, never a month's.
+        with pytest.raises(ValueError, match="Unknown time grain 'fortnight'"):
             mo.Time('2024-01', periods=4, grain='fortnight')
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="Time week start must be 'YYYY-Www'"):
             mo.Time('2024-01', periods=4, grain='week')
+        t = mo.Time('2024-W01', periods=2, grain='week')
+        assert t.value == ['2024-W01', '2024-W02']
 
 
 class TestMultiGrain:

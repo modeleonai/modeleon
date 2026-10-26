@@ -187,6 +187,26 @@ def test_rows_downstream_written_before_the_loop_closes():
     assert series(m.x.ahead) == [3.0, 7.0, 15.0, 0.0]
 
 
+def test_a_criteria_joined_to_a_cell_is_read_as_given_when_the_loop_closes():
+    m = model(4)
+    with m:
+        m.cap = mo.Variable(500.0, unit="USD")
+        m.err = mo.Variable("#N/A")
+        m.repay = mo.Variable([200.0] * 4, unit="USD")
+        m.x = mo.MultiVariable("X", loop=True)
+        with m.x as x:
+            x.under = mo.COUNTIF(x.balance, ("<", m.cap))
+            x.small = mo.SUMIF(x.balance, ("<", m.cap), x.balance)
+            x.broken = mo.COUNTIF(x.balance, ("<", m.err))
+            x.balance = mo.lag(x.balance, fill=1000.0) - m.repay
+    assert m.x.under.value == 2 and m.x.under.unit is None
+    assert m.x.small.value == 600.0 and str(m.x.small.unit) == "USD"
+    # As outside a loop (and as the workbook computes ">" & a cell holding
+    # an error): the error is the result, never a count of error cells.
+    assert m.x.broken.value == "#N/A"
+    assert m.x.under.formula == "COUNTIF(balance, CONCAT('<', cap))"
+
+
 def test_a_raw_list_operand_inside_the_loop_is_a_series():
     m = model(4)
     with m:
@@ -329,6 +349,51 @@ def test_units_wait_for_the_loop_to_close():
     assert m.x.balance._unit is not None and str(m.x.balance._unit) == "USD"
     assert m.x.ratio._unit is None
     assert m.x.share._unit is None
+
+
+def _debt_inputs(m, n):
+    m.inp = mo.MultiVariable("Inputs")
+    with m.inp as i:
+        i.rate = mo.Variable(0.01)
+        i.opening = mo.Variable(1000.0, unit="EUR")
+        i.repay = mo.Variable([10.0] * n, unit="EUR")
+        i.fee = mo.Variable([1.0] * n, unit="USD")
+
+
+def test_a_subscript_written_before_the_loop_closes_keeps_its_lines_unit():
+    # ``line[0]`` is in the line's unit, built on the open loop as once it
+    # closed - and a ratio to it is a pure number, not the line's unit.
+    m = model(4)
+    with m:
+        _debt_inputs(m, 4)
+        m.debt = mo.MultiVariable("Debt", loop=True)
+        with m.debt as d:
+            d.first = d.balance[0]
+            d.last = d.balance[-1]
+            d.left = d.balance / d.balance[0]
+            d.balance = mo.lag(d.balance, fill=m.inp.opening) - m.inp.repay
+    assert str(m.debt.first._unit) == "EUR"
+    assert str(m.debt.last._unit) == "EUR"
+    assert m.debt.left._unit is None
+    assert m.debt.first.value == pytest.approx(990.0)
+
+
+def test_a_recurrence_written_before_the_loop_closes_keeps_its_starts_unit():
+    # A running total and a roll-forward are in their start's unit, as
+    # mo.recurrence builds them outside a loop; a bare number starts none.
+    m = model(4)
+    with m:
+        _debt_inputs(m, 4)
+        m.debt = mo.MultiVariable("Debt", loop=True)
+        with m.debt as d:
+            d.paid = mo.cumsum(d.interest)
+            d.roll = mo.recurrence(m.inp.opening, "{prev} - {x}", x=d.interest)
+            d.count = mo.recurrence(0.0, "{prev} + 1", x=d.interest)
+            d.interest = mo.lag(d.balance, fill=m.inp.opening) * m.inp.rate
+            d.balance = mo.lag(d.balance, fill=m.inp.opening) - m.inp.repay
+    assert str(m.debt.paid._unit) == "EUR"
+    assert str(m.debt.roll._unit) == "EUR"
+    assert m.debt.count._unit is None
 
 
 def test_a_thrown_away_expression_does_not_stop_the_loop():
@@ -488,6 +553,73 @@ def test_a_unit_mix_found_when_the_loop_closes_names_the_row():
         with m.x as x:
             x.cost = mo.lag(x.balance, fill=100.0) + m.fee
             x.balance = mo.lag(x.balance, fill=100.0) - m.repay
+
+
+def test_a_unit_mix_through_a_subscript_is_refused_when_the_loop_closes():
+    m = model(4)
+    with m:
+        _debt_inputs(m, 4)
+        m.debt = mo.MultiVariable("Debt", loop=True)
+    with pytest.raises(ValueError, match=r"mix.*incompatible units: EUR and USD"):
+        with m.debt as d:
+            d.mix = d.balance[0] + m.inp.fee
+            d.balance = mo.lag(d.balance, fill=m.inp.opening) - m.inp.repay
+
+
+def test_a_unit_mix_through_a_recurrence_is_refused_when_the_loop_closes():
+    m = model(4)
+    with m:
+        _debt_inputs(m, 4)
+        m.debt = mo.MultiVariable("Debt", loop=True)
+    with pytest.raises(ValueError, match=r"mix.*incompatible units: EUR and USD"):
+        with m.debt as d:
+            d.mix = mo.cumsum(d.balance) + m.inp.fee
+            d.balance = mo.lag(d.balance, fill=m.inp.opening) - m.inp.repay
+
+
+def _usd_eur_inputs(m):
+    m.inp = mo.MultiVariable("Inputs")
+    with m.inp as i:
+        i.opening = mo.Variable(100.0, unit="USD")
+        i.cash = mo.Variable([10.0] * 4, unit="USD")
+        i.fee = mo.Variable([1.0] * 4, unit="EUR")
+
+
+@pytest.mark.parametrize("order", [
+    ["prev", "balance", "flow"], ["balance", "flow", "prev"], ["flow", "prev", "balance"],
+])
+def test_a_mix_is_reported_on_the_row_that_writes_it(order):
+    # ``balance`` adds an EUR fee to a USD lag; ``prev`` only reads it
+    # through mo.lag with a USD fill. The refusal names balance, in every
+    # order the rows are written, never the row whose lag reads it.
+    m = model(4)
+    with m:
+        _usd_eur_inputs(m)
+        m.x = mo.MultiVariable("X", loop=True)
+    with pytest.raises(ValueError, match=r"x\.balance: Cannot add/subtract values with "
+                                         r"incompatible units: USD and EUR"):
+        with m.x as d:
+            for name in order:
+                if name == "prev":
+                    d.prev = mo.lag(d.balance, fill=m.inp.opening)
+                elif name == "balance":
+                    d.balance = mo.lag(d.flow, fill=0.0) + m.inp.fee
+                else:
+                    d.flow = d.prev + m.inp.cash
+
+
+def test_a_mix_read_through_a_pass_through_row_is_reported_where_written():
+    m = model(4)
+    with m:
+        _usd_eur_inputs(m)
+        m.x = mo.MultiVariable("X", loop=True)
+    with pytest.raises(ValueError, match=r"x\.balance: Cannot add/subtract values with "
+                                         r"incompatible units: USD and EUR"):
+        with m.x as d:
+            d.prev = mo.lag(d.mid, fill=m.inp.opening)
+            d.balance = mo.lag(d.flow, fill=0.0) + m.inp.fee
+            d.mid = d.balance * 1
+            d.flow = d.prev + m.inp.cash
 
 
 def test_python_that_cannot_be_rerun_is_refused_over_an_open_loop():
@@ -897,3 +1029,76 @@ def test_an_undeclared_loop_row_prints_the_label_its_formula_gives():
             d.x = mo.lag(d.y, fill=0.0) + m.inp.sh
             d.y = (d.x * 0.5).set_unit(factor)
     assert str(m.x.x._unit) == "factor"
+
+
+def test_a_list_holding_a_total_of_a_loop_row_waits_for_the_loop():
+    # The list's lines are the call's dependencies: a total of a row read
+    # before its line is the closed loop's, never the placeholder's.
+    m = model(4)
+    with m:
+        m.inp = mo.MultiVariable("Inputs")
+        with m.inp as i:
+            i.rate = mo.Variable(0.01)
+            i.repay = mo.Variable([10.0] * 4, unit="EUR")
+            i.f = mo.Variable(6.0, unit="EUR")
+        m.x = mo.MultiVariable("X", loop=True)
+        with m.x as x:
+            x.npv = mo.NPV(m.inp.rate, [mo.SUM(x.balance), m.inp.f])
+            x.balance = mo.lag(x.balance, fill=100.0) - m.inp.repay
+    assert m.x.npv.value == pytest.approx(300.0 / 1.01 + 6.0 / 1.01 ** 2)
+
+
+def test_a_downstream_recurrence_refuses_two_units_when_the_loop_closes():
+    # Run again from its formula when the loop closes, the template is read
+    # for units then, and a mix is reported under the row.
+    def build(sched_unit):
+        m = model(3)
+        with m:
+            m.inp = mo.MultiVariable("Inputs")
+            with m.inp as i:
+                i.opening = mo.Variable(100.0, unit="EUR")
+                i.sched = mo.Variable([1.0, 2.0, 3.0], unit=sched_unit)
+            m.debt = mo.MultiVariable("Debt", loop=True)
+            with m.debt as d:
+                d.cum = mo.recurrence(m.inp.opening, "{prev} + {r}", r=d.repay)
+                d.repay = m.inp.sched * 1.0
+        return m
+    with pytest.raises(ValueError, match=r'debt\.cum: recurrence\("\{prev\} \+ \{r\}"\): '
+                                         r'Cannot add/subtract'):
+        build("USD")
+    m = build("EUR")
+    eager = mo.recurrence(m.inp.opening, "{prev} + {r}", r=m.inp.sched * 1.0)
+    assert str(m.debt.cum.unit) == "EUR"
+    assert m.debt.cum.value == pytest.approx(eager.value)
+
+
+def test_a_recurrence_in_a_loop_takes_the_unit_its_template_gives():
+    # One rule inside and outside a loop: a start without a unit takes
+    # the template's, so the row is in USD as the same line built eagerly.
+    m = model(3)
+    with m:
+        m.inp = mo.MultiVariable("Inputs")
+        m.inp.sched = mo.Variable([1.0, 2.0, 3.0], unit="USD")
+        m.debt = mo.MultiVariable("Debt", loop=True)
+        with m.debt as d:
+            d.cum = mo.recurrence(0.0, "{prev} + {r}", r=d.repay)
+            d.repay = m.inp.sched * 1.0
+    assert str(m.debt.cum.unit) == "USD"
+    assert str(mo.recurrence(0.0, "{prev} + {r}", r=m.inp.sched * 1.0).unit) == "USD"
+
+
+def test_a_declared_recurrence_row_in_a_loop_keeps_its_unit_when_the_loop_closes():
+    # A declared unit decides what the line prints, in a loop as outside:
+    # the re-run at close carries it, so the product is not refused.
+    m = model(3)
+    with m:
+        m.inp = mo.MultiVariable("Inputs")
+        with m.inp as i:
+            i.opening = mo.Variable(100.0, unit="EUR")
+            i.factor = mo.Variable([1.0, 2.0, 3.0], unit="USD")
+        m.debt = mo.MultiVariable("Debt", loop=True)
+        with m.debt as d:
+            d.cum = mo.recurrence(m.inp.opening, "{prev} * {x}", x=d.scale, unit="EUR")
+            d.scale = m.inp.factor * 1.0
+    assert str(m.debt.cum.unit) == "EUR"
+    assert m.debt.cum.value == pytest.approx([100.0, 200.0, 600.0])

@@ -294,7 +294,7 @@ def _make_overview_sheet(root, direct_var_names: list[str]):
     # Bulk-assign — the property setter installs the dict into the
     # underlying storage in one shot. Per-key writes through the
     # property getter would write into a snapshot, not the storage.
-    virt._components = {name: root._components[name] for name in direct_var_names}
+    virt._components = {name: root._component(name) for name in direct_var_names}
     return virt
 
 
@@ -971,7 +971,7 @@ def _collect_rows(mv, direct_only: bool = False) -> tuple[list, int]:
     max_cols = 1
     hidden = _units_hidden(mv)
     for name in mv._component_order:
-        comp = mv._components[name]
+        comp = mv._component(name)
         if isinstance(comp, Variable):
             label = _label_with_unit(comp, hidden)
             values = comp._value if isinstance(comp._value, list) else [comp._value]
@@ -1257,7 +1257,7 @@ def model_html(root) -> str:
     direct_var_names: list = []
     sub_mvs: list = []
     for name in root._component_order:
-        comp = root._components[name]
+        comp = root._component(name)
         if isinstance(comp, Variable):
             direct_var_names.append(name)
         elif isinstance(comp, MultiVariableBase):

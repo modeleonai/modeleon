@@ -53,7 +53,7 @@ Split across two mixin modules:
 """
 
 from datetime import date
-from typing import Dict, List, Optional, Any, TYPE_CHECKING
+from typing import Dict, Iterable, List, Optional, Any, Set, Tuple, TYPE_CHECKING
 import contextvars
 import inspect
 import weakref
@@ -136,6 +136,76 @@ def _signature_of(compute_func: Any) -> "inspect.Signature":
         # A callable that can't be weakly referenced (e.g. a builtin set
         # as ``compute``): introspect each time rather than pin it.
         return inspect.signature(compute_func)
+
+
+#: The slots that declare a container's window.
+_WINDOW_SLOTS = frozenset(('default_grain', 'default_start', 'default_periods', 'default_zone'))
+
+#: Below this many names a list is scanned; from it on, looked up.
+_SCANNED_NAMES = 16
+
+
+class _ComponentNames(list[str]):
+    """A container's component names in order: a list whose ``in`` is a
+    set lookup once it is long. Every child adopted asks whether its name
+    is taken, and a scan of the list made filling a container quadratic
+    in its size. Every change to the list brings the set up to date —
+    ``append`` adds its name, any other change builds the set again — so
+    ``in`` only reads it."""
+
+    __slots__ = ('_lookup',)
+
+    def __init__(self, names: Iterable[str] = ()) -> None:
+        super().__init__(names)
+        self._lookup: Optional[Set[str]] = None
+        self._index()
+
+    def _index(self) -> None:
+        try:
+            self._lookup = set(self) if len(self) >= _SCANNED_NAMES else None
+        except TypeError:
+            # An unhashable name: the list is scanned, as a plain list is.
+            self._lookup = None
+
+    def __reduce__(self) -> Tuple[Any, ...]:
+        # A copy (or a pickle) is the same names in a new list.
+        return (type(self), (list(self),))
+
+    def __contains__(self, name: object) -> bool:
+        lookup = self._lookup
+        if lookup is not None:
+            try:
+                return name in lookup
+            except TypeError:
+                pass
+        return list.__contains__(self, name)
+
+    def append(self, name: str) -> None:
+        super().append(name)
+        lookup = self._lookup
+        if lookup is None:
+            if len(self) == _SCANNED_NAMES:
+                self._index()
+        else:
+            try:
+                lookup.add(name)
+            except TypeError:
+                self._lookup = None
+
+
+def _indexes_after(change: Any) -> Any:
+    def changed(self: _ComponentNames, *args: Any) -> Any:
+        result = change(self, *args)
+        self._index()
+        return result
+    changed.__name__ = change.__name__
+    return changed
+
+
+for _change in ('extend', 'insert', 'remove', 'pop', 'clear',
+                '__setitem__', '__delitem__', '__iadd__', '__imul__'):
+    setattr(_ComponentNames, _change, _indexes_after(getattr(list, _change)))
+del _change
 
 
 class MultiVariableBase(_MVLifecycle, _MVInspect, Component):
@@ -258,7 +328,7 @@ class MultiVariableBase(_MVLifecycle, _MVInspect, Component):
         # disambiguating from private state attrs (``_parent``,
         # ``_qualified_id``, etc.) and from Variable IDs whose binding
         # names start with underscore (floating qpaths).
-        self._component_names: List[str] = []
+        self._component_names: List[str] = _ComponentNames()
 
         # Layout role is a derived internal marker. Users set
         # ``excel_props={'tab': True}`` to mark an Excel tab; the writer
@@ -277,21 +347,25 @@ class MultiVariableBase(_MVLifecycle, _MVInspect, Component):
         default_grain: Optional[str] = None,
         default_start: Optional[str] = None,
         default_periods: Optional[Any] = None,
+        default_zone: Optional[str] = None,
     ) -> None:
         """Validate and set the ambient time window (``default_grain`` /
-        ``default_start`` / ``default_periods``) declared in a constructor.
+        ``default_start`` / ``default_periods`` / ``default_zone``)
+        declared in a constructor.
 
         The window is where a model's time lives: list-valued lines inherit
         their native ``(start, grain)`` from the nearest ancestor window
         (``Variable.time``), and every renderer's timeline header is
         derived from it (``resolve_default_window``). Plain attribute
-        assignment (``m.default_grain = 'month'``) remains valid and
-        unvalidated; this constructor path fails loudly on a bad window.
+        assignment (``m.default_grain = 'month'``) remains valid; the grain
+        is checked there too (``__setattr__``), the rest of the window only
+        on this constructor path, which fails loudly on a bad window.
         """
-        from .time import GRAINS, _parse
+        from .time import GRAINS, WINDOW_MAX_PERIODS, SheetWidthError, _parse, width_refusal
         from .variable import Variable
         if default_grain is None:
-            given = 'default_start' if default_start is not None else 'default_periods'
+            given = ('default_start' if default_start is not None
+                     else 'default_periods' if default_periods is not None else 'default_zone')
             raise ValueError(
                 f"{given}= needs default_grain= beside it — the window's grain "
                 f"is what anchors the start label and the period count "
@@ -315,7 +389,11 @@ class MultiVariableBase(_MVLifecycle, _MVInspect, Component):
                 raise ValueError(
                     f"default_periods must be positive; got {default_periods}."
                 )
+            if default_periods > WINDOW_MAX_PERIODS:
+                raise SheetWidthError(width_refusal(default_grain, default_periods))
         self.default_grain = default_grain
+        if default_zone is not None:
+            self.default_zone = default_zone
         if default_start is not None:
             self.default_start = default_start
         if default_periods is not None:
@@ -326,7 +404,8 @@ class MultiVariableBase(_MVLifecycle, _MVInspect, Component):
     @property
     def _components(self) -> Dict[str, Any]:
         """Dict view of components — derived from ``__dict__`` indexed
-        by ``_component_names``. Read returns a fresh dict snapshot."""
+        by ``_component_names``. Read returns a fresh dict snapshot, a
+        copy of every child: one child is read with ``_component(name)``."""
         return {k: self.__dict__[k] for k in self._component_names if k in self.__dict__}
 
     @_components.setter
@@ -337,7 +416,7 @@ class MultiVariableBase(_MVLifecycle, _MVInspect, Component):
         current = list(self.__dict__.get('_component_names', []))
         for name in current:
             self.__dict__.pop(name, None)
-        self.__dict__['_component_names'] = list(mapping.keys())
+        self.__dict__['_component_names'] = _ComponentNames(mapping.keys())
         for name, value in mapping.items():
             self.__dict__[name] = value
 
@@ -350,7 +429,7 @@ class MultiVariableBase(_MVLifecycle, _MVInspect, Component):
     def _component_order(self, order: List[str]) -> None:
         """Replace the component name order. Components themselves stay
         in ``__dict__``; only the order list is updated."""
-        self.__dict__['_component_names'] = list(order)
+        self.__dict__['_component_names'] = _ComponentNames(order)
 
     @property
     def _is_sheet(self) -> bool:
@@ -409,7 +488,29 @@ class MultiVariableBase(_MVLifecycle, _MVInspect, Component):
             if not is_engine_frame(frame):
                 return _forward_placeholder(
                     self, name, (frame.f_code.co_filename, frame.f_lineno))
-        raise AttributeError(f"'{type(self).__name__}' has no component '{name}'")
+        missing = f"'{type(self).__name__}' has no component '{name}'"
+        if name in _SETTING_SLOTS:
+            # A setting of the container, never a row — and the engine's
+            # own probes (``.tracks``, ``.default_grain``, tens of thousands
+            # per workbook), which pay no frame walk.
+            raise AttributeError(missing)
+        caller = sys._getframe(1)
+        from .mv_context import is_engine_frame, spelled
+        if is_engine_frame(caller):
+            # The engine's own probe (``getattr(mv, name, None)``): no hint
+            # to build — the author never reads this message.
+            raise AttributeError(missing)
+        # The author's own name for the container (``model``, ``income``,
+        # ``model.pnl``) — never its declared or display name, which
+        # need not be Python.
+        holder = spelled(self, caller) or "<the container>"
+        raise AttributeError(
+            f"{missing}. Assign it before the line that reads it — "
+            f"`{holder}.{name} = mo.Variable(...)` for a row, "
+            f"`{holder}.{name} = mo.MultiVariable('{name}')` for a container; "
+            f"a row read before its own line belongs in a loop container "
+            f"(loop=True)."
+        )
 
     def __setattr__(self, name: str, value: Any) -> None:
         """Auto-register Variables or nested MVs assigned as attributes.
@@ -423,6 +524,25 @@ class MultiVariableBase(_MVLifecycle, _MVInspect, Component):
         through normal attribute assignment.
         """
         from .variable import Variable
+        if name == 'default_grain' and value is not None:
+            # The same gate as the constructor's: a grain the engine does
+            # not know must not sit on a model until a writer dies on it.
+            from .time import GRAINS
+            if value not in GRAINS:
+                raise ValueError(
+                    f"Unknown default_grain {value!r}; supported: "
+                    f"{', '.join(GRAINS)}."
+                )
+        if name == 'default_zone' and value is not None:
+            # A fixed offset, spelled one way ('+01:00'); a named zone is
+            # refused with the offset to write instead.
+            from .time import zone_offset
+            value = zone_offset(value)
+        if name == 'default_periods' and isinstance(value, int) and not isinstance(value, bool):
+            from .time import WINDOW_MAX_PERIODS, SheetWidthError, width_refusal
+            if value > WINDOW_MAX_PERIODS:
+                raise SheetWidthError(width_refusal(
+                    self.__dict__.get('default_grain') or 'period', value))
         if name == 'default_grain' and '_default_start_source' in self.__dict__ \
                 and isinstance(value, str):
             from .time import window_start_label
@@ -434,6 +554,28 @@ class MultiVariableBase(_MVLifecycle, _MVInspect, Component):
                     '_default_start_source'))):
             from .mv_context import refuse_window_change
             refuse_window_change(self, name)
+        if name == 'default_periods' and isinstance(value, int) and not isinstance(value, bool):
+            # A model given its horizon by assignment (``m.default_periods =
+            # 36``) is the model last given a horizon, as the constructor's
+            # is: a line reading ``mo.time`` outside its ``with`` block (a
+            # model written without one) finds the window there. Noted once the
+            # assignment is allowed (a refused change moves nothing), and
+            # not for the engine's own assignments (a projection builds
+            # models too).
+            from .mv_context import _note_window, is_engine_frame
+            if not is_engine_frame(sys._getframe(1)):
+                _note_window(self)
+        if name in _WINDOW_SLOTS and (self.__dict__.get('_component_names')
+                                      or self.__dict__.get('_forward')
+                                      or self.__dict__.get('_sliced')):
+            # The lines under this window are placed by it — a row read
+            # ahead of its line and a track slice too: a formula placed
+            # through them before the change is placed again. A container
+            # that holds none of them yet places nothing — a line adopted
+            # into it later is placed again on its own adoption — so the
+            # window every constructor sets moves nothing kept.
+            from .variable_ops import _windows_changed
+            _windows_changed()
         if name == 'default_start' and isinstance(value, (date, Variable)):
             self._set_default_start(value)
             return
@@ -516,6 +658,13 @@ class MultiVariableBase(_MVLifecycle, _MVInspect, Component):
             self._detach_component(name)
             return
         super().__delattr__(name)
+        if name in _WINDOW_SLOTS and (self.__dict__.get('_component_names')
+                                      or self.__dict__.get('_forward')
+                                      or self.__dict__.get('_sliced')):
+            # Deleting a window slot changes the window as setting one
+            # does: a formula placed through these lines is placed again.
+            from .variable_ops import _windows_changed
+            _windows_changed()
 
     # ``python_name`` property + setter are inherited from :class:`Base`.
 
@@ -544,7 +693,7 @@ class MultiVariableBase(_MVLifecycle, _MVInspect, Component):
             self._qualified_id = QPath.ROOT.child(self._python_name)
             from .mv_context import _crystallize_subtree
             for comp_name in self._component_order:
-                child = self._components[comp_name]
+                child = self._component(comp_name)
                 _crystallize_subtree(child, self._qualified_id.child(comp_name))
             return self._qualified_id
         return QPath.floating(id(self), kind="m")
@@ -621,7 +770,7 @@ class MultiVariableBase(_MVLifecycle, _MVInspect, Component):
         MV's components, returning the detached instance. Raises
         :class:`KeyError` if there is no such component.
         """
-        if not isinstance(name, str) or name not in self._components:
+        if not isinstance(name, str) or not self._has_component(name):
             raise KeyError(
                 f"{name!r} is not a component of this "
                 f"{type(self).__name__}."
@@ -883,7 +1032,7 @@ class MultiVariable(MultiVariableBase):
         # by every list-valued line under it (``Variable.time``) and by the
         # Excel timeline header (``resolve_default_window``).
         window_kwargs: Dict[str, Any] = {}
-        for window_key in ("default_grain", "default_start", "default_periods"):
+        for window_key in ("default_grain", "default_start", "default_periods", "default_zone"):
             if window_key in components:
                 window_kwargs[window_key] = components.pop(window_key)
 

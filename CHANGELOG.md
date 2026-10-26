@@ -7,6 +7,684 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] — 2026-10-26
+
+### Added
+
+- **A named view, applied.** A model may keep several looks beside its
+  own — `model.board = mo.ExcelView('Board pack', font=…, bands=…)`,
+  `model.banker = mo.ExcelView('Banker', …)` — and `with
+  mo.applied_view(model.board): model.to_excel(path)` draws the book
+  under one of them: its fonts, bands, columns and formats over the
+  model's own view, whatever it leaves unset coming, as before, from the
+  model, a `mo.house_view(...)` around the call and the engine's defaults
+  (`mo.default_excel_view`); a `sheet={'order': …}` it declares orders
+  the book. The same model, the same numbers and formulas, in as many
+  looks as it declares. The period axis stays the model's: `orient` is
+  geometry, not a look.
+- **Errors caught, and many branches without nesting.** `mo.IFERROR(value,
+  fallback)` shows the fallback where a division by zero or a lookup that
+  finds nothing would spread an error through the model (`=IFERROR(B7 / B8,
+  0)` in every period); `mo.ISERROR` and `mo.ISNUMBER` test a cell, `mo.XOR`
+  joins conditions, and `mo.IFS(cond, value, …)` / `mo.SWITCH(expr, case,
+  value, …, default)` choose among many branches without nested `IF`s. Each
+  is one call per period over a row and runs inside a loop container;
+  `XOR`, `IFS` and `SWITCH` are stored as the `_xlfn.` names Excel expects.
+  `SWITCH` compares numbers to about 15 significant digits, as the
+  spreadsheet does; text given to `XOR` is refused with a pointer to compare
+  it instead. The values `IFERROR`, `IFS` and `SWITCH` may return are in
+  one unit, inside a loop container too (`mo.IFERROR(usd, eur)` is
+  refused; a plain `0` or a line without a unit goes with any), and
+  `SWITCH` compares its expression with each case in one unit
+  (`mo.SWITCH(hours, limit_usd, …)` is refused).
+- **Rounding, powers and logarithms.** `mo.ROUNDUP`, `mo.ROUNDDOWN`,
+  `mo.TRUNC`, `mo.CEILING`, `mo.FLOOR`, `mo.POWER`, `mo.SQRT`, `mo.EXP`,
+  `mo.LN`, `mo.LOG`, `mo.LOG10` and `mo.SIGN`, one call per period, and
+  `mo.PRODUCT`: over one row the product of its cells, written over its
+  range (`=PRODUCT(C3:N3)`), over two or more operands with a series among
+  them one product per period (`=PRODUCT(C3, C4)` in each column), as `a *
+  b` multiplies them, and over scalars only one number. They round the
+  number as the cell shows it (`ROUNDUP(0.1 * 3, 1)` is 0.3, not 0.4), read
+  a date as its serial number, and give `#NUM!` where no cell could hold
+  the result; the same functions work inside a `mo.recurrence` template
+  (`"ROUNDUP({prev} * 1.05, 0)"`). A rounded amount keeps its unit;
+  `mo.POWER` and `mo.SQRT` raise it as `**` does (`mo.POWER(usd, 2)` is in
+  `USD^2`, `mo.SQRT` of a line in `USD^2` is in `USD`, `mo.SQRT(usd)` has
+  none); `mo.PRODUCT` multiplies its operands' units (`USD/t` times `t` is
+  `USD`), and over one row runs along pure numbers such as growth factors:
+  a row in a unit is refused, its cells' product being that unit to the
+  power of their count; `mo.CEILING` and `mo.FLOOR` take a number and its
+  multiple in one unit; `mo.EXP`, `mo.LN`, `mo.LOG`, `mo.LOG10` and
+  `mo.SIGN` carry none. The same holds inside a loop container.
+- **Loan schedules and depreciation.** `mo.NPER`, `mo.RATE`, `mo.IPMT`,
+  `mo.PPMT`, `mo.CUMIPMT` and `mo.CUMPRINC` — how long a loan runs, what
+  rate it carries, and the interest and principal of each payment — and
+  `mo.SLN`, `mo.DB`, `mo.DDB` and `mo.SYD`. One call per period, so
+  `mo.PPMT(rate, mo.time.index, n, loan)` is a whole amortization row
+  (`=PPMT(I!B1, 1, 4, I!B2)`, `=PPMT(I!B1, 2, 4, I!B2)`, …), inside a loop
+  container too. `RATE` iterates as the spreadsheet does, retrying from its
+  default guesses, and is `#NUM!` where no rate balances the flows. The
+  amounts each one reads — a loan and its balloon, a payment, a cost and
+  its salvage — are in one unit, the result's (`mo.SLN(cost, salvage,
+  life)` with both in USD is in USD; a salvage in EUR is refused), and
+  `NPER` and `RATE` carry none.
+- **Date arithmetic.** `mo.DATEDIF(start, end, unit)` with all six units,
+  Excel's quirks included (`"MD"` from 31 January to 1 March is -2 in a
+  common year); `mo.WEEKDAY` and `mo.WEEKNUM` with every return type (21 is
+  the ISO week); `mo.NETWORKDAYS` and `mo.WORKDAY`, whose holidays line is
+  written as the range every period's call reads (`=NETWORKDAYS(B2, C2,
+  Inputs!B5:D5)`).
+- **Text.** `mo.LEFT`, `mo.RIGHT`, `mo.MID`, `mo.TRIM`, `mo.FIND`,
+  `mo.SEARCH`, `mo.SUBSTITUTE`, `mo.VALUE`, `mo.TEXT` (number and date
+  formats: `TEXT(d, "yyyy-mm-dd")`, `TEXT(x, "#,##0.00")`), `mo.REPT` and
+  `mo.TEXTJOIN`. An operand reads as the cell would: a number as its General
+  text, a date as its serial number, a blank as empty text.
+- **Conditional sums and counts.** `mo.SUMIF`, `mo.SUMIFS`, `mo.COUNTIF`,
+  `mo.COUNTIFS`, `mo.AVERAGEIF`, `mo.AVERAGEIFS`, `mo.MAXIFS` and
+  `mo.MINIFS` over a row, or over a field down the records of a table
+  (`=SUMIFS(Deals!C3:C5, Deals!B3:B5, "North")`), with Excel's criteria —
+  `">=10"`, `"<>0"`, `"North*"`, `("<", threshold)` joined to a cell as
+  `"<" & B2` — and `mo.COUNT` / `mo.COUNTA`: over one row the count of its
+  cells (`=COUNT(C5:N5)`), over two or more operands with a series among
+  them one count per period (`=COUNT(C5, C9)` in each column), over scalars
+  only one number. The lines a `SUMIF`, `SUMIFS`, `AVERAGEIF`,
+  `AVERAGEIFS`, `MAXIFS` or `MINIFS` call totals, averages or picks from
+  are in one unit, which the result carries, and each criterion is compared
+  in its range's unit, one joined to a cell too: `mo.SUMIF(hours, ("<",
+  cap), revenue)` with the cap in USD is refused, inside a loop container
+  as outside, and an error the joined cell holds is the call's result. A
+  criterion a spreadsheet reads one way in some locales and another way in
+  others (`'1,000'`, `'1/31/2026'`) is refused when the model is built,
+  with the form to write instead (`'1000'`, `'2026-01-31'`). Where the
+  cells a conditional call reads cannot form one range — lines on two
+  sheets or with a line between them, or a row split by a totals column —
+  the call is written as its computed number and `check_compat` lists the
+  cell; `mo.COUNT` and `mo.COUNTA` name such cells one by one
+  (`=COUNT(East!B1, East!B3)`).
+- **Lookups.** `mo.XLOOKUP`, `mo.INDEX`, `mo.MATCH`, `mo.VLOOKUP` and
+  `mo.HLOOKUP` over a row, a list of rows, or the records of a table; a key
+  that is a series gives one lookup per period (`=INDEX(Inputs!B3:D3,
+  MATCH(B2, Inputs!B2:D2, 0))`, then `MATCH(C2, …)`), so a year-varying
+  assumption is read from its table instead of being retyped. Approximate
+  matches need sorted cells, as in Excel; `XLOOKUP`'s binary searches
+  (`search_mode` 2 / -2) are refused, and `None` typed as a key is refused
+  (the formula would write it as 0). A key is compared with the cells
+  searched in one unit (`mo.XLOOKUP(amount_usd, thresholds_eur, fees)` is
+  refused), and the cells a lookup may return — a list of rows, a block's
+  column or row, an `if_not_found` — are in one unit, as `mo.CHOOSE`'s
+  choices are; a number or a line without a unit goes with any. Where the
+  cells searched or returned cannot form one range — lines on two sheets
+  or with a line between them, or a row split by a totals column — the
+  lookup is written as its computed number and `check_compat` lists the
+  cell.
+- **Statistics.** `mo.MEDIAN`, `mo.STDEV_S`, `mo.STDEV_P`, `mo.VAR_S`,
+  `mo.VAR_P`, `mo.PERCENTILE_INC`, `mo.PERCENTILE_EXC`, `mo.QUARTILE_INC`,
+  `mo.QUARTILE_EXC`, `mo.LARGE`, `mo.SMALL`, `mo.RANK_EQ` and `mo.RANK_AVG`
+  — Excel's dot is an underscore in the name, and the file stores
+  `_xlfn.PERCENTILE.INC` — with the older `mo.STDEV`, `mo.STDEVP`,
+  `mo.VAR`, `mo.VARP`, `mo.PERCENTILE`, `mo.QUARTILE` and `mo.RANK` that
+  older workbooks carry. Over a row or one field down the records of
+  a table: the median of a comps multiple is `=MEDIAN(Comps!C3:C9)`, its
+  first quartile `=_xlfn.PERCENTILE.INC(Comps!C3:C9, 0.25)`, and each
+  record's rank among its peers one call per record against the same
+  range (`=_xlfn.RANK.EQ(C3, C3:C9)`). Several series are combined period
+  by period, as `a + b` combines them — the rule every aggregate follows:
+  `mo.MEDIAN(plan, actual)` is `=MEDIAN(C5, C9)` in every column,
+  with scalars broadcast, series of other lengths refused and a line with
+  tracks taken track by track; a list of two or more yearly lines (one
+  field down a records table, or sibling lines) is one sample per year —
+  the peers' median revenue is `=MEDIAN(Peers!C3:C9)`, then
+  `=MEDIAN(Peers!D3:D9)`, …, their first quartile and each record's rank
+  among them one call per year over the same column of cells
+  (`=_xlfn.RANK.EQ(D3, D3:D9)`). One series alone is reduced over its
+  periods (`=MEDIAN(C5:N5)`) and scalars only stay one number; a list of
+  one yearly line is refused, as no sample. Inside a `loop=True` container
+  a call over two or more values runs one period at a time. Blanks, text
+  and booleans in a range are skipped; a `k` or a quart out of range is
+  `#NUM!`; `LARGE` takes a fractional `k` up and `SMALL` down; the values
+  a call reads are in one unit.
+- **A rank, a conditional total or a lookup per record reads its range
+  once.** Every call over the same lines — `mo.RANK_EQ(rec.multiple,
+  peers)` for each record of a table, or a `SUMIF`, `COUNTIFS`, `MATCH` or
+  `XLOOKUP` per record — shares one range, read once and checked before
+  each call: a line given another value (replaced, or its list changed in
+  place), another unit or another place is read again. Its cells are
+  sorted once for `RANK`, `LARGE`, `PERCENTILE` and `MEDIAN`, and indexed
+  by value once a second equality in `SUMIF`, `COUNTIFS`, `MATCH`,
+  `XLOOKUP` or their kin looks among them; the range's address is worked
+  out once per sheet. Each formula still lists all its peers, so the build
+  of a very large table keeps a cost per record and peer.
+- **Hours.** `default_grain='hour', default_start='2026-01-05T13'` (or a
+  `datetime` on the hour, or a date — its midnight): the wall clock of one
+  fixed-offset zone, declared once on the window (`default_zone='+01:00'`;
+  UTC when omitted; a named zone such as `'Europe/Paris'` is refused with the
+  offset to write, since a zone that moves its clocks would skip and repeat
+  hours). An hour is `[13:00, 14:00)`: `mo.time.end` is where it stops,
+  `mo.time.days` is 1/24 (`mo.time.months` is refused), `regrain` weights a
+  mean by it. An hour nests in its day and everything above: `.at('day')`,
+  `.at('month')`, `.at('week')`; `timeline={'totals': ['day']}`
+  draws a day total after each day's last hour, `05 Jan 2026 | 22:00 23:00 |
+  Total 05 Jan 2026`, a live `=SUM` over its hours; a time row's day total
+  reads its hours' cells too — the first hour's start, the last hour's
+  stop, the `SUM` of their days. The header is a closed
+  form off the start cell (`start + i/24`, never a chain that would drift
+  over thousands of columns), captions are the hour's start as a clock
+  (`dd mmm yyyy hh:mm`), the days row shows its fraction. Keys are
+  `YYYY-MM-DDTHH`; the finance spelling is `05 Jan 2026 13:00`.
+- **A window wider than a sheet is refused.** A sheet holds 16,384 columns
+  and a period is one (a total another): `default_periods` past 16,383 is
+  refused where it is declared, and the layout refuses a sheet whose label
+  columns, periods and totals together pass the last column
+  (`SheetWidthError`), naming the count, what the grain fits (hours about 22
+  months) and the two ways out — a coarser grain, or the data kept as rows.
+- **An instant keeps its clock in a formula.** A `datetime` off midnight
+  inlined into a formula is written `(DATE(2026, 1, 5)+TIME(13, 0, 0))` — in
+  brackets, so `end - start` subtracts the whole instant; it was cut to its
+  day.
+- **An ISO year in its own book.** A window of ISO years
+  (`default_grain='iso_year'`), or a weekly book viewed as ISO years,
+  writes its header off the start cell: the ISO year of the start cell
+  is `YEAR(start + 3)`, each year starts on `DATE(y,1,4) -
+  WEEKDAY(DATE(y,1,4),3)` and ends the day before the next one does; an
+  anchor chains `start = previous end + 1` and ends each year off its own
+  start, so a first year opened on a Monday inside it is short and right.
+- **ISO weeks, and the ISO year that totals them.** `default_grain='week'`,
+  `default_start='2026-W05'` (or a date that is a Monday): weeks run Monday to
+  Sunday and are numbered in their ISO year — `2026-W01` starts on 29 December
+  2025, and 2026 has 53 weeks; `mo.time` reads each week (7 days; `months` is
+  refused, as a day's is). A week lies inside one ISO year and in no month,
+  quarter or calendar year: `.at('iso_year')` rolls it up, and
+  `timeline={'totals': ['iso_year']}` draws a total after each ISO year's last
+  week; a day sheet may total by `'week'` (with `'iso_year'` above it). A
+  weekly header is a live chain off the start cell (`end = start + 6`).
+- **A day sheet totals by month.** `ExcelView(timeline={'totals': ['month']})`
+  (beside `'quarter'`, `'half'`, `'year'`) on a day window draws a month total
+  after each month's last day — `30 31 | Total Jan | 01 02 03 | Total Feb` —
+  under a month tier (`Jan`; the year on the tier above when it is declared),
+  the days grouped under their month in the outline, each total a live `=SUM`
+  over its days (`=` the last day for a stock). Code that reads the totals
+  plan (`modeleon.compile.excel.totals.TotalsPlan`) finds a sheet's own periods
+  keyed `('period', i)`, where they were `('month', i)` whatever the grain;
+  `month_col` stays as an alias of `native_col`.
+- **The half-year.** A fifth grain between quarter and year: a window of
+  its own (`default_grain='half', default_start='2026-H1'`, or a date —
+  a half opened on the 1st of any month is a short first period, as a
+  quarter's is), a totals column (`ExcelView(timeline={'totals': ['half']})`
+  draws `Total H1` after June and `Total H2` after December, under the
+  year's tier and over the quarters'), a target of `.at('half')` on a line
+  or on a whole model (`model.at('half')`), with its `mo.time` (181 / 184
+  days, 6 months) and its header formulas (`EOMONTH(start, 5)`). Keys are
+  `YYYY-Hn`; the finance spelling is `H1 2026`, the compact one `H1-26`.
+- **The calendar's answers for a window.**
+  `modeleon.core.time.period_bounds('2026-01', 'month', 3)` returns each
+  period's first and last day as two lists (1 to 31 January, 1 to 28
+  February, 1 to 31 March; for an hour, where it starts and stops), and
+  `year_back_index('2026-01', 'month', 15)` the index of the period a year
+  earlier in the same window (`None` for the first twelve months, then `0,
+  1, 2`). `modeleon.core.calendar` holds a ruler for each grain (hour, day,
+  week, month, quarter, half, year, iso_year): `GREGORIAN.ruler('quarter')`
+  finds the period holding a day (`start_of`) and where the next one starts
+  (`next_start`), writes and reads a period (`label(date(2026, 4, 1),
+  'finance')` is `'Q2 2026'`, `parse('2026-Q2')` gives back 1 April) and
+  names its grain (`word` is `'Quarterly'`, `letter` `'Q'`). A chart's time
+  axis or a growth on last year in your own code can take its dates from
+  these instead of doing calendar arithmetic of its own.
+
+### Changed
+
+- **`mo.SUM` and `mo.AVERAGE` over two or more operands work period by
+  period.** `mo.SUM(product_a, product_b)` is the two lines' total in every
+  period — a subtotal, written `=SUM(C5, C9)` in each column — and
+  `mo.AVERAGE(plan, actual)` their mean, with scalars broadcast as `a + b`
+  broadcasts them, series of other lengths refused and an operand with
+  tracks taken track by track; inside a `loop=True` container they are
+  allowed. Before, two series were reduced to one number across both rows
+  (`=SUM(B2:F2, B3:F3)`). Over one operand `mo.SUM(row)` stays the total of
+  its periods (`=SUM(B2:F2)`), and over scalars only one number (`=SUM(B2,
+  B3)`). The total of several rows over all their periods is now
+  `mo.SUM(a) + mo.SUM(b)`. Every aggregate follows the rule `mo.MIN` /
+  `mo.MAX` follow since 0.2.2: several series are combined period by
+  period, one series alone is reduced over its periods, scalars only stay
+  one number. The operands of a call are added left to right, as `+` adds
+  them (Python's `sum` compensates the rounding), so `mo.SUM(a, b, c)` is
+  `a + b + c` to the last digit — over scalars only too, where a value can
+  move in its last digit (`mo.SUM(0.1, 0.2, -0.3)`). Lines on other time
+  windows and lines along keys are read as `a + b` reads them, as in every
+  function (the next entry). A `None` typed into `mo.SUM`,
+  `mo.AVERAGE`, `mo.MIN`, `mo.MAX` or `mo.PRODUCT` (or into a list typed
+  in) is the 0 the formula holds, as the sheet reads `=MIN(C2, 0)` and as
+  the counts read it (`mo.AVERAGE`, `mo.MIN` and `mo.MAX` skipped it);
+  text among the values is refused with a message naming
+  the function and the value. A per-period `SUM` or `AVERAGE` re-grains
+  as `a + b` does — its quarter is the call over its operands' quarters,
+  written live in a totals column (`=SUM(E5, E9)`) — and a per-period
+  `mo.PRODUCT` as `a * b` does.
+- **Every function reads a line on another time window by date, and lines
+  along keys key by key — as `a + b` reads them, in Python and in the
+  workbook.** A located series on another window (a sub-container's own
+  `default_start`, a line's `start=`) is aligned onto the combined window:
+  each line continued by its own `extend=` rule — `mo.zero()` for a flow,
+  `mo.hold()` for a rate — the result on that window, two grains refused.
+  In 0.2.2 `mo.AND`, `mo.OR`, `mo.CHOOSE`, `mo.CONCAT`, `mo.DATE`,
+  `mo.DAYS360`, `mo.YEARFRAC` and `mo.DAYS` paired such lines by position —
+  January beside a tranche's March, the line's last value standing in for
+  the months it lacks — `mo.IF` paired them by position and raised
+  `IndexError` past the shorter branch (`mo.IF(rev > 2, rev, fee)` gave
+  `[10, 20, 3, 4]` for a fee from March; with the fee's
+  `extend=mo.zero()` it is now `[0, 0, 3, 4]`), `mo.MIN` and
+  `mo.MAX` refused lines of other lengths (`Cannot broadcast lists of
+  different lengths`), and `mo.MOD` and the comparisons paired two windows
+  of one length by position and refused others; now each reads the line
+  on its date, as do the functions added since (rounding, powers, loan
+  schedules, `mo.IFERROR` and its kin, the lookups' keys and positions,
+  the statistics, the counts), a `mo.recurrence` template's lines, which
+  0.2.2 paired by position, and a loop container, whose rows read such a line by date in every period (a
+  one-period line was broadcast into every period of the loop, a line of
+  another length refused). A model that relied on the positional reading
+  meets a refusal naming the line and the rule to declare: `'fee' does
+  not cover the combined window (…). Say what continues it:
+  extend=mo.zero() (a flow) or extend=mo.hold() (a rate)`. An unnamed
+  formula runs on the window of the lines it reads — `rev * 1` on the
+  model's, `fee > 15` on the tranche's — and meets other windows by date;
+  it carries no `extend=` rule, so where it does not cover the combined
+  window it is refused, naming the line to make of it — and it is placed
+  the same whatever the order the model was built in: a line attached to
+  the model after a formula was built over it, or a window moved after,
+  places the formula as a fresh one is placed. The commonest case
+  is a condition on a line of another window, `mo.IF(fee > 15, rev, 0)`,
+  which 0.2.2 read by position: its migration is a line with a rule on
+  that container, `m.t.big = mo.Variable(m.t.fee > 15, extend=mo.zero())`,
+  then `mo.IF(m.t.big, rev, 0)`; a condition on the model's own lines,
+  `mo.IF(rev > 2, fee, 0)`, needs nothing. A one-value line on a window
+  of several periods is the constant it always was; a line along keys
+  runs on no window; a plain line beside a tracked one is read on the
+  tracked line's window (`mo.SUM(rev, once, trk)` reads `once` on its one
+  date — 0.2.2 refused the call, and `trk + once` read it in every
+  period) and a tracked line on its own window only; windows are ordered
+  by date, never as text (`'2026-9'` comes before `'2026-10'`: `rev + fee`
+  dropped September). A line of dates or text with `extend=mo.zero()` is
+  refused where the zero would stand in, pointing to `mo.hold()` (0.2.2
+  let the zero stand in without a word). A line of another length with no
+  window at all is refused, as `a + b` refuses it; `mo.IF`, `mo.AND`,
+  `mo.OR`, `mo.CONCAT`, the dates and a `mo.recurrence` template, which
+  paired it by position, now name it (`'pair' cannot be paired with the
+  call's other series period by period`); a list typed in keeps its positional reading,
+  its last value standing in for the periods it lacks as the cell writes
+  it (in `mo.IF` too, which raised `IndexError` there), and `mo.IF` with
+  one condition takes the chosen branch whole, as before.
+  Lines along the same keys in another order are combined key by key in
+  every function, the result keeping their keys, and a line along keys
+  against a period series is refused, as `a + b` refuses it — the
+  functions zipped them cell by cell. What a workbook written now does
+  differently from 0.2.2: where Python aligns two windows — `+`, `-`, `*`,
+  `/`, `%`, `**`, the comparisons, every function and a loop container's
+  rows — a formula reading a line on a sub-container's own window inside
+  the sheet's takes the line's cell of the same date and, for a period
+  the line has no column for, its `extend=` rule, written as `0` for a
+  flow (`=SUM(C5, 0)`) or as its first or last cell for a rate held;
+  0.2.2 wrote the cell in the same position — January read the line's
+  first cell, March's — and, past the line's last column, its first cell
+  again. Where Python reads one line alone — `fee * 2` over a line on
+  another window, set on the model's sheet — the workbook reads it by
+  position, as Python does and as 0.2.2 did. A formula whose operands met
+  by date on a window of its own, set on a sheet of another window
+  (`m.x.y = mo.IFERROR(m.b.bz + m.c.cz, 0)` with `B` from November on a
+  sheet from January), is refused by the export as the bare sum was: its
+  January column would hold November. A line along keys in another order
+  is read at its key's cell (`=B6 * D8`, Bear × Bear), where 0.2.2 wrote
+  the cell in the same position (Bear × Bull) beside Python's key-by-key
+  value; a function's result over one keyed line keeps its keys and is
+  laid out under a caption row of them (`mo.ROUND(growth, 1)`); where the
+  line above it runs along periods or other keys that caption row is new
+  and the rows below move down one — 0.2.2 dropped the keys and wrote the
+  values under the period captions (or refused the line when the keys and
+  the periods differed in number). A window
+  reaching beyond the sheet's is refused at export, as before.
+- **Functions that add, compare or pick take their values in one unit, as
+  `+` does.** `mo.SUM(revenue, hours)`, with `revenue` in USD and `hours`
+  in hours, is refused, naming both lines (`mo.SUM takes its values in one
+  unit; 'revenue' and 'hours' are in USD and hours`), with the advice `+`
+  gives; so are `mo.AVERAGE`, `mo.MIN`, `mo.MAX`, the two branches of
+  `mo.IF`, the choices of `mo.CHOOSE` and a comparison of two lines
+  (`revenue > hours`: `Cannot compare values with incompatible units: USD
+  and hours`). Before, these ran in silence and the result had no unit, so
+  the next formula could not catch the mix: `mo.SUM(revenue, hours) + cost`
+  passed, in USD. A number or a line without a unit goes with any
+  (`mo.MAX(revenue, 0)` is in USD). A condition, an index or a case is not
+  one of the values: `mo.CHOOSE(scenario, revenue, cost)` with `scenario`
+  labelled `#` is in USD, where it had no unit. Inside a loop container,
+  over a row read before its line, the check is made when the loop closes.
+  The functions this release adds take their values the same way (above).
+- **A series where a function took one value is one call per period.**
+  `mo.ROUND`'s digits, `mo.EDATE` / `mo.EOMONTH`'s months and every
+  argument of `mo.PMT`, `mo.FV` and `mo.PV` may be a line — each period
+  computes the call over its own values, written in its column as the
+  spreadsheet writes it (`=ROUND(C5, C9)`, `=EDATE(C5, C9)`, `=PMT(C9 /
+  100, 12, 1000, 0, 0)`), a scalar standing in every period and lines read
+  as above; these raised a bare `TypeError`. `mo.NPV`'s rate and `mo.IRR`
+  / `mo.XIRR`'s guess stay one value for the whole row: a series there is
+  refused by name, as `mo.XNPV`'s rate already was.
+- **A function says how it is written.** Which names the Excel writer
+  passes through as `=NAME(...)`, which arguments it writes as ranges, which
+  names the file stores with the `_xlfn.` prefix, and which functions a loop
+  container runs one period at a time, is one registry
+  (`modeleon.functions.registry`) each function fills from its own module;
+  the renderer's and the loop container's hand-kept name sets are gone. A
+  function name the registry does not know is still written as given, with
+  a warning that points at it.
+- **A condition's `source_code` follows its formula.** For `mo.IF`,
+  `mo.AND`, `mo.OR`, `mo.NOT`, `mo.ISBLANK` and `mo.CHOOSE`, and the new
+  `mo.IFERROR`, `mo.ISERROR`, `mo.ISNUMBER`, `mo.XOR`, `mo.IFS` and
+  `mo.SWITCH`, `source_code` is the line's `.formula`, rendered when it is
+  read, so it follows names given to the lines later and a formula set by
+  hand (`flag.formula = '...'`): `mo.IF(a > 0, b, 0.0)` built before `a`
+  and `b` were named reads `IF((a > 0), b, 0.0)` once they are. Before, it
+  kept the text of the call, `IF((v1088264b0 > 0), v107cf6b70, 0.0)`. A
+  text written with `flag.source_code = '...'` still wins; nothing in the
+  workbook changes.
+- **A recurrence template whose power or function outgrows a cell gives
+  `#NUM!`.** `mo.recurrence(1e200, "{prev} ** 2", periods=3)` is
+  `[1e+200, '#NUM!', '#NUM!']`, carried on as a division by zero is; 0.2.2
+  raised `OverflowError`. The functions new in this release do the same in
+  a template (`"EXP({prev} * 1000)"`); an overflow by `*` or `+` still
+  gives `inf`, as in Python.
+- **A recurrence is in its start's unit.** `mo.recurrence(opening,
+  "{prev} * (1 + {g})", g=growth)` from an `opening` in USD is in USD, and
+  so is `mo.recurrence_sum(opening, additions)` over USD additions: a
+  revenue line built so is labelled `Revenue (USD)` in the workbook and
+  the notebook repr, and adding an hours line to it is refused. Before,
+  both had no unit unless `unit=` was given: the label read `Revenue`, and
+  the sum with hours passed, in hours. A declared `unit=` still decides.
+- **Grains nest by a relation, not by their order.** The calendar says
+  which grain lies inside which: in `modeleon.core.calendar`,
+  `GREGORIAN.nests('day', 'week')` is true and `GREGORIAN.nests('week',
+  'month')` false, and `GREGORIAN.verify()` checks each such claim period
+  by period. `modeleon.core.time.GRAINS` lists `hour, day, week, month,
+  quarter, half, year, iso_year` in that order (ranks 0 to 7). `.at()` on a line or on a whole
+  model, and arithmetic between two lines, are refused across grains that
+  do not nest (a weekly line's `.at('month')`), with the reason and the way
+  out: a grain both share (days). A totals column a sheet cannot draw (a
+  month column over weeks, weeks beside months over days) is left out with
+  a `TotalsWarning` that names the sheet and says why (`'month' totals are
+  not drawn: a week does not lie inside one month (weeks straddle months).
+  A week sheet totals by iso_year.`). In 0.2.2 `GRAINS` was `day, month,
+  quarter, year`, and a line rolled up to any grain after its own.
+- **Large models build faster.** Arithmetic between lines does less work
+  for each value, a condition (`mo.IF` and its kin) renders its text only
+  when it is read, and under a blend of tracks (`mo.blend`) what a line
+  reads is read once for the model, not again for every line built on it:
+  in our runs a model of 2,000 lines of arithmetic or conditions builds in
+  about three quarters of the time 0.2.2 took. Values, formulas and
+  workbooks are the same; writing the workbook takes about as long as
+  before.
+
+### Fixed
+
+- **A tracked row reads by position.** `closing[-1]` of a plan/actual row
+  raised "Index -1 on a scalar Variable", and `[0]` copied the whole row as
+  numbers. Both now read that period of every track, written in the book as
+  one live cell per track; a period not entered yet reads 0, as a blank cell
+  does in a formula. An index past `[0]` on a one-cell row says to read the
+  row by its name instead of pointing at `var.value`.
+- **A view goes where it is read.** An unnamed `mo.ExcelView(...)` hung
+  under a name that says "view" — `model.excel_view = …`, `model.view = …`,
+  `mo.Model(..., view=…)` — became a container nobody reads: the workbook
+  kept its look and no total column appeared, or the view's own settings
+  were refused as a series (`'totals' has 2 value(s) in a 24-period
+  window`). `to_excel` now warns (`UnreadViewWarning`, on the author's
+  line) with the slot to use, spelled by the author's own name for the
+  model — `model.default_excel_view = mo.ExcelView(...)`. A view the slot
+  points at is read, also through `extend`, through the copy a projection
+  or a second parent makes, through an ancestor's slot, and under
+  `mo.house_view(...)`. A view given a name of its own
+  (`model.board_view = mo.ExcelView('Board pack', ...)`, kept to be applied
+  with `mo.applied_view`) and a view kept under a name without "view" in it
+  draw no warning, and no view's settings are read as a series over the
+  model's periods.
+- **A horizon given by assignment counts.** `m.default_periods = 36` marks
+  the model last given a horizon, as the constructor does, so a line
+  reading `mo.time` outside the model's `with` block finds the window; a
+  refused change (the lines already read the window) marks nothing.
+- **A container cannot hold itself.** `model.m = model` adopted the model
+  as its own component and recursed until Python gave up; so did assigning
+  an ancestor. Refused with the alias to write (`with model as m:`). A read
+  of a component that was never assigned (`'Model' has no component
+  'inputs'`) now says how to assign it, and that a row read before its own
+  line belongs in a loop container. Both messages spell the container by
+  the author's own name for it (`model`, `income`, `model.pnl`), never by
+  its declared or display name, so the line they suggest runs.
+- **A large table is written in linear time.** A container with thousands
+  of children copied its whole list of children for every child it read,
+  and checked a new child's name against the list one by one: a records
+  table of 10,000 records took two minutes to write and now takes about
+  three seconds (3,000 records: 11 s to under a second), and its notebook
+  repr and `.code` follow.
+- **A blank typed into `LEN`, `UPPER`, `LOWER` or `CONCAT` is written as
+  `""`.** It was written as `0`, which the workbook reads as the text "0"
+  (`=LEN(0)` is 1 where Python gave 0).
+- **`mo.DAYS360` reads a method that varies by period.** A line given as
+  `method` was read as one TRUE — any list is — so every period counted
+  the European way, where the workbook reads each period's own cell
+  (`=DAYS360(B4, B11, B10)`); now each period takes its own method.
+- **A list of lines given as one argument says what it means, or is
+  refused.** In 0.2.2 `mo.SUM([a, b])` held a Variable as its value and the
+  cell its text (`Variable(...)`), as did `mo.AVERAGE`, `mo.MIN` and
+  `mo.MAX` over scalar lines; over a list holding a series `mo.MIN` /
+  `mo.MAX` raised "The truth value of a list Variable is ambiguous". A
+  list of scalar lines is its lines one by one in `mo.SUM`, `mo.AVERAGE`,
+  `mo.MIN`, `mo.MAX` and `mo.PRODUCT` (`mo.SUM([p, q])` is `mo.SUM(p, q)`,
+  `=SUM(B1, B2)`) and the range they form in `mo.COUNT` / `mo.COUNTA`
+  (`=COUNT(B1:B2)`). A list holding a series reads two ways and is
+  refused, both spelled with the lines' own names: per period, `mo.SUM(a,
+  b)`; the total over all their periods, `mo.SUM(a) + mo.SUM(b)` (each
+  function its own: `mo.MIN(mo.MIN(a), mo.MIN(b))`, …). The statistics
+  read a list of series lines as one sample per period (above).
+- **A grain or totals kind the engine does not know is refused where it is
+  given.** `m.default_grain = 'fortnight'` is refused on assignment, as the
+  constructor refuses it (`Unknown default_grain 'fortnight'; supported:
+  hour, day, week, ...`); it used to be accepted and fail later, in
+  `to_excel` or at the first `mo.time` read, on `Unknown time grain
+  'fortnight'`, which does not name `default_grain`.
+  `ExcelView(timeline={'totals': ['fortnight']})` is refused by name
+  (`ExcelView timeline totals may name day, week, month, quarter, half,
+  year, iso_year; got 'fortnight'`); it used to be accepted and draw no
+  column, without a word. `.at('fortnight')` on a month line names the
+  grains it rolls up to (`a month rolls up to quarter, half, year`), where
+  it raised a bare `KeyError: 'fortnight'`. A day window's start must be
+  `YYYY-MM-DD`: `default_start='2026-W01'` is refused, where it used to
+  start the window on Monday 29 December 2025, the first day of that ISO
+  week.
+- **Months beside years point to the explicit step.** Two units that
+  differ only in a month word against a year word (`months` / `yrs`,
+  `USD/month` / `USD/yr`) are refused with the step written out both ways
+  — `(x / 12).set_unit('yrs')`, `(x * 12).set_unit('months')` — since a
+  unit is a label that never rescales: dividing by 12 leaves months in
+  months. A refusal with no hint no longer opens its advice with
+  "Otherwise".
+- **A remainder keeps its unit.** `usd % 12` is in USD, and `usd % hours`
+  and `mo.MOD(usd, hours)` are refused, inside a loop container too;
+  before, `%` dropped the unit, and both let any two units through,
+  leaving none. `100 // usd` is in `1/USD`, as `100 / usd` is.
+- **A whole power raises the unit, inside a loop container too.**
+  `usd ** 2.0` is in `USD^2`, as `usd ** 2` is, and `(usd * usd) ** 0.5`
+  is in `USD`; a power that comes out fractional (`usd ** 0.5`), or an
+  exponent that is a line, still leaves none. A unit string reads `^n` as
+  a power, so a line declared in `'USD^2'` adds to `usd * usd`. Inside a
+  loop container a row takes the unit it takes outside one: `balance ** 2`
+  is in `USD^2`, and `balance + balance ** 2` is refused. Before, a power
+  written as a float and a root had no unit, so `usd ** 2.0 + usd`
+  passed; a loop row built with `**` had none either, so
+  `balance + balance ** 2` passed, stamped USD; and `'USD^2'` was a word
+  of its own, so adding that line to `usd * usd` was refused as
+  `USD^2 and USD^2`.
+- **A `pyformula` result has no unit unless declared.** The engine cannot
+  see inside the function, and a ratio of two USD lines was stamped USD,
+  then added to amounts without a word. Declare the result's unit with
+  the new `pyformula(unit='USD')`, or with `set_unit`.
+- **A `pyformula` named like a spreadsheet function is not run as that
+  function in a loop container.** A `@mo.pyformula` function named `max`
+  (or given `name='MAX'`), applied inside a `loop=True` container to a row
+  of the loop, is refused when the loop closes, as one of any other name is
+  (`MAX(...) cannot be computed again when the loop closes`): build that
+  row after the loop's last line. Before, the loop ran `mo.MAX` in its
+  place without a word — a function doubling a row of 100, 200 and 310
+  gave the row back unchanged.
+- **A unit with several slashes reads as written.** `'USD/seat/month'`
+  divides at each slash, so a seat count times a price in
+  `'USD/seat/month'` is in `USD/month` and adds to a fee in `USD/month`.
+  A bracketed group is a unit of its own (`'USD/(seat/month)'` is
+  `USD * month/seat`), and a word may carry a note in brackets: hours in
+  `'hours (billable)'` times a rate in `'USD/hours (billable)/month'` are
+  in `USD/month`. A chain prints as typed; a string whose brackets do not
+  balance keeps the old reading and prints as typed. Before, only the
+  first `/` was read — `USD` per one symbol `seat/month` — so `seat`
+  never cancelled (the product was in `seat * USD/seat/month`, and adding
+  the fee was refused), and a note lost its closing bracket
+  (`hours (billable`).
+- **A unit-keyed number format finds its line by unit equality.**
+  `ExcelView(formats={'USD/seat/month': '0.00'})` formats the price a
+  model works out, `revenue / seats / months`, whose unit prints
+  `USD/(seat * month)`, and `formats={'seat * month': '#,##0'}` formats
+  `months * seats`, whose unit prints `month * seat`. Before, a format was
+  found by the unit's printed text, so both lines were left in General. A
+  pure number matches by its label, so a `'%'` format is never applied
+  to a `bps` line.
+- **A loop container's rows get the units their formulas give.** When a
+  loop closes, a row's unit waits for the rows it reads (`+` takes the
+  other side's unit, a product or a power waits for its factors), a lag's
+  fill gives the row it lags its unit, and a row nothing settles (a flag,
+  an index, a discount factor) is a pure number. With
+  `opening = mo.lag(closing, fill=start)` and `start`, `cap` and `inflow`
+  in USD, `opening / cap` is a pure number and a closing of
+  `opening + inflow + opening ** 2 * k` (`k` in `1/USD`) is in USD; 0.2.2
+  read a row that had no unit yet as a pure number, so the ratio printed
+  `1/USD` and that closing was refused (`USD and 1/USD`). A unit that
+  never settles is refused: `x = mo.lag(x, fill=1.0) * cap` (0.2.2 printed
+  `USD^4`) meets `its unit does not settle`, with the two ways out, a
+  factor with no unit or a declared unit on the row (`.set_unit(...)`). A
+  mix is reported under the row that writes it on every build, where 0.2.2
+  sometimes named a row reading it through a lag; and a formula built in
+  the loop that fails when the loop closes passes its error to the rows
+  built on it, where 0.2.2 handed them the numbers it held while the loop
+  was open.
+- **Inside a loop container, `line[0]` and a recurrence keep their unit.**
+  A row written before the loop closes as `x[k]`, `x[a:b]`,
+  `mo.recurrence`, `mo.recurrence_sum` or `mo.cumsum` kept no unit, so
+  `balance[0] + fee_usd` passed in silence and `balance / balance[0]`
+  printed EUR. They now carry the line's (the start's) unit, as built
+  outside a loop, and a mix is refused when the loop closes.
+- **A loop refused when it closes hands out no numbers.** A loop
+  container whose unit check refused it at close (an `EUR` fee added to a
+  `USD` amount) still handed its rows out with the numbers computed from
+  the mix and wrote them into the book. Every row, and
+  every line built on one, now refuses its value with the refusal, as a
+  loop refused before it computes does; the way out is to build the
+  container again.
+- **A count in `bps` or `pp` beside a share in `%` is refused.** `bps` and
+  `pp` are labels that never rescale (50 bps is written 0.005, 2 pp is
+  0.02), so a `bps` or `pp` line holding a count (50) is refused beside a
+  `%` line holding a fraction (0.05) where the two are added or taken as
+  one: `+` and `-`; every function that combines them (`mo.SUM`,
+  `mo.AVERAGE`, `mo.MIN`, `mo.MAX`, `mo.IF`, `mo.IFS`, `mo.SWITCH`,
+  `mo.CHOOSE`, `mo.IFERROR`, `mo.MOD`, `mo.CEILING`, `mo.FLOOR`, the
+  conditional totals, the statistics, the cells a lookup returns); a
+  recurrence template (`mo.recurrence(share, '{prev} + {x}', x=counts)`);
+  a lag's fill (`mo.lag`, `.shift`); and a loop container, when the loop
+  closes, under the row. `rate + step`, with `rate` holding 0.05 in `%`
+  and `step` 50 in `bps`, is refused with the way to write it: `A bps line
+  holds the fraction (50 bps is 0.005), or the count is converted first:
+  step / 10_000.` A share written as points (30 % + 2 pp) and a fraction
+  stepped by a fraction (0.05 % + 0.005 bps) add as before. Before,
+  nothing made the check, and `rate + step` came out 50.05 without a word.
+- **`.shift`, `NPV`, `XNPV`, `PMT`, `FV` and `PV` carry units, and a lag's
+  fill is checked.** A lag is in its line's unit, and so must be its fill:
+  `mo.lag(balance, fill=opening)`, the balance in USD and the opening in
+  EUR, is refused (`mo.lag takes its values in one unit; 'balance' and
+  'opening' are in USD and EUR`), and inside a loop container the check is
+  made when the loop closes. A number or a line without a unit fills any
+  line, and a line without a unit takes any fill. `balance.shift(1)` is in
+  USD, as `mo.lag(balance)` is. `mo.NPV` and `mo.XNPV` are in their flows'
+  unit, and `mo.PMT`, `mo.FV` and `mo.PV` take their amounts — a present or
+  future value, a payment — in one unit, the result's: `mo.PMT(rate, 24,
+  loan, balloon)` with the loan in USD and the balloon in EUR is refused;
+  the rate and the number of periods are not amounts. Before, a fill or a
+  balloon in any unit passed, and `balance.shift(1)` and the five functions
+  had no unit: `mo.NPV(rate, flows) + fee` passed with the fee in EUR.
+- **`.shift(n, fill_value=<line>)` keeps the fill as a live cell.** A
+  line given as the fill was frozen into the formula as its number
+  (`=1000.0` in the first cell), so the workbook did not follow an edit of
+  the opening cell. The fill is now a reference to its cell (`=inp!B2`),
+  as `mo.lag(x, fill=<line>)` keeps it, and `.shift` follows `mo.lag`'s
+  unit rule (above): a fill in another unit is refused, in a loop
+  container when it closes; a list fill or a fill assigned further down
+  is refused, as `mo.lag` refuses them. The 0.2.0 note that `.shift`
+  inlines its fill no longer holds.
+- **`NPV`, `IRR`, `XNPV` and `XIRR` over a list of lines read each
+  line.** `mo.NPV(rate, [y1, y2])` with lines in two units ran in silence
+  and stamped no unit, so `usd + NPV(rate, [eur, eur])` passed; the
+  book wrote the computed number with a false "reduces a literal list"
+  warning, and inside a loop container a list holding a total of a row
+  read before its line kept the number it held while the loop was open.
+  The list is now
+  the lines' cells: they must share one unit (two are refused), the result
+  carries it (`NPV`, `XNPV`), the lines are the call's dependencies,
+  and the book writes `=NPV(B1, B3:B4)` / `=IRR(B2:B4, 0.1)`. A list
+  of numbers typed in stays a value, as before.
+- **A recurrence template is read for units.** `mo.recurrence(eur,
+  '{prev} + {x}', x=usd_line)` had no unit and ran in silence; the
+  template is now read as any formula is: a mix is refused with the
+  operators' own message (`recurrence("{prev} + {x}"): Cannot
+  add/subtract values with incompatible units: EUR and USD`), a start
+  without a unit takes the template's, a template that multiplies the
+  line by a dimension every period is refused as a unit that does not
+  settle, and inside a loop container the check is made when the loop
+  closes, under the row. A declared `unit=` decides what the line
+  prints, never what its template may add.
+- **`CHOOSE` over a keyed line.** A choice that runs along keys — `mo.Variable({'Bear':
+  0.9, 'Base': 1.0, 'Bull': 1.1})`, or a line on one non-time `indexed_by` axis — is, on
+  its own, one choice per key in key order: `mo.CHOOSE(pick, growth)` is `mo.CHOOSE(pick,
+  growth['Bear'], growth['Base'], growth['Bull'])`, written `=CHOOSE(B1, B3, C3, D3)` over
+  the line's cells (one such formula per period when the index is a series; keys that
+  are not text spread by position, as `[]` and the workbook read them). Before, the line
+  was read as one period series: its keys were lost, a 3-key line in a 4-period window
+  was refused for its length, and the workbook held `=CHOOSE(B1, B3)` in every period. Refused
+  with an error that names the fix instead of a silent number: a keyed line beside other choices
+  (the numbering would depend on its key count), a computed keyed line with no cells of
+  its own (name it first), a tracked or keyed index, a series index over tracked
+  choices, a line on two axes. A scalar index over tracked choices still switches track
+  by track, as before.
+- **A line along keys against a period series is refused.** `base * growth`, with
+  `base` a period series — a list, a located list (`start=`/`extend=`), a tracked line,
+  `mo.time.days` — and `growth` a keyed list (or a line on one finite non-time axis) of
+  the same length, was zipped cell by cell — January with Bear, February with Base — and
+  the result carried the keys, so the numbers looked right and were wrong; unequal
+  lengths died with the generic length error. Every arithmetic operator and comparison
+  now raises, naming both lines, the pairing a zip would make, and the fixes that run
+  (pick one key, `growth['Bear']`; give the series the same keys or lay it along the
+  same axis; or switch with `mo.CHOOSE(pick, growth)`). A keyed list against a line on
+  an axis of other labels is refused too. Scalars, one-value bare lists, a raw Python
+  list (`keyed * other.value`), keyed × keyed, axis × axis and series × series
+  broadcast as before. The layout, the operators and `CHOOSE` use the same test of
+  whether a line runs along keys.
+- **A wrapping Variable keeps the keys and axes of the line it wraps.**
+  `mo.Variable(growth * 2, display_name='Twice')` ran along nothing — the keys of the
+  product were dropped, as its unit once was — so the named line lost its caption row
+  and its place in `CHOOSE`. A declared `keys=` or `indexed_by=` on the wrapper still wins.
+- **A per-period field inside an `orient='columns'` block is refused, not dropped.** The
+  matrix holds one cell per field per instance; a list field (a period series, a keyed
+  line, a line on an axis) was skipped without a word — its row vanished and every
+  aggregate reading it was written as a dead number. The layout now records the refusal
+  and `to_excel` raises it before writing a book, naming the
+  line, the instance and the block, with the forms that hold such a line (the sheet, or
+  `orient='records'` for a period series); `check_compat` reports it as a `layout`
+  issue; the notebook repr and every other reader keep their addresses. A one-value
+  bare list field is a cell, as a one-value list is a single value everywhere else.
+- **A name whose line was overwritten by a plain value can be removed.** After
+  `inputs.rate = 0.05` written over the line `rate`, `inputs.remove('rate')`,
+  `del inputs.rate`, and moving `inputs` to another container raised
+  `AttributeError: 'float' object has no attribute '_qualified_id'` and could leave the
+  container half detached. The plain value is removed or carried along like a line.
+
 ## [0.2.2] — 2026-10-19
 
 ### Added

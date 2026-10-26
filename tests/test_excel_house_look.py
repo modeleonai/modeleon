@@ -540,3 +540,59 @@ def test_a_bar_rows_total_stays_a_number(tmp_path):
     assert totals["Active"].value.startswith("=SUM(")
     assert totals["Active"].number_format == "General"
     assert totals["Cash"].number_format == "#,##0"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# A named view, applied
+# ══════════════════════════════════════════════════════════════════════
+
+
+def test_an_applied_named_view_dresses_the_book_and_ends_with_the_block(tmp_path):
+    m = deal(mo.ExcelView(font={"name": "Arial", "size": 10}, sheet={"gridlines": False}))
+    m.board = mo.ExcelView("Board pack", font={"name": "Georgia", "size": 11})
+    # A named view on the model changes nothing until applied: the book is the model's own.
+    assert book(m, tmp_path)["Series"]["A1"].font.name == "Arial"
+    with mo.applied_view(m.board):
+        view = resolve_excel_view(m.td.volume)
+        assert view.base_font == {"name": "Georgia", "size": 11}     # the applied view
+        assert view.sheet_gridlines is False                          # the model's, kept
+        wb = book(m, tmp_path)
+    assert wb["Series"]["A1"].font.name == "Georgia"
+    assert wb["Series"].sheet_view.showGridLines is False
+    # Outside the block the model's own look is back.
+    assert resolve_excel_view(m.td.volume).base_font == {"name": "Arial", "size": 10}
+    assert book(m, tmp_path)["Series"]["A1"].font.name == "Arial"
+
+
+def test_an_applied_view_lies_over_the_house_and_the_model(tmp_path):
+    house = mo.ExcelView(font={"name": "Arial", "size": 10}, meta=LEAD)
+    m = deal(mo.ExcelView(font={"name": "Georgia", "size": 12}))
+    m.print = mo.ExcelView("Print", font={"name": "Verdana", "size": 9})
+    with mo.house_view(house), mo.applied_view(m.print):
+        view = resolve_excel_view(m.ti.rate)
+    assert view.base_font == {"name": "Verdana", "size": 9}          # the applied view
+    assert view.meta_fields == (("row_sum", "Total"),)               # the house, kept
+
+
+def test_an_applied_view_s_sheet_order_wins(tmp_path):
+    m = deal()
+    m.series_first = mo.ExcelView("Series first", sheet={"order": ["td", "ti", "timing"]})
+    assert book(m, tmp_path).sheetnames == ["Inputs", "Series", "Timing"]
+    with mo.applied_view(m.series_first):
+        assert book(m, tmp_path).sheetnames == ["Series", "Inputs", "Timing"]
+
+
+def test_an_applied_view_s_orient_is_not_a_look():
+    m = deal()
+    m.side = mo.ExcelView("Side", orient="records", font={"name": "Georgia"})
+    own = resolve_excel_view(m.td.volume).orient
+    with mo.applied_view(m.side):
+        view = resolve_excel_view(m.td.volume)
+    assert view.base_font == {"name": "Georgia"}
+    assert view.orient == own and view.orient != "records"
+
+
+def test_applied_view_refuses_what_is_not_a_view():
+    with pytest.raises(TypeError, match="ExcelView"):
+        with mo.applied_view({"font": {"name": "Georgia"}}):
+            pass

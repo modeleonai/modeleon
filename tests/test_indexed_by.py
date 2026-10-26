@@ -15,6 +15,8 @@ ops, and the independence of ``_keys`` (keyed-list labels) from
 
 from __future__ import annotations
 
+import operator
+
 import pytest
 
 import modeleon as mo
@@ -548,3 +550,248 @@ class TestRank2EmissionGate:
         _reject_rank2_emission(
             mo.Variable([1.0, 2.0], indexed_by=[months])
         )  # no raise
+
+
+class TestKeysAlong:
+    """``keys_along`` is the one predicate for "this line runs along keys,
+    not periods": a keyed list, or a line on one finite non-time axis.
+    The layout's ``line_keys`` is the same answer as text."""
+
+    def test_keyed_list_gives_its_keys_as_given(self):
+        from modeleon.core.shape import keys_along
+        assert keys_along(mo.Variable({'Bear': 1, 'Base': 2})) == ['Bear', 'Base']
+        byyear = mo.Variable([1.0, 2.0, 3.0], keys=[2026, 2027, 2028])
+        assert keys_along(byyear) == [2026, 2027, 2028]
+
+    def test_one_finite_axis_gives_its_labels(self):
+        from modeleon.core.shape import keys_along
+        scen = mo.Variable(['Bear', 'Bull'])
+        assert keys_along(mo.Variable([1, 2], indexed_by=[scen])) == ['Bear', 'Bull']
+
+    def test_none_for_a_series_a_scalar_a_time_axis_rank2_tracks_and_a_keyed_cell(self):
+        from modeleon.core.shape import keys_along
+        assert keys_along(mo.Variable([1, 2, 3])) is None
+        assert keys_along(mo.Variable(7)) is None
+        t = mo.Time('2026-01', periods=3)
+        assert keys_along(mo.Variable([1, 2, 3], indexed_by=[t])) is None
+        a = mo.Variable(['x', 'y'])
+        b = mo.Variable(['p', 'q'])
+        assert keys_along(mo.Variable([1, 2, 3, 4], indexed_by=[a, b])) is None
+        mt = mo.Model('t', default_grain='month', default_start='2026-01', default_periods=3,
+                      tracks=mo.Tracks('plan', 'actual'))
+        mt.rev = mo.Variable(plan=[1, 2, 3], actual=[1, 2, 3])
+        assert keys_along(mt.rev) is None
+        assert keys_along(mo.Variable({'Bear': 1, 'Base': 2})['Base']) is None
+
+    def test_layout_line_keys_is_keys_along_as_text(self):
+        from modeleon.compile.excel.layout import line_keys
+        from modeleon.core.shape import keys_along
+        scen = mo.Variable(['Bear', 'Bull'])
+        a = mo.Variable(['x', 'y'])
+        b = mo.Variable(['p', 'q'])
+        lines = [
+            mo.Variable({'Bear': 1, 'Base': 2}),
+            mo.Variable([1.0, 2.0, 3.0], keys=[2026, 2027, 2028]),
+            mo.Variable([1, 2], indexed_by=[scen]),
+            mo.Variable([1, 2, 3]),
+            mo.Variable(7),
+            mo.Variable([1, 2, 3], indexed_by=[mo.Time('2026-01', periods=3)]),
+            mo.Variable([1, 2, 3, 4], indexed_by=[a, b]),
+            mo.Variable({'Bear': 1, 'Base': 2})['Base'],
+        ]
+        for v in lines:
+            raw = keys_along(v)
+            assert line_keys(v) == (None if raw is None else [str(k) for k in raw])
+
+
+def _keyed_model():
+    m = mo.Model('m', default_grain='month', default_start='2026-01', default_periods=3)
+    m.growth = mo.Variable({'Bear': 0.9, 'Base': 1.0, 'Bull': 1.1})
+    m.base = mo.Variable([100, 110, 120])
+    return m
+
+
+class TestKeysAgainstPeriods:
+    """A line that runs along keys against a period series is refused:
+    zipped cell by cell it pairs Bear with January — numbers that look
+    right and are wrong. Everything the engine aligned on purpose keeps
+    broadcasting as before."""
+
+    def test_keyed_times_series_is_refused_naming_both_lines(self):
+        m = _keyed_model()
+        with pytest.raises(ValueError) as e:
+            m.base * m.growth
+        msg = str(e.value)
+        assert "'growth' runs along its keys (Bear, Base, Bull)" in msg
+        assert "'base' runs along periods (3 values)" in msg
+        assert 'Bear with the first period, Base with the second' in msg
+        assert 'Pick one key, growth["Bear"]' in msg
+        assert "mo.Variable({'Bear': …, 'Base': …, 'Bull': …})" in msg
+
+    def test_axised_times_series_is_refused_floating_and_named(self):
+        scen = mo.Variable(['Bear', 'Base', 'Bull'])
+        growth = mo.Variable([0.9, 1.0, 1.1], indexed_by=[scen])
+        base = mo.Variable([100, 110, 120])
+        with pytest.raises(ValueError) as e:
+            base * growth
+        msg = str(e.value)
+        assert 'runs along an axis (Bear, Base, Bull)' in msg
+        assert 'runs along periods (3 values)' in msg
+        m = mo.Model('m', default_grain='month', default_start='2026-01', default_periods=3)
+        m.scen = mo.Variable(['Bear', 'Base', 'Bull'])
+        m.g = mo.Variable([0.9, 1.0, 1.1], indexed_by=[m.scen], display_name='Growth by scenario')
+        m.base = mo.Variable([100, 110, 120])
+        with pytest.raises(ValueError) as e:
+            m.base * m.g
+        msg = str(e.value)
+        assert "'Growth by scenario' runs along the axis 'scen' (Bear, Base, Bull)" in msg
+        assert 'Pick one cell, g[0]' in msg
+        assert 'indexed_by=[scen]' in msg
+
+    @pytest.mark.parametrize('op', [
+        operator.add, operator.sub, operator.mul, operator.truediv, operator.floordiv,
+        operator.mod, operator.pow, operator.lt, operator.le, operator.gt, operator.ge,
+        operator.eq, operator.ne,
+    ])
+    def test_every_operator_and_comparison_refuses(self, op):
+        m = _keyed_model()
+        with pytest.raises(ValueError, match='runs along'):
+            op(m.growth, m.base)
+        with pytest.raises(ValueError, match='runs along'):
+            op(m.base, m.growth)
+
+    def test_unequal_lengths_get_this_message_not_the_length_error(self):
+        m = _keyed_model()
+        with pytest.raises(ValueError) as e:
+            m.growth * mo.Variable([1, 2, 3, 4])
+        assert 'runs along periods (4 values)' in str(e.value)
+        assert 'different lengths' not in str(e.value)
+
+    def test_a_located_series_and_time_are_periods_too(self):
+        m = _keyed_model()
+        m.early = mo.Variable([1.0, 2.0, 3.0], start='2026-01', grain='month')
+        with pytest.raises(ValueError, match="'early' runs along periods \\(3 values\\)"):
+            m.growth * m.early
+        with m:
+            with pytest.raises(ValueError, match='the line mo.time.days runs along periods') as e:
+                m.growth * mo.time.days
+            # a time property cannot be given keys — the switch is offered
+            assert 'switch with mo.CHOOSE(pick, growth)' in str(e.value)
+
+    def test_operator_results_and_slices_still_run_along_keys(self):
+        m = _keyed_model()
+        with pytest.raises(ValueError, match=r'the line growth \* 2 runs along its keys'):
+            (m.growth * 2) * m.base
+        with pytest.raises(ValueError, match=r'runs along its keys \(Bear, Base\)'):
+            m.growth[0:2] * m.base
+
+    def test_year_keys_and_a_single_key_count(self):
+        m = _keyed_model()
+        m.byyear = mo.Variable([1.0, 2.0, 3.0], keys=[2026, 2027, 2028])
+        with pytest.raises(ValueError) as e:
+            m.byyear * m.base
+        msg = str(e.value)
+        assert 'runs along its keys (2026, 2027, 2028)' in msg
+        assert 'Pick one cell, byyear[0]' in msg
+        assert 'mo.Variable({2026: …, 2027: …, 2028: …})' in msg
+        with pytest.raises(ValueError, match=r'runs along its keys \(Only\)'):
+            mo.Variable({'Only': 5.0}) * mo.Variable([1, 2, 3])
+
+    def test_scalars_and_one_value_lists_still_broadcast(self):
+        m = _keyed_model()
+        for r in (m.growth * 2, 2 * m.growth, m.growth * mo.Variable(2),
+                  m.growth * mo.Variable([2])):
+            assert r._value == pytest.approx([1.8, 2.0, 2.2])
+            assert r._keys == ['Bear', 'Base', 'Bull']
+
+    def test_a_raw_list_stays_positional(self):
+        m = _keyed_model()
+        r = m.growth * [1, 2, 3]
+        assert r._value == pytest.approx([0.9, 2.0, 3.3])
+        assert r._keys == ['Bear', 'Base', 'Bull']
+        r2 = m.growth * m.base.value
+        assert r2._value == pytest.approx([90.0, 110.0, 132.0])
+        assert r2._keys == ['Bear', 'Base', 'Bull']
+
+    def test_keyed_times_keyed_keeps_its_rules(self):
+        m = _keyed_model()
+        r = m.growth * mo.Variable({'Bull': 2, 'Base': 3, 'Bear': 4})
+        assert r._value == pytest.approx([3.6, 3.0, 2.2])
+        assert r._keys == ['Bear', 'Base', 'Bull']
+        with pytest.raises(ValueError, match='different key sets'):
+            m.growth * mo.Variable({'X': 1, 'Base': 2, 'Bear': 3})
+
+    def test_a_keyed_cell_is_a_scalar_and_broadcasts(self):
+        m = _keyed_model()
+        r = m.growth['Base'] * m.base
+        assert r._value == [100.0, 110.0, 120.0]
+        assert r._keys is None
+
+    def test_axes_and_the_time_axis_are_unchanged(self):
+        t = mo.Time('2026-01', periods=3)
+        rev = mo.Variable([100, 110, 120], indexed_by=[t])
+        scen = mo.Variable(['Bear', 'Base', 'Bull'])
+        growth = mo.Variable([0.9, 1.0, 1.1], indexed_by=[scen])
+        r = mo.Variable([100, 110, 120]) * rev
+        assert r._value == [10000, 12100, 14400]
+        assert r._indexed_by == (t,)
+        cross = rev * growth
+        assert cross._indexed_by == (t, scen)
+        assert len(cross._value) == 9
+        same = growth * mo.Variable([1, 2, 3], indexed_by=[scen])
+        assert same._value == pytest.approx([0.9, 2.0, 3.3])
+        assert same._indexed_by == (scen,)
+
+    def test_series_times_series_stays_positional(self):
+        m = _keyed_model()
+        assert (m.base * mo.Variable([1, 2, 3]))._value == [100, 220, 360]
+        with m:
+            days = (m.base * mo.time.days)._value
+        assert days == [3100, 3080, 3720]
+
+    def test_a_tracked_series_is_periods_too(self):
+        mt = mo.Model('t', default_grain='month', default_start='2026-01', default_periods=3,
+                      tracks=mo.Tracks('plan', 'actual'))
+        mt.rev = mo.Variable(plan=[1, 2, 3], actual=[1, 2, 3])
+        mt.g = mo.Variable({'Bear': 0.9, 'Base': 1.0, 'Bull': 1.1})
+        for a, b in ((mt.rev, mt.g), (mt.g, mt.rev)):
+            with pytest.raises(ValueError, match=r"'rev' runs along periods \(3 values\)"):
+                a * b
+        with pytest.raises(ValueError, match='runs along periods'):
+            mt.rev > mt.g
+
+    def test_a_series_on_the_time_axis_meets_a_keyed_list_and_is_refused(self):
+        t = mo.Time('2026-01', periods=3)
+        rev = mo.Variable([100, 110, 120], indexed_by=[t])
+        g = mo.Variable({'Bear': 0.9, 'Base': 1.0, 'Bull': 1.1})
+        with pytest.raises(ValueError, match='runs along periods'):
+            g * rev
+
+    def test_a_located_one_value_series_is_periods(self):
+        m = mo.Model('m', default_grain='month', default_start='2026-01', default_periods=6)
+        m.growth = mo.Variable({'Bear': 0.9, 'Base': 1.0, 'Bull': 1.1})
+        m.fee = mo.Variable([100.0], start='2026-01', grain='month', extend=mo.zero())
+        with pytest.raises(ValueError, match=r"'fee' runs along periods \(1 value\)"):
+            m.fee * m.growth
+        # a bare one-value list is still a single value
+        assert (m.growth * mo.Variable([2.0]))._value == pytest.approx([1.8, 2.0, 2.2])
+
+    def test_keyed_list_against_an_axis_of_other_labels_is_refused(self):
+        regions = mo.Variable(['North', 'South', 'East'])
+        by_region = mo.Variable([10, 20, 30], indexed_by=[regions])
+        g = mo.Variable({'Bear': 0.9, 'Base': 1.0, 'Bull': 1.1})
+        with pytest.raises(ValueError, match='labels would not match'):
+            g * by_region
+        scen = mo.Variable(['Bear', 'Base', 'Bull'])
+        same = mo.Variable([1, 2, 3], indexed_by=[scen])
+        assert (g * same)._value == pytest.approx([0.9, 2.0, 3.3])
+        with pytest.raises(ValueError, match='labels would not match'):
+            mo.Variable({'Bull': 1.1, 'Base': 1.0, 'Bear': 0.9}) * same
+
+    def test_a_computed_series_side_gets_the_switch_as_the_fix(self):
+        m = _keyed_model()
+        m.doubled = m.base * 2
+        with pytest.raises(ValueError) as e:
+            m.growth * m.doubled
+        assert 'switch with mo.CHOOSE(pick, growth)' in str(e.value)
+        assert 'mo.Variable({' not in str(e.value)

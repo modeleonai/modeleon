@@ -355,7 +355,7 @@ def _emit_descendants(
     from ..core.multi_variable import MultiVariableBase
 
     for name in mv._component_order:
-        child = mv._components[name]
+        child = mv._component(name)
         child_lhs = f"{prefix}.{name}"
         if isinstance(child, Variable):
             out.append(_render_variable(
@@ -400,7 +400,7 @@ def _collect_scope_vars(mv: "MultiVariableBase") -> set["Variable"]:
 
     def visit(node: "MultiVariableBase") -> None:
         for cname in node._component_order:
-            child = node._components[cname]
+            child = node._component(cname)
             if isinstance(child, MultiVariableBase):
                 visit(child)
             elif isinstance(child, Variable):

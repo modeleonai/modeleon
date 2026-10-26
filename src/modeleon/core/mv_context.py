@@ -32,6 +32,7 @@ resolved them at module scope.
 from __future__ import annotations
 
 import os
+import sys
 import warnings
 import weakref
 from contextvars import ContextVar
@@ -95,7 +96,7 @@ def _refuse_read_only_name(cls: type, name: str) -> None:
 
 #: Names that are settings of a container, never rows.
 _SETTING_SLOTS = frozenset({
-    'default_grain', 'default_start', 'default_periods',
+    'default_grain', 'default_start', 'default_periods', 'default_zone',
     'default_excel_view', 'default_header', 'tracks',
 })
 
@@ -266,6 +267,9 @@ def _fit_time(name: str, var: Any, window: Any, home: Any) -> None:
                                          int(window.periods), first_day)
             t._start, t._grain = window.start, window.grain
             t._first_day = first_day
+            # Its window moved: a formula placed over it is placed again.
+            from .variable_ops import _windows_changed
+            _windows_changed()
             continue
         def _from(start: Any, first: Any) -> str:
             return first.isoformat() if first is not None else str(start)
@@ -352,6 +356,105 @@ def check_borrowed_horizon(parent: Any, component: Any) -> None:
             f"model of {actual}. Build it inside the model's `with` block."
         )
     del component.__dict__['_borrowed_horizon']
+
+
+def author_frame() -> Any:
+    """The innermost frame that runs neither the engine's code nor a
+    trusted extension's: the line the author wrote."""
+    frame: Any = sys._getframe(1)
+    while frame is not None and is_engine_frame(frame):
+        frame = frame.f_back
+    return frame
+
+
+#: How many of the author's frames a hint may draw names from, and how
+#: large a namespace it reads: a probe that throws the message away
+#: (``getattr(mv, name, None)`` in a loop) must not pay for a scan of
+#: tens of thousands of names.
+_NAME_FRAMES = 8
+_NAME_SCAN_MAX = 2000
+
+
+def _names_by_object(frame: Any) -> dict:
+    """``id(object) -> the name it is bound to`` where the author's line
+    runs: the frame's locals, then its globals less the names its locals
+    shadow (inside ``def compare(model)`` the global ``model`` is not
+    reachable by that name), then the same for the frames that called it
+    while they are the author's own — a lambda or a nested function sees
+    the names of the line that called it. One pass over each namespace,
+    however many ancestors are looked up afterwards. Private names are
+    not spelled."""
+    out: dict = {}
+    depth = 0
+    while frame is not None and depth < _NAME_FRAMES and not is_engine_frame(frame):
+        local = frame.f_locals
+        if len(local) <= _NAME_SCAN_MAX:
+            for key, value in local.items():
+                if key.isidentifier() and not key.startswith('_'):
+                    out.setdefault(id(value), key)
+        globs = frame.f_globals
+        if globs is not local and len(globs) <= _NAME_SCAN_MAX:
+            for key, value in globs.items():
+                if key in local or not key.isidentifier() or key.startswith('_'):
+                    continue
+                out.setdefault(id(value), key)
+        frame = frame.f_back
+        depth += 1
+    return out
+
+
+def spelled(node: Any, frame: Any) -> Optional[str]:
+    """How the author's line reaches ``node``, spelled from the HIGHEST
+    bound ancestor and the path down: ``model.b`` for a container of
+    ``model`` even while a nearer name is bound to it, because the
+    nearer name may be a comprehension's or a lambda's variable
+    (``[seg.revenue for seg in (model.a, model.b)]``), gone before the
+    line the hint says to write; a name bound to the node itself when no
+    ancestor is bound (``income`` after ``with … as income:``); ``None``
+    when nothing is. A hint spells the author's own names, never a
+    container's declared or display name — ``mo.Model('m')`` bound as
+    ``model`` is ``model`` — so following the hint runs."""
+    if frame is None:
+        return None
+    names = _names_by_object(frame)
+    best: Optional[str] = None
+    path: list = []
+    while node is not None:
+        name = names.get(id(node))
+        if name is not None:
+            best = '.'.join([name, *reversed(path)])
+        child = node.__dict__.get('_name_in_parent')
+        if not child:
+            break
+        path.append(child)
+        node = node.__dict__.get('_parent')
+    return best
+
+
+def _refuse_self_adoption(parent: Any, name: str, component: Any) -> None:
+    """``parent.<name> = component`` where ``component`` is ``parent``
+    itself or one of its ancestors: refused with the alias to write."""
+    node = parent
+    while node is not None:
+        if node is component:
+            break
+        node = node.__dict__.get('_parent')
+    else:
+        return
+    frame = author_frame()
+    holder = spelled(parent, frame)
+    what = spelled(component, frame)
+    holds = "itself" if component is parent else "one of its ancestors"
+    where = f"`{holder}.{name} = {what}`" if holder and what else f"Assigning `{name}`"
+    if what:
+        alias = f"with {what}:" if name == what else f"with {what} as {name}:"
+        hint = f"To write its rows under the name `{name}`, open a block: `{alias}`."
+    else:
+        hint = (
+            f"To write a container's rows under the name `{name}`, open a block "
+            f"on it: `with <the container> as {name}:`."
+        )
+    raise ValueError(f"{where}: a container cannot hold {holds}. {hint}")
 
 
 def _forward_placeholder(mv: Any, name: str, site: Any = None) -> Any:
@@ -455,6 +558,9 @@ def _transplant(target: Any, component: Any) -> None:
     keep = {k: target.__dict__[k] for k in
             ('_owner', '_component_name', '_python_name', '_qualified_id')
             if k in target.__dict__}
+    # The formulas placed through ``target`` while it had no window: they
+    # are placed again when the row it becomes is adopted.
+    readers = target.__dict__.get('_placed_through')
     state = dict(component.__dict__)
     if isinstance(state.get('_value'), list):
         # Its own list: an alias must not share the source row's values.
@@ -464,6 +570,11 @@ def _transplant(target: Any, component: Any) -> None:
     target.__class__ = type(component)
     if keep.get('_owner') is not None:
         target.__dict__.update(keep)
+    if readers:
+        own = target.__dict__.get('_placed_through')
+        if own:
+            readers.extend(own)
+        target.__dict__['_placed_through'] = readers
 
 
 def _become_forward(placeholder: Any, component: Any) -> Any:
@@ -544,11 +655,14 @@ def _crystallize_subtree(item: Any, path: QPath) -> None:
     the root adopts its subtree.
     """
     from .multi_variable import MultiVariableBase
+    from .variable import Variable
 
+    if not isinstance(item, (MultiVariableBase, Variable)):
+        return  # a plain value written over a line: no identity
     item._qualified_id = path
     if isinstance(item, MultiVariableBase):
         for comp_name in item._component_order:
-            child = item._components[comp_name]
+            child = item._component(comp_name)
             _crystallize_subtree(child, path.child(comp_name))
 
 
@@ -566,7 +680,12 @@ def _run_adoption_hooks(item: Any) -> None:
 
     if isinstance(item, MultiVariableBase):
         for comp_name in item._component_order:
-            _run_adoption_hooks(item._components[comp_name])
+            _run_adoption_hooks(item._component(comp_name))
+        # A row read ahead of its line runs on this window now as well.
+        for placeholder in (item.__dict__.get('_forward') or {}).values():
+            if '_placed_through' in placeholder.__dict__:
+                from .variable_ops import _forget_placements
+                _forget_placements(placeholder)
     elif isinstance(item, Variable):
         item._on_adopted()
 
@@ -580,11 +699,14 @@ def _invalidate_subtree_paths(item: Any) -> None:
     lets the lazy ``path`` property walk the owner chain on access.
     """
     from .multi_variable import MultiVariableBase
+    from .variable import Variable
 
+    if not isinstance(item, (MultiVariableBase, Variable)):
+        return  # a plain value written over a line: no identity
     item._qualified_id = None
     if isinstance(item, MultiVariableBase):
         for comp_name in item._component_order:
-            child = item._components[comp_name]
+            child = item._component(comp_name)
             _invalidate_subtree_paths(child)
 
 
@@ -599,10 +721,16 @@ class _MVLifecycle:
     # Attributes provided by MultiVariableBase.
     _components: dict
     _component_order: list
+    _component_names: list
     _display_name: Optional[str]
     _python_name: Optional[str]
     _qualified_id: Any
     _role: str
+
+    if TYPE_CHECKING:
+        # Read helpers of :class:`~.mv_inspect._MVInspect`.
+        def _has_component(self, name: str) -> bool: ...
+        def _component(self, name: str) -> Any: ...
 
     # ─── Context-manager protocol ───────────────────────────────
 
@@ -661,6 +789,15 @@ class _MVLifecycle:
         # …) is refused before anything below changes state.
         _refuse_read_only_name(type(self), name)
 
+        # A container assigned under a second name inside its own tree —
+        # ``model.m = model``, ``model.sub.m = model`` — would adopt
+        # itself or an ancestor: the demotion below would make the model
+        # a MultiVariable and the path walk recurse until Python gives up
+        # (a RecursionError). A short name for a container is a
+        # ``with … as`` alias.
+        if isinstance(component, MultiVariableBase):
+            _refuse_self_adoption(self, name, component)
+
         # Demote a Model to a plain MultiVariable on adoption — Models
         # are top-level roots by contract; once adopted they are sub-
         # trees. The class swap is layout-safe because Model adds no
@@ -673,8 +810,8 @@ class _MVLifecycle:
         if isinstance(component, Model):
             component.__class__ = MultiVariable  # type: ignore[assignment]
 
-        if name in self._components:
-            existing = self._components[name]
+        if self._has_component(name):
+            existing = self._component(name)
             if existing is component:
                 return  # idempotent self-assignment
 
@@ -792,17 +929,23 @@ class _MVLifecycle:
         from .multi_variable import MultiVariableBase
         from .variable import Variable
 
-        if name not in self._components:
+        if not self._has_component(name):
             return None
-        existing = self._components[name]
+        existing = self._component(name)
         if isinstance(existing, MultiVariableBase):
             existing._parent = None
             existing._name_in_parent = None
         elif isinstance(existing, Variable):
             existing._owner = None
             existing._component_name = None
-        existing._qualified_id = None
-        existing._python_name = None
+        if isinstance(existing, (MultiVariableBase, Variable)):
+            # A plain value written over a line has no identity to clear.
+            existing._qualified_id = None
+            existing._python_name = None
+        # Its lines leave the window they ran on: a formula placed
+        # through them is placed again (``variable_ops``).
+        from .variable_ops import _windows_changed
+        _windows_changed()
         self.__dict__.pop(name, None)
         if name in self._component_names:
             self._component_names.remove(name)
@@ -834,7 +977,7 @@ class _MVLifecycle:
         if '_loop' in self.__dict__:
             clone._loop = self._loop
         for comp_name in self._component_order:
-            comp = self._components[comp_name]
+            comp = self._component(comp_name)
             if isinstance(comp, Variable) and not isinstance(comp, MultiVariableBase):
                 clone._register_component(comp_name, comp.copy())
             elif isinstance(comp, MultiVariableBase):

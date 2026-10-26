@@ -33,13 +33,22 @@ passed as the object — it prints its word and is inert in the algebra::
     pv = cash * df                           # cash's unit: the label is inert
 
 Four words are labelled pure numbers by convention, as strings:
-``'%'``, ``'x'``, ``'bps'`` and ``'pp'``.
+``'%'``, ``'x'``, ``'bps'`` and ``'pp'``. Each is written as the number
+it is — 5% is 0.05, 8x is 8, 50 bps is 0.005, 2 pp is 0.02 — because a
+label prints and never rescales (a label the arithmetic drops must not
+change a magnitude). A bps or pp line holding a count (50) added to a %
+line holding fractions is refused: that sum is wrong under any reading.
 
 A unit is a plain value: assigned to a model it is an attribute, never
 a row or a section.
 """
 
-from typing import Dict, Optional
+import re
+from typing import Dict, Optional, Tuple
+
+
+#: A factor raised to a whole power, as ``__str__`` writes it: ``m^2``.
+_POWER = re.compile(r'(.+?)\s*\^\s*([+-]?\d+)')
 
 
 class Unit:
@@ -61,6 +70,13 @@ class Unit:
     #: dimension — by convention, the same for every author.
     _DIMENSIONLESS_SYMBOLS = frozenset({'%', 'x', 'bps', 'pp'})
 
+    #: The text a unit prints when its canonical form would not read back
+    #: as the author wrote it: a chain ('USD/kW/month' rather than
+    #: 'USD/(kW * month)') and a string with unbalanced parentheses. A unit
+    #: that arithmetic builds has none. A class default, so a Unit restored
+    #: from an older pickle prints too.
+    _written: Optional[str] = None
+
     def __init__(self, symbol: Optional[str] = None, *,
                  _components: Optional[Dict[str, int]] = None):
         self._unit_components: Dict[str, int] = {}
@@ -79,6 +95,8 @@ class Unit:
                 self._display_symbol = symbol
             else:
                 self._unit_components = self._parse(symbol)
+                if self._unit_components and self._prints_as_written(symbol.strip()):
+                    self._written = symbol.strip()
 
     @staticmethod
     def _parse(text: str) -> Dict[str, int]:
@@ -91,10 +109,23 @@ class Unit:
             'hr * Gb'       → {'hr': 1, 'Gb': 1}
             '$/(hr * Gb)'   → {'$': 1, 'hr': -1, 'Gb': -1}
             '$ * hr / Gb'   → {'$': 1, 'hr': 1, 'Gb': -1}
+            '$/kW/month'    → {'$': 1, 'kW': -1, 'month': -1}
+            '$/(kW/month)'  → {'$': 1, 'kW': -1, 'month': 1}
+            'USD/m^2'       → {'USD': 1, 'm': -2}
+
+        Everything after the first ``/`` is the denominator (``'$/hr * Gb'``
+        is ``'$/(hr * Gb)'``), and each further ``/`` divides again, so a
+        chain reads the way it is written: USD per kW per month. A whole
+        power follows ``^``, as a unit prints it (``'m^2'``). A word may
+        carry a note in parentheses ('kW (AC)', 'USD (real)'); a string
+        whose parentheses do not balance keeps the first-slash reading.
         """
         text = text.strip()
         if not text:
             return {}
+
+        if Unit._balanced(text):
+            return Unit._parse_chain(text)
 
         components: Dict[str, int] = {}
 
@@ -116,6 +147,74 @@ class Unit:
                 components[sym] = components.get(sym, 0) - 1
 
         return {k: v for k, v in components.items() if v != 0}
+
+    @staticmethod
+    def _prints_as_written(text: str) -> bool:
+        """A chain of two or more slashes, once parentheses that wrap the
+        whole string are set aside, or unbalanced parentheses: the canonical
+        form of either would not read back as the author wrote it."""
+        if not Unit._balanced(text):
+            return True
+        while text.startswith('(') and text.endswith(')') and Unit._balanced(text[1:-1]):
+            text = text[1:-1].strip()
+        return len(Unit._split_top(text, '/')) > 2
+
+    @staticmethod
+    def _parse_chain(text: str) -> Dict[str, int]:
+        """The numerator, then each ``/``-separated piece divides it; a
+        parenthesised factor is a unit of its own, read the same way."""
+        components: Dict[str, int] = {}
+        for i, piece in enumerate(Unit._split_top(text, '/')):
+            sign = 1 if i == 0 else -1
+            for factor in Unit._split_top(piece, '*'):
+                factor = factor.strip()
+                if not factor or factor == '1':
+                    continue
+                base, power = Unit._raised(factor)
+                if (base.startswith('(') and base.endswith(')')
+                        and Unit._balanced(base[1:-1])):
+                    sub = Unit._parse(base[1:-1])
+                else:
+                    sub = {base: 1}
+                for sym, exp in sub.items():
+                    components[sym] = components.get(sym, 0) + sign * exp * power
+        return {k: v for k, v in components.items() if v != 0}
+
+    @staticmethod
+    def _raised(factor: str) -> Tuple[str, int]:
+        """``'m^2'`` → ``('m', 2)``: a whole power after ``^``; any other
+        factor is itself, to the first power."""
+        match = _POWER.fullmatch(factor)
+        if match is None or not Unit._balanced(match.group(1)):
+            return factor, 1
+        return match.group(1).strip(), int(match.group(2))
+
+    @staticmethod
+    def _split_top(text: str, sep: str) -> list:
+        """Split on ``sep`` outside parentheses."""
+        parts, depth, start = [], 0, 0
+        for i, ch in enumerate(text):
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+            elif ch == sep and depth == 0:
+                parts.append(text[start:i])
+                start = i + 1
+        parts.append(text[start:])
+        return parts
+
+    @staticmethod
+    def _balanced(text: str) -> bool:
+        depth = 0
+        for ch in text:
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+                if depth < 0:
+                    return False
+        return depth == 0
 
     @staticmethod
     def _split_product(text: str) -> list:
@@ -214,6 +313,8 @@ class Unit:
         return len(self._unit_components) == 0
 
     def __str__(self):
+        if self._written is not None:
+            return self._written
         if not self._unit_components:
             return self._display_symbol or ''
 
@@ -256,6 +357,19 @@ class Unit:
     def __bool__(self):
         """A Unit is truthy if it has components or a display symbol (e.g. '%')."""
         return bool(self._unit_components) or bool(self._display_symbol)
+
+
+class _Unsettled:
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "UNSETTLED"
+
+
+#: The unit of a loop row not derived yet, while its loop settles (see
+#: ``core.loops._rederive_units``): ``+`` takes the other side's unit, a
+#: product or a power of it stays unsettled. Never a line's unit.
+UNSETTLED = _Unsettled()
 
 
 def unit_key(unit: Unit) -> tuple:

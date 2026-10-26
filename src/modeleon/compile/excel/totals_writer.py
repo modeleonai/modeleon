@@ -25,9 +25,10 @@ from numbers import Real
 from typing import Any, Dict
 
 from .addresses import VariableAddresses
+from .cached_values import remember
 from .layout import line_keys
 from .translator import ExcelTranslator
-from .totals import TotalsPlan, listed_or_ranged, regrain_rule_of, rule_formula
+from .totals import NATIVE, TotalsPlan, listed_or_ranged, regrain_rule_of, rule_formula
 from .writer import resolve_number_format
 from ...core.multi_variable import MultiVariableBase
 from ...core.variable import Variable
@@ -48,7 +49,7 @@ def _vars_by_place(mv: MultiVariableBase, prefix: str = "") -> Dict[str, Variabl
     component names from ``mv`` down (``tax``, ``income.revenue``)."""
     out: Dict[str, Variable] = {}
     for name in mv._component_order:
-        comp = mv._components[name]
+        comp = mv._component(name)
         if isinstance(comp, Variable):
             out.setdefault(f"{prefix}{name}", comp)
         elif isinstance(comp, MultiVariableBase):
@@ -177,6 +178,10 @@ def bucket_cells(
             # ROUND, a product of two flows): its bucket is the SUM of its
             # own month cells, live as a rule line's.
             rule, tracked = "sum", None
+        elif rule is None and not authored and (picked := _picked_cell(var, pvar)):
+            # A time row over hours: the day's first start or last stop is
+            # this very row's hour cell, live as a rule line's.
+            rule, tracked = picked, None
         # A compare column (Var, Var %, Share) of a line whose track rows
         # have no fold of their own: its formula over those rows' bucket
         # cells, all on this sheet.
@@ -184,6 +189,7 @@ def bucket_cells(
                   and getattr(var, "_expr", None) is not None
                   and all(getattr(r, "id", None) in bucket_refs[kind]
                           for r in var._expr.iter_refs()))
+        own_time = pvar is not None and _reads_its_own_time(var, pvar)
         for bi, (_label, lo, hi) in enumerate(plan.buckets[kind]):
             formula: Any = None
             value: Any = None
@@ -191,7 +197,7 @@ def bucket_cells(
             if rule is not None:
                 _slot = getattr(var, '_col_slot', 0) or 0
                 month_refs = [
-                    f"{_col_letter(plan.cell(('month', i), _slot))}{month_row}"
+                    f"{_col_letter(plan.cell((NATIVE, i), _slot))}{month_row}"
                     for i in range(lo, min(hi, plan.n))
                     if i < len(addresses[vid].values)
                 ]
@@ -257,6 +263,10 @@ def bucket_cells(
                 # True when a formula's text carries a computed value baked
                 # in: that formula is correct for the current inputs only.
                 "inlined": bool(inlined),
+                # What the engine computed for a time row's bucket on a
+                # clock sheet, kept beside its formula for a reader that does not recalculate.
+                "cached": (_bucket_value(pvar, bi, var)
+                           if own_time and pvar is not None and formula is not None else None),
             }
     return out
 
@@ -277,6 +287,8 @@ def write_totals(
         cell = ws[ref]
         if spec["formula"] is not None:
             cell.value = spec["formula"]
+            if spec.get("cached") is not None:
+                remember(ws, ref, spec["cached"])
         elif spec["value"] is not None:
             cell.value = spec["value"]
         cell.font = Font(bold=True)
@@ -311,6 +323,30 @@ def _shown_series(var: Variable) -> Any:
     blend = getattr(getattr(resolve_tracks_decl(var), "blend", None), "name", None)
     roles = list(value.roles)
     return value[blend if blend in roles else roles[0]]
+
+
+def _reads_its_own_time(var: Variable, pvar: Any) -> bool:
+    """A time row whose projection reads its own cells — a clock sheet's
+    start, end or days (``core.projection._project_time_row``)."""
+    from ...core.expr import Regrain
+    from ...core.time import time_field_of
+
+    expr = getattr(pvar, "_expr", None)
+    return (isinstance(expr, Regrain) and time_field_of(var) is not None
+            and getattr(expr.source, "id", None) == getattr(var, "id", None))
+
+
+def _picked_cell(var: Variable, pvar: Any) -> str | None:
+    """``'first'`` or ``'last'`` when the projection reads each bucket off
+    this very row's own cells, as a clock sheet's time row does (a day's
+    first start, its last stop: ``core.projection._project_time_row``)."""
+    from ...core.expr import Regrain
+
+    expr = getattr(pvar, "_expr", None)
+    if (isinstance(expr, Regrain) and expr.recipe in ("first", "last")
+            and getattr(expr.source, "id", None) == getattr(var, "id", None)):
+        return str(expr.recipe)
+    return None
 
 
 def _sums_its_months(var: Variable, pvar: Any, tracked: Any, buckets: Any,

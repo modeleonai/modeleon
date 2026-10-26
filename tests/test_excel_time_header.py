@@ -250,17 +250,18 @@ def _serial(v):
     return round(_to_serial(v), 6) if isinstance(v, (int, float, date)) else v
 
 
-@pytest.mark.parametrize('grain_book', ['month', 'quarter'])
+@pytest.mark.parametrize('grain_book', ['month', 'quarter', 'half'])
 @pytest.mark.slow
 def test_the_workbook_recalculates_to_the_engine(tmp_path, grain_book):
     m = target(6)
-    if grain_book == 'quarter':
-        # A quarterly book of the same model (the debt loop re-grains by
-        # its balances; the rest is recomputed for quarters).
+    if grain_book in ('quarter', 'half'):
+        # A quarterly / half-yearly book of the same model (the debt loop
+        # re-grains by its balances; the rest is recomputed for the
+        # coarser periods).
         m.debt.interest.set_regrain(mo.frozen(values='sum'))
         m.debt.balance.set_regrain(mo.frozen(values='last'))
         m.inputs.capex.set_regrain(mo.up('sum'))
-        m = m.at('quarter')
+        m = m.at(grain_book)
     wb = _recalculated(m, tmp_path)
     rows = {
         'Inputs': ['rate', 'loan', 'cod'],

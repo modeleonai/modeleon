@@ -167,7 +167,11 @@ class TestAttachedListKeepsTheRange:
 class TestOtherListsWithNoCells:
     """Every list an aggregate can reduce that has no row in the book —
     an intermediate expression, a literal list, a slice of an unattached
-    list, one list among several arguments — follows the same rule."""
+    list — follows the same rule. One list among several arguments is no
+    reduction (several series are combined period by
+    period, as ``a + b`` combines them): the call is one per period, the
+    list's element of each period written into that period's cell — the
+    ``mixed`` case, ``=SUM(10, B1) + B1``, ``=SUM(20, C1) + C1``, …"""
 
     @pytest.mark.parametrize("build", [
         lambda m, x: mo.SUM(m.a * 2) + m.a,
@@ -202,18 +206,40 @@ class TestOtherListsWithNoCells:
 
 class TestScalarOperandsAreUnchanged:
     def test_an_unattached_scalar_is_inlined_inside_the_live_call(self, tmp_path):
+        # A scalar beside a series: one call per period (just
+        # as ``a + 5``), the scalar inlined into each period's call and the
+        # row's own cell live; the reduction of the row stays its range.
         m = mo.Model("M")
         m.a = mo.Variable([1, 2, 3], display_name="A")
         s = mo.Variable(5)
         m.u = mo.SUM(s, m.a) + m.a
         m.u._display_name = "U"
+        m.t = mo.SUM(s, mo.SUM(m.a)) + m.a
+        m.t._display_name = "T"
         out = tmp_path / "u.xlsx"
         warned = _emit(m, out)
         assert warned
+        assert m.u.value == [7, 9, 11] and m.t.value == [12, 13, 14]
         rows = _written(out)
         a_range = f"{rows['A'][0].coordinate}:{rows['A'][2].coordinate}"
         for formula, a in zip([c.value for c in rows["U"][:3]], rows["A"][:3]):
-            assert formula == f"=SUM(5, {a_range}) + {a.coordinate}"
+            assert formula == f"=SUM(5, {a.coordinate}) + {a.coordinate}"
+        for formula, a in zip([c.value for c in rows["T"][:3]], rows["A"][:3]):
+            assert formula == f"=SUM(5, SUM({a_range})) + {a.coordinate}"
+
+    def test_one_list_among_several_arguments_is_read_period_by_period(self, tmp_path):
+        m = mo.Model("M")
+        m.a = mo.Variable([1, 2, 3], display_name="A")
+        x = mo.Variable([10, 20, 30])
+        m.u = mo.SUM(x, m.a) + m.a
+        m.u._display_name = "U"
+        out = tmp_path / "u.xlsx"
+        assert _emit(m, out)
+        assert m.u.value == [12, 24, 36]
+        rows = _written(out)
+        for formula, a, ten in zip([c.value for c in rows["U"][:3]], rows["A"][:3],
+                                   (10, 20, 30)):
+            assert formula == f"=SUM({ten}, {a.coordinate}) + {a.coordinate}"
 
 
 class TestTrackedLines:

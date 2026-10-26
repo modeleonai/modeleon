@@ -25,6 +25,21 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 from ..core.expr import Expr, Literal, SelfRef, VarRef
 from ..core.variable import Variable
+from ._helpers import align_keyed, align_located, placed, refuse_unpaired
+from .mathfn import (
+    _ceiling,
+    _exp,
+    _floor,
+    _ln,
+    _log,
+    _log10,
+    _power,
+    _rounddown,
+    _roundup,
+    _sign,
+    _sqrt,
+    _trunc,
+)
 
 
 # ─── Safe formula evaluator ────────────────────────────────────────────
@@ -100,6 +115,22 @@ _SAFE_FUNCTIONS: Dict[str, Any] = {
     'ROUND': round,
     'INT':   math.floor,
     'MOD':   operator.mod,
+    # The rounding family, the powers and logarithms, the sign: the
+    # kernels behind the public helpers in ``mathfn``, so a template
+    # computes what the cell computes (``ROUNDUP`` away from zero on the
+    # number as shown, ``CEILING`` with its sign rules).
+    'CEILING':   _ceiling,
+    'EXP':       _exp,
+    'FLOOR':     _floor,
+    'LN':        _ln,
+    'LOG':       _log,
+    'LOG10':     _log10,
+    'POWER':     _power,
+    'ROUNDDOWN': _rounddown,
+    'ROUNDUP':   _roundup,
+    'SIGN':      _sign,
+    'SQRT':      _sqrt,
+    'TRUNC':     _trunc,
     # Pure date arithmetic — safe to whitelist (no I/O, no attribute
     # access, deterministic on inputs). Mirror the public ``EDATE`` /
     # ``EOMONTH`` / ``YEAR`` / ``MONTH`` / ``DAY`` so a recurrence
@@ -235,15 +266,19 @@ def _resolve_periods(periods, variables: Dict[str, Any]) -> Tuple[int, Optional[
     return periods, None
 
 
-def _per_period_values(variables: Dict[str, Any], periods: int) -> Dict[str, list]:
+def _per_period_values(variables: Dict[str, Any], periods: int,
+                       read: Optional[Dict[str, list]] = None) -> Dict[str, list]:
     """Align each variable to a per-period list of raw values.
 
-    List-valued Variables pass through (Variables-of-Variables unwrapped).
+    List-valued Variables pass through (Variables-of-Variables unwrapped),
+    as ``read`` gives them where they were read by date (:func:`_by_date`).
     Scalars get broadcast to ``periods`` copies.
     """
     out: Dict[str, list] = {}
     for key, var in variables.items():
-        if isinstance(var, Variable):
+        if read is not None and key in read:
+            out[key] = read[key]
+        elif isinstance(var, Variable):
             if var.var_type == 'list' and isinstance(var._value, list):
                 out[key] = [v._value if isinstance(v, Variable) else v for v in var._value]
             else:
@@ -251,6 +286,25 @@ def _per_period_values(variables: Dict[str, Any], periods: int) -> Dict[str, lis
         else:
             out[key] = [var] * periods
     return out
+
+
+def _by_date(variables: Dict[str, Any]) -> Tuple[Optional[Dict[str, list]], Any, Any]:
+    """The template variables' series read as ``a + b`` reads them: on
+    other time windows by date — each continued by its own ``extend=``
+    rule, a window not covered refused — along keys key by key; lines of
+    other lengths refused (:func:`refuse_unpaired`). Returns
+    the series so read (None where nothing was), the combined window and
+    the keys the recurrence runs on."""
+    names = list(variables)
+    lines = [variables[name] for name in names]
+    raws = [v._value if isinstance(v, Variable) else v for v in lines]
+    read, keys = align_keyed("recurrence", lines, raws)
+    read, window = align_located(lines, read)
+    refuse_unpaired(lines, read, window)
+    if window is None and keys is None:
+        return None, None, None
+    return ({name: value for name, value in zip(names, read) if isinstance(value, list)},
+            window, keys)
 
 
 def _eval_lambda(formula, start_value, periods: int) -> list:
@@ -314,6 +368,12 @@ def _eval_template(formula: str, start_value, periods: int,
             # carried on like any error rather than ending the run.
             result.append('#DIV/0!')
             prev = '#DIV/0!'
+            continue
+        except OverflowError:
+            # A number too large for a cell (EXP of a large one) is
+            # Excel's #NUM!, carried on the same way.
+            result.append('#NUM!')
+            prev = '#NUM!'
             continue
         except TypeError as e:
             raise ValueError(
@@ -547,10 +607,15 @@ def recurrence(
         )
         if display_name:
             result._display_name = display_name
-        return _with_line(result, line)
+        return _with_line(result, line, start)
 
     is_lambda = callable(formula) and (inspect.isfunction(formula) or inspect.ismethod(formula))
-    periods_resolved, periods_var = _resolve_periods(periods, variables)
+    read, window, keys = (None, None, None) if is_lambda else _by_date(variables)
+    if read is not None and periods is None:
+        # The combined window's periods, which every series read on it fills.
+        periods_resolved, periods_var = max(len(v) for v in read.values()), None
+    else:
+        periods_resolved, periods_var = _resolve_periods(periods, variables)
 
     start_value = start._value if isinstance(start, Variable) else start
 
@@ -575,7 +640,7 @@ def recurrence(
             )
         values = _eval_template(
             formula, start_value, periods_resolved,
-            _per_period_values(variables, periods_resolved),
+            _per_period_values(variables, periods_resolved, read),
         )
         recurrence_expr = _build_selfref_expr(
             start, formula, variables, periods_var, periods_resolved,
@@ -609,7 +674,7 @@ def recurrence(
 
     if display_name:
         result._display_name = display_name
-    return _with_line(result, line)
+    return _with_line(placed(result, window, keys), line, start)
 
 
 #: What a line takes beside its recurrence: its fold rule, unit, words and
@@ -617,17 +682,213 @@ def recurrence(
 _LINE_KEYWORDS = ('regrain', 'unit', 'description', 'excel_props')
 
 
-def _with_line(result: Variable, line: Dict[str, Any]) -> Variable:
+def _with_line(result: Variable, line: Dict[str, Any], start: Any = None) -> Variable:
     if 'regrain' in line and line['regrain'] is not None:
         result.set_regrain(line['regrain'])
-    if 'unit' in line and line['unit'] is not None:
-        result.set_unit(line['unit'])
+    declared = line.get('unit')
+    expr = getattr(result, '_expr', None)
+    if isinstance(expr, SelfRef):
+        # The template is read for units as any formula is: a mix is
+        # refused, and a start without a unit takes the template's.
+        derived = _checked_template_unit(expr, start, declared)
+        if declared is None and derived is not None:
+            result._unit = derived
+    if declared is not None:
+        result.set_unit(declared)
+    elif getattr(result, '_unit', None) is None and getattr(start, '_unit', None) is not None:
+        # The line rolls its start forward, so it is in the start's unit:
+        # a balance that opens in USD stays in USD.
+        result._unit = start._unit
     if 'description' in line and line['description'] is not None:
         result.set_description(line['description'])
     if 'excel_props' in line and line['excel_props'] is not None:
         result._excel_props = {
             **result._excel_props, **result._validate_excel_props(line['excel_props'])}
     return result
+
+
+_TEMPLATE_BIN = {ast.Add: '+', ast.Sub: '-', ast.Mult: '*', ast.Div: '/', ast.Mod: '%',
+                 ast.Pow: '**', ast.FloorDiv: '//'}
+_TEMPLATE_CMP = {ast.Eq: '==', ast.NotEq: '!=', ast.Lt: '<', ast.LtE: '<=', ast.Gt: '>',
+                 ast.GtE: '>='}
+
+
+def _template_expr(node: ast.AST, names: Dict[str, Expr]) -> Expr:
+    """The template's parsed tree as the engine's formula nodes, so the
+    operators' unit rules read it as they read any formula; ``names``
+    maps each placeholder (and ``prev``) to its node."""
+    from ..core.expr import BinOp, Compare, FuncCall, UnaryOp
+    if isinstance(node, ast.Constant):
+        return Literal(node.value)
+    if isinstance(node, ast.Name):
+        return names.get(node.id, Literal(None))      # a bare function name: no unit
+    if isinstance(node, ast.BinOp):
+        return BinOp(_TEMPLATE_BIN[type(node.op)], _template_expr(node.left, names),
+                     _template_expr(node.right, names))
+    if isinstance(node, ast.UnaryOp):
+        inner = _template_expr(node.operand, names)
+        return FuncCall('NOT', [inner]) if isinstance(node.op, ast.Not) else UnaryOp('-', inner)
+    if isinstance(node, ast.Compare):
+        left = _template_expr(node.left, names)
+        pairs: list[Expr] = []
+        for op, rhs in zip(node.ops, node.comparators):
+            right = _template_expr(rhs, names)
+            pairs.append(Compare(_TEMPLATE_CMP[type(op)], left, right))
+            left = right
+        return pairs[0] if len(pairs) == 1 else FuncCall('AND', pairs)
+    if isinstance(node, ast.IfExp):
+        return FuncCall('IF', [_template_expr(n, names)
+                               for n in (node.test, node.body, node.orelse)])
+    if isinstance(node, ast.BoolOp):
+        return FuncCall('AND' if isinstance(node.op, ast.And) else 'OR',
+                        [_template_expr(v, names) for v in node.values])
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+        name = node.func.id if node.func.id in _SAFE_FUNCTIONS else node.func.id.upper()
+        return FuncCall(name, [_template_expr(a, names) for a in node.args])
+    raise ValueError(f"Expression not allowed in formulas: {type(node).__name__}")
+
+
+def _compares(expr: Any) -> Any:
+    """Every comparison in a formula tree - a condition is read by no
+    function's law, so its two sides are checked here."""
+    from ..core.expr import Compare
+    if isinstance(expr, Compare):
+        yield expr
+    for child in (getattr(expr, 'args', None) or ()):
+        yield from _compares(child)
+    for attr in ('left', 'right', 'operand', 'inner'):
+        child = getattr(expr, attr, None)
+        if isinstance(child, Expr):
+            yield from _compares(child)
+
+
+def _template_tree(node: SelfRef) -> Tuple[Expr, Variable]:
+    """The template as the engine's formula nodes and the Variable that
+    stands for ``{prev}`` in it (``_display_name`` '{prev}')."""
+    parseable = _PLACEHOLDER_RE.sub(r'\1', node.template)
+    tree = ast.parse(parseable, mode='eval').body
+    prev = Variable()
+    prev._display_name = '{prev}'
+    return _template_expr(tree, {**node.variables, 'prev': VarRef(prev)}), prev
+
+
+def template_unit(node: SelfRef, start_unit: Any, declared: Any, *,
+                  unsettled: Any = frozenset(), check_dimension: bool = True) -> Any:
+    """The unit a recurrence line is in, and the check of its template -
+    the one rule ``mo.recurrence`` builds the line by and a loop container
+    derives it by again (``core.loops._unit_of``, which passes the rows
+    not settled yet as ``unsettled``): the declared unit, else the start's,
+    else the one the template derives with the previous value read as
+    unsettled (as a loop row is read while its loop settles); then, the
+    previous value read in that unit, the template may not mix two units,
+    and (``check_dimension``, where the declared unit is known) must give
+    the row's unit or none. A start or a variable not settled yet leaves
+    the answer :data:`~modeleon.core.unit.UNSETTLED`."""
+    from ..core.loops import _dimension, _unit_of
+    from ..core.unit import UNSETTLED
+
+    if not isinstance(node.template, str):          # the lambda form: no template
+        return declared if declared is not None else start_unit
+    if start_unit is UNSETTLED:
+        return UNSETTLED
+    expr, prev = _template_tree(node)
+
+    def derive(prev_unit: Any, ids: Any) -> Any:
+        prev._unit = prev_unit
+        for cmp in _compares(expr):
+            _unit_of(cmp, ids)
+        return _unit_of(expr, ids)
+
+    ids = frozenset(unsettled)
+    row = declared if declared is not None else start_unit
+    if row is None:
+        u = derive(None, ids | {id(prev)})
+        if u is UNSETTLED:
+            # Unsettled by the previous value alone - the template says
+            # nothing of the row's unit - or by a row of the loop?
+            if derive(None, ids) is UNSETTLED:
+                return UNSETTLED
+            u = None
+        row = u
+    given = derive(row, ids)
+    if given is UNSETTLED:
+        return UNSETTLED
+    if (check_dimension and declared is None and given is not None
+            and _dimension(given) != _dimension(row)):
+        if row is None or set(_dimension(given)) >= set(_dimension(row)):
+            raise ValueError(
+                f"the template gives {given} from a start in {row or 'no unit'}: a "
+                f"dimension multiplied in every period grows a power of it, so the "
+                f"line's unit does not settle. Give the factor no unit, or declare "
+                f"the line's unit (unit=...)."
+            )
+        raise ValueError(
+            f"the template gives {given}, but the start is in {row}, so the line "
+            f"would hold two units. Give the start and the template the same unit, "
+            f"or declare the line's unit (unit=...)."
+        )
+    return row
+
+
+def template_count_pairs(node: SelfRef, start: Any) -> list:
+    """The pairs of lines the template's own ``+`` / ``-`` add - ``{prev}``
+    read as ``start`` (the first period, the one the sum has not written
+    into), each variable as its line - for the check ``+`` makes of a bps
+    or pp count added to a % fraction; a loop container reads them again
+    when it closes (``core.loops._check_counts``)."""
+    from ..core.expr import BinOp
+    if not isinstance(node.template, str):
+        return []
+    expr, prev = _template_tree(node)
+    pairs: list = []
+
+    def line(n: Any) -> Any:
+        if not isinstance(n, VarRef):
+            return None
+        return start if n.var is prev else n.var
+
+    def walk(e: Any) -> None:
+        if isinstance(e, BinOp) and e.op in ('+', '-'):
+            a, b = line(e.left), line(e.right)
+            if isinstance(a, Variable) and isinstance(b, Variable):
+                pairs.append((a, b))
+        for child in (getattr(e, 'args', None) or ()):
+            walk(child)
+        for attr in ('left', 'right', 'operand', 'inner'):
+            child = getattr(e, attr, None)
+            if isinstance(child, Expr):
+                walk(child)
+
+    walk(expr)
+    return pairs
+
+
+def _template_counts(node: SelfRef, start: Any) -> None:
+    """The check ``+`` makes, over the template's own ``+`` / ``-``."""
+    from ..core.variable_ops import _refuse_a_count_added_to_a_share
+    for a, b in template_count_pairs(node, start):
+        _refuse_a_count_added_to_a_share(a, b)
+
+
+def _checked_template_unit(node: SelfRef, start: Any, declared: Any) -> Any:
+    """:func:`template_unit` over a line as built. A refusal over a row
+    whose loop is open is left to the loop, which runs the recurrence
+    again from its formula when it closes and reports it under the row."""
+    from ..core.unit import UNSETTLED, Unit
+    from ..core.variable_ops import _on_open_loop
+    if isinstance(declared, str):
+        declared = Unit.parse(declared)
+    start_unit = getattr(start, '_unit', None)
+    provisional = any(_on_open_loop(v) for v in (start, *[
+        e.var for e in node.variables.values() if isinstance(e, VarRef)]))
+    try:
+        unit = template_unit(node, start_unit, declared)
+        _template_counts(node, start)
+        return None if unit is UNSETTLED else unit
+    except ValueError as exc:
+        if not provisional:
+            raise ValueError(f'recurrence("{node.template}"): {exc}') from exc
+        return declared if declared is not None else start_unit
 
 
 def recurrence_sum(
