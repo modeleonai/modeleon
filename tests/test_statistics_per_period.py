@@ -245,12 +245,20 @@ class TestTheReductionsPerPeriod:
     def test_the_call_holds_its_operands(self):
         m = _model()
         out = mo.MEDIAN(m.x.a, m.x.b, 5.0)
-        assert out._expr == FuncCall("MEDIAN", [VarRef(m.x.a), VarRef(m.x.b), Literal(5.0)])
+        # Compared by parts: since Python 3.13 a dataclass compares its fields
+        # with ==, and a Variable's == is per period, never a bool.
+        assert isinstance(out._expr, FuncCall) and out._expr.func == "MEDIAN"
+        a, b, five = out._expr.args
+        assert isinstance(a, VarRef) and a.var is m.x.a
+        assert isinstance(b, VarRef) and b.var is m.x.b
+        assert five == Literal(5.0)
         assert out.formula == "MEDIAN(a, b, 5.0)"
         typed = mo.MEDIAN(m.x.a, [1.0, 9.0, 1.0])
         assert typed._expr.args[1] == Literal([1.0, 9.0, 1.0])
         sample = mo.PERCENTILE_INC(_revs(m), 0.25)
-        assert sample._expr.args[0] == ListExpr([VarRef(r) for r in _revs(m)])
+        items, revs = sample._expr.args[0], _revs(m)
+        assert isinstance(items, ListExpr) and len(items.items) == len(revs)
+        assert all(isinstance(i, VarRef) and i.var is r for i, r in zip(items.items, revs))
         assert mo.to_json(sample._expr)["func"] == "PERCENTILE_INC"
 
 

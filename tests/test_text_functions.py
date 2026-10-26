@@ -318,7 +318,8 @@ class TestRept:
         (None, 3, ""),
         ("ab", -1, "#VALUE!"),
         ("ab", "x", "#VALUE!"),
-        ("a", 32767, "a" * 32767),
+        pytest.param("a", 32767, "a" * 32767, id="a-32767"),  # a short id: Windows caps
+                                                              # an environment variable
         ("a", 32768, "#VALUE!"),
     ])
     def test_repeats(self, text, n, expected):
