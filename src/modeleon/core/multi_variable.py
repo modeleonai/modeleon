@@ -457,10 +457,18 @@ class MultiVariableBase(_MVLifecycle, _MVInspect, Component):
 
     def at(self, grain: str) -> 'MultiVariableBase':
         """The model re-grained (projected) onto a coarser ``grain``. Every line
-        re-grains by its own rule (apply-own-rule), and **formulas without a rule
-        recompute over their re-grained inputs** (correct for additive / ratio
-        formulas — only multiplicative flows need an explicit ``sum``). Returns a
-        new ``MultiVariable`` of re-grained values, ready to inspect or
+        re-grains by its own rule (apply-own-rule); **a formula without a rule
+        recomputes over its re-grained inputs** (correct for additive / ratio
+        formulas), and a product of two lines that vary by period, a condition
+        or ``MIN`` / ``MAX`` is computed period by period and summed. A formula
+        without a rule whose total turns on the period's number or dates
+        (``mo.time.index`` / ``.start`` / ``.end``) has no default — arithmetic
+        on them, a product of schedules of them, a number over one, a
+        condition or a power on them when the condition yields fixed numbers,
+        a level or a schedule; a product with stored data, the period's length
+        or a flow still folds — nor has a line computed from it: ``at`` raises
+        ``ValueError`` naming the line and the rule to give. Returns a new
+        ``MultiVariable`` of re-grained values, ready to inspect or
         ``.to_excel``.
         """
         from .projection import project_model

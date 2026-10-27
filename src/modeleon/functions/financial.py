@@ -71,18 +71,20 @@ def _zero_blanks(values: List[Any]) -> List[Any]:
 _ONE_ROW = {
     "IRR": "Give the outlay a period of its own in the row - with a window "
            "that starts at the close, the first: flows = mo.IF(mo.time.index "
-           "== 1, -cost, flow) - then mo.IRR(flows).",
+           "== 1, -cost, flow).set_regrain(mo.up('sum')) - then mo.IRR(flows).",
     "NPV": "A time-0 outlay stays outside the call, as Excel discounts the "
            "first flow a whole period: outlay + mo.NPV(rate, flows); a later "
            "amount (a terminal value) goes into the row in its own period.",
     "XIRR": "Give the outlay a period of its own - with a window that starts "
             "at the close, the first: flows = mo.IF(mo.time.index == 1, -cost, "
-            "flow), dates = mo.IF(mo.time.index == 1, close, mo.time.end) - "
-            "then mo.XIRR(flows, dates).",
+            "flow).set_regrain(mo.up('sum')), dates = mo.IF(mo.time.index == 1, "
+            "close, mo.time.end).set_regrain(mo.up('last')) - then "
+            "mo.XIRR(flows, dates).",
     "XNPV": "Give the outlay a period of its own - with a window that starts "
             "at the close, the first: flows = mo.IF(mo.time.index == 1, -cost, "
-            "flow), dates = mo.IF(mo.time.index == 1, close, mo.time.end) - "
-            "then mo.XNPV(rate, flows, dates).",
+            "flow).set_regrain(mo.up('sum')), dates = mo.IF(mo.time.index == 1, "
+            "close, mo.time.end).set_regrain(mo.up('last')) - then "
+            "mo.XNPV(rate, flows, dates).",
 }
 
 
@@ -580,37 +582,73 @@ def XNPV(
 
 
 # The payment, future value and present value of one period's numbers —
-# the arithmetic of a call over scalars, and of each period's cell of a
-# call over a series.
-def _pmt(r: Any, n: Any, v: Any, f: Any, w: Any) -> Any:
+# the arithmetic of every call, over scalars or one period of a series,
+# as the spreadsheet computes it: ``PMT`` is the payment the schedule
+# functions split (``_payment``), ``FV`` the balance they carry
+# (``_balance``), and ``PV`` discounts by ``(1 + r) ** -n``. A cell is
+# read as the spreadsheet reads it (``_number``) and holds a double, a
+# type other than 0 reads as 1 (``_advance``), and the result is
+# ``#NUM!`` where the spreadsheet's is: ``PMT`` over a term of 0, at a
+# rate below -100% (its power is taken through ``log1p``) or paid at the
+# start of a period at -100%, ``PV`` at -100% over a positive term, a
+# fractional power of a negative number, a power or a result too large
+# for a cell.
+def _finite_real(x: Any) -> Any:
+    """``x`` as a cell holds it: ``#NUM!`` where it is no finite real
+    number, 0 rather than -0."""
+    if isinstance(x, complex) or not math.isfinite(x):
+        return '#NUM!'
+    return x + 0.0
+
+
+def _pmt(rate: Any, nper: Any, pv: Any, fv: Any = 0, when: Any = 0) -> Any:
+    r, n, v, f = (float(_number(x)) for x in (rate, nper, pv, fv))
+    w = _advance(when)
+    try:
+        return _finite_real(_payment(r, n, v, f, w))
+    except (ArithmeticError, ValueError):       # ValueError: no log1p below -100%
+        return '#NUM!'
+
+
+def _fv(rate: Any, nper: Any, pmt: Any, pv: Any = 0, when: Any = 0) -> Any:
+    r, n, p, v = (float(_number(x)) for x in (rate, nper, pmt, pv))
+    w = _advance(when)
+    try:
+        return _finite_real(_balance(r, n, p, v, w))
+    except ArithmeticError:
+        return '#NUM!'
+
+
+def _pv(rate: Any, nper: Any, pmt: Any, fv: Any = 0, when: Any = 0) -> Any:
+    r, n, p, f = (float(_number(x)) for x in (rate, nper, pmt, fv))
+    w = _advance(when)
     if r == 0:
-        return -(v + f) / n
-    return -(f + v * (1 + r) ** n) * r / ((1 + r * w) * ((1 + r) ** n - 1))
-
-
-def _fv(r: Any, n: Any, p: Any, v: Any, w: Any) -> Any:
-    if r == 0:
-        return -(v + p * n)
-    return -(v * (1 + r) ** n + p * (1 + r * w) * ((1 + r) ** n - 1) / r)
-
-
-def _pv(r: Any, n: Any, p: Any, f: Any, w: Any) -> Any:
-    if r == 0:
-        return -(f + p * n)
-    return -(f + p * (1 + r * w) * ((1 + r) ** n - 1) / r) / (1 + r) ** n
+        return _finite_real(-(f + p * n))
+    # Over ``(1 + r) ** -n``: a term too long for ``(1 + r) ** n`` to fit
+    # a cell still has a present value.
+    try:
+        u = (1 + r) ** -n
+        if w:
+            return _finite_real(-(f * u + p * (1 - (1 + r) ** (1 - n)) / r + p))
+        return _finite_real(-(f * u + p * (1 - u) / r))
+    except ArithmeticError:
+        return '#NUM!'
 
 
 def _series_among(*args: Any) -> bool:
     return any(is_series(a) for a in args)
 
 
-# A call with a series among its arguments: one per period, every argument
-# written as the call over scalars writes it, read as ``a + b`` reads its
-# operands (a scalar in every period, lines on other windows by date,
-# lines along keys key by key).
-def _each_period(func: str, kernel: Any, *args: Any) -> Variable:
+# Every call is one per period, as a loop container makes it: over scalars
+# once, its text keeping the numbers it was given (``source_code``); with a
+# series among the arguments once a period, every argument written as the
+# call over scalars writes it, read as ``a + b`` reads its operands (a
+# scalar in every period, lines on other windows by date, lines along keys
+# key by key). An error an argument holds is that period's result.
+def _each_period(func: str, kernel: Any, *args: Any,
+                 source_code: str | None = None) -> Variable:
     return elementwise(func, kernel, list(args), blank=0, value_type='float',
-                       render_backends=_EXCEL_ONLY)
+                       render_backends=_EXCEL_ONLY, source_code=source_code)
 
 
 def PMT(
@@ -632,19 +670,22 @@ def PMT(
         monthly = mo.PMT(0.06 / 12, 30 * 12, 300_000)  # ≈ -1,798.65
 
     Any argument may vary by period: a series among them makes the call
-    one per period, ``=PMT(C9 / 100, 12, 1000, 0, 0)`` in every column.
+    one per period, ``=PMT(C9 / 100, 12, 1000, 0, 0)`` in every column,
+    and a loop container makes it one period at a time. The arguments
+    read as the spreadsheet reads them — an error a cell holds is the
+    result, a ``when`` other than 0 is 1 — and the result is ``#NUM!``
+    where the spreadsheet's is: over a term of 0, at a rate below -100%,
+    paid at the start of a period at -100%, or where ``(1 + rate) **
+    nper`` is too large for a cell. Guard a term that can run out on the
+    term itself, ``mo.IF(left > 0, -mo.PMT(rate, left, balance), 0)``:
+    paid at the start of a period, the spreadsheet can show a
+    meaningless number over a term of 0, which ``IFERROR`` lets through.
     """
     if _series_among(rate, nper, pv, fv, when):
         return _each_period('PMT', _pmt, rate, nper, pv, fv, when)
     r, n, pv_v, fv_v, w = _arg(rate), _arg(nper), _arg(pv), _arg(fv), _arg(when)
-    pmt_val = _pmt(r, n, pv_v, fv_v, w)
-
-    result = _wrap_with_formula(
-        pmt_val, 'PMT',
-        [_formula_arg(a) for a in (rate, nper, pv, fv, when)],
-    )
-    result._source_code = f"PMT({r}, {n}, {pv_v}, {fv_v}, {w})"
-    return result
+    return _each_period('PMT', _pmt, rate, nper, pv, fv, when,
+                        source_code=f"PMT({r}, {n}, {pv_v}, {fv_v}, {w})")
 
 
 def FV(
@@ -659,22 +700,17 @@ def FV(
     Example::
 
         # $500/month into 7%-return account for 30 years, starting from $0
-        retirement = mo.FV(0.07 / 12, 30 * 12, -500)  # ≈ 611,729
+        retirement = mo.FV(0.07 / 12, 30 * 12, -500)  # ≈ 609,985.50
 
     Any argument may vary by period, one call per period as for
-    :func:`PMT`.
+    :func:`PMT`; errors and ``when`` read as there, and the result is
+    ``#NUM!`` where the spreadsheet's is.
     """
     if _series_among(rate, nper, pmt, pv, when):
         return _each_period('FV', _fv, rate, nper, pmt, pv, when)
     r, n, p, pv_v, w = _arg(rate), _arg(nper), _arg(pmt), _arg(pv), _arg(when)
-    fv_val = _fv(r, n, p, pv_v, w)
-
-    result = _wrap_with_formula(
-        fv_val, 'FV',
-        [_formula_arg(a) for a in (rate, nper, pmt, pv, when)],
-    )
-    result._source_code = f"FV({r}, {n}, {p}, {pv_v}, {w})"
-    return result
+    return _each_period('FV', _fv, rate, nper, pmt, pv, when,
+                        source_code=f"FV({r}, {n}, {p}, {pv_v}, {w})")
 
 
 def PV(
@@ -692,19 +728,14 @@ def PV(
         pv = mo.PV(0.05, 20, -1000)  # ≈ 12,462
 
     Any argument may vary by period, one call per period as for
-    :func:`PMT`.
+    :func:`PMT`; errors and ``when`` read as there, and the result is
+    ``#NUM!`` where the spreadsheet's is.
     """
     if _series_among(rate, nper, pmt, fv, when):
         return _each_period('PV', _pv, rate, nper, pmt, fv, when)
     r, n, p, fv_v, w = _arg(rate), _arg(nper), _arg(pmt), _arg(fv), _arg(when)
-    pv_val = _pv(r, n, p, fv_v, w)
-
-    result = _wrap_with_formula(
-        pv_val, 'PV',
-        [_formula_arg(a) for a in (rate, nper, pmt, fv, when)],
-    )
-    result._source_code = f"PV({r}, {n}, {p}, {fv_v}, {w})"
-    return result
+    return _each_period('PV', _pv, rate, nper, pmt, fv, when,
+                        source_code=f"PV({r}, {n}, {p}, {fv_v}, {w})")
 
 
 # ─── Loan schedules and depreciation ──────────────────────────────
@@ -764,7 +795,10 @@ def _payment(r: Any, n: Any, v: Any, f: Any, w: int) -> Any:
     if r == 0:
         return -(v + f) / n
     if r == -1:
-        t, t_less_one = 0.0, -1.0               # every amount gone after a period
+        # Every amount gone after a period; over no term, or a negative
+        # one, no payment (a division by zero).
+        t = 0.0 ** n
+        t_less_one = t - 1.0
     else:
         growth = n * math.log1p(r)
         t, t_less_one = math.exp(growth), math.expm1(growth)
@@ -1225,10 +1259,11 @@ register("IRR", shape="range")
 register("NPV", shape="range")
 register("XIRR", shape="range")
 register("XNPV", shape="range")
-register("PMT", shape="scalar")
-register("FV", shape="scalar")
-register("PV", shape="scalar")
-# The schedule and depreciation functions are one call per period.
+# PMT, FV and PV, the schedule and the depreciation functions are one
+# call per period.
+register("PMT", shape="elementwise")
+register("FV", shape="elementwise")
+register("PV", shape="elementwise")
 register("NPER", shape="elementwise")
 register("IPMT", shape="elementwise")
 register("PPMT", shape="elementwise")

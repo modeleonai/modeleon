@@ -242,7 +242,9 @@ class TestTheBook:
                                  ' - (DATE(2026,10,21)+TIME(22,0,0))) * 24')
         assert twice[1].value == '=(DATE(2026,10,21)+TIME(22,0,0)) * 2'
         assert span[3].value == '=(DATE(2026, 10, 22) - (DATE(2026, 10, 21)+TIME(22, 0, 0))) * 24'
-        assert twice[3].value == '=(DATE(2026, 10, 21)+TIME(22, 0, 0)) * 2'
+        # a formula of the period's date with no re-grain rule has no day
+        # total — a duration (end minus start) does
+        assert twice[3].value == '#VALUE!'
 
     def test_a_month_tier_over_days_over_hours(self):
         plan = build_totals_plan(('day', 'month'), 'hour', '2026-10-31T22', 4, 3)

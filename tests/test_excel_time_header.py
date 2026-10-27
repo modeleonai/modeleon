@@ -44,7 +44,9 @@ def target(n=4, start=date(2026, 1, 1)):
             h.start = mo.time.start
             h.end = mo.time.end
             h.days = mo.time.days
-            h.construction = mo.IF(h.end <= m.inputs.cod, 1, 0)
+            # a flag on the period's date folds by its re-grain rule: 'sum'
+            # counts the months it is on, so an amount times it totals right
+            h.construction = mo.IF(h.end <= m.inputs.cod, 1, 0).set_regrain(mo.up('sum'))
         m.default_header = m.header
         m.debt = mo.MultiVariable('Debt', loop=True)
         with m.debt as d:

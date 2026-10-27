@@ -691,7 +691,10 @@ class TestALineComputedMonthByMonthTotalsLive:
                 o.units = mo.Variable([10.0, 20.0, 30.0] * 2, display_name="Units",
                                       regrain=mo.up("sum"))
                 o.rate = mo.Variable(0.1, display_name="Rate")
-                o.flag = mo.IF(mo.time.index >= 3, 1, 0).set_display_name("Flag")
+                # a flag on the period's number folds by its re-grain rule;
+                # 'sum', a flow, makes its bucket the SUM of its own months
+                o.flag = mo.IF(mo.time.index >= 3, 1, 0).set_regrain(
+                    mo.up("sum")).set_display_name("Flag")
                 o.tax = mo.IF(o.rev > 250, o.rev * 0.2, 0).set_display_name("Tax")
                 o.sales = (o.rev * o.units).set_display_name("Sales")
                 o.rounded = mo.ROUND(o.rev / 7, 0).set_display_name("Rounded")
@@ -1675,3 +1678,788 @@ class TestNativeOutlineGroups:
         lv = {c: ws.column_dimensions[get_column_letter(c)].outline_level
               for c in range(2, 10)}
         assert lv[2] == lv[3] == lv[4] == lv[5] == 1
+
+
+class TestAFormulaThatDependsOnThePeriodsPosition:
+    """A formula whose total turns on the period's number or dates has no
+    total without a re-grain rule: a condition on them was summed as a flow
+    (a price of 50 switched by date totalled 600 a year) and arithmetic on
+    them was recomputed at the coarser grain (a payroll grown by
+    ``mo.time.index`` totalled one month's pay). Its total cells show
+    ``#VALUE!``, ``model.at`` raises, and the message says which rule to
+    give; a line computed from it (``price * 2``) is refused too, naming
+    both. The period's length (``mo.time.days``, ``.months``), a duration on
+    the dates, a product of two lines and a row with a rule read linearly
+    still fold."""
+
+    @staticmethod
+    def _model(ruled=False):
+        m = mo.Model("m", default_grain="month", default_start="2026-01", default_periods=24)
+        with m:
+            m.inputs = mo.MultiVariable("Inputs")
+            with m.inputs as i:
+                i.switch = mo.DATE(2027, 1, 1)
+                i.base = mo.Variable(1000.0)
+                i.infl = mo.Variable(0.01)
+                i.rate = mo.Variable(0.12)
+                i.capex = mo.Variable(500.0)
+            m.h = mo.MultiVariable("Header")
+            m.h.index = mo.time.index
+            m.e = mo.MultiVariable("E")
+            with m.e as e:
+                price = mo.IF(mo.time.start >= m.inputs.switch, 55, 50)
+                payroll = m.inputs.base * (1 + m.inputs.infl) ** (mo.time.index - 1)
+                capex = m.inputs.capex * mo.IF(mo.time.index == 1, 1, 0)
+                late = mo.IF(m.h.index > 12, 1, 0)          # through a time row
+                if ruled:
+                    price = price.set_regrain(mo.up("mean"))
+                    payroll = payroll.set_regrain(mo.up("sum"))
+                    capex = capex.set_regrain(mo.up("sum"))
+                    late = late.set_regrain(mo.up("sum"))
+                e.price = price.set_display_name("Price")
+                e.payroll = payroll.set_display_name("Payroll")
+                e.capex = capex.set_display_name("Capex")
+                e.late = late.set_display_name("Late")
+                e.balance = mo.Variable([1000.0] * 24, regrain=mo.up("last"), display_name="Balance")
+                e.interest = (e.balance * m.inputs.rate * mo.time.days / 365).set_display_name("Interest")
+                e.customers = mo.Variable([10.0] * 24, regrain=mo.up("last"), display_name="Customers")
+                e.mrr = (e.customers * e.price).set_display_name("MRR")
+                e.price_x2 = (e.price * 2).set_display_name("Price x2")
+            m.default_excel_view = mo.ExcelView(timeline={"totals": ["year"]})
+        return m
+
+    @staticmethod
+    def _year_totals(m):
+        path = os.path.join(tempfile.mkdtemp(), "t.xlsx")
+        m.to_excel(path)
+        ws = openpyxl.load_workbook(path)["E"]
+        head = [c.value for c in ws[1]]
+        cols = [j + 1 for j, h in enumerate(head) if isinstance(h, str) and h.startswith("Total")]
+        return {ws.cell(r, 1).value: [ws.cell(r, c).value for c in cols]
+                for r in range(2, ws.max_row + 1) if ws.cell(r, 1).value}
+
+    def test_without_a_rule_its_total_cells_show_value_errors(self):
+        totals = self._year_totals(self._model())
+        for label in ("Price", "Payroll", "Capex", "Late", "Price x2"):
+            assert totals[label] == ["#VALUE!", "#VALUE!"], (label, totals[label])
+
+    def test_a_duration_measured_on_the_dates_still_folds(self):
+        from modeleon.core.projection import project_line
+
+        m = self._model()
+        with m:
+            with m.e as e:
+                e.span = ((mo.time.end - mo.time.start) * 24).set_display_name("Span")
+        span = project_line(m.e.span, "year", {}, on_error="absorb")
+        assert not getattr(span, "_regrain_error", None)
+        assert span._value == [8736, 8736]
+
+    def test_the_period_s_length_and_a_product_still_fold(self):
+        totals = self._year_totals(self._model())
+        assert all(str(v).startswith("=") for v in totals["Interest"]), totals["Interest"]
+        assert all(str(v).startswith("=SUM(") for v in totals["MRR"]), totals["MRR"]
+        assert totals["Balance"][0].startswith("=")
+
+    def test_the_projection_names_the_rule_to_give(self):
+        from modeleon.core.projection import project_line
+
+        m = self._model()
+        price = project_line(m.e.price, "year", {}, on_error="absorb")
+        assert price._value == "#VALUE!"
+        assert price._regrain_error.startswith(
+            "'Price' puts the period's number or dates (mo.time.index, .start or .end) "
+            "through mo.IF, so its year total is not defined without a re-grain rule")
+        assert ".set_regrain(mo.up('mean'))" in price._regrain_error
+        payroll = project_line(m.e.payroll, "year", {}, on_error="absorb")
+        assert "through a power" in payroll._regrain_error
+        with pytest.raises(ValueError, match="the period's number or dates") as refused:
+            m.at("year")
+        assert type(refused.value) is ValueError
+
+    def test_a_line_computed_from_it_names_both(self):
+        from modeleon.core.projection import project_line
+
+        x2 = project_line(self._model().e.price_x2, "year", {}, on_error="absorb")
+        assert x2._value == "#VALUE!"
+        assert x2._regrain_error.startswith("'Price x2' is computed from 'Price'")
+        assert "until 'Price' has a re-grain rule" in x2._regrain_error
+
+    def test_with_a_rule_each_folds_by_it(self):
+        m = self._model(ruled=True)
+        assert [round(v, 2) for v in m.e.price.at("year").value] == [50.0, 55.0]
+        assert [round(v, 2) for v in m.e.payroll.at("year").value] == [12682.5, 14290.96]
+        assert m.e.capex.at("year").value == [500.0, 0.0]
+        totals = self._year_totals(m)
+        for label in ("Price", "Payroll", "Capex", "Late", "Price x2"):
+            assert "#VALUE!" not in totals[label], (label, totals[label])
+
+
+class TestWhereThePositionLawStops:
+    """Where the law stops. A schedule — a line computed from the period's
+    number or dates and fixed numbers alone, at any distance and whatever
+    its rule — has no total through a condition, a cap or a power; a
+    condition that yields a flow, a product of two lines and a line that
+    reads stored data keep their totals."""
+
+    @staticmethod
+    def _model():
+        m = mo.Model("m", default_grain="month", default_start="2026-01", default_periods=24)
+        with m:
+            m.inputs = mo.MultiVariable("Inputs")
+            with m.inputs as i:
+                i.switch = mo.DATE(2027, 1, 1)
+                i.cod = mo.DATE(2026, 7, 1)
+                i.base = mo.Variable(1000.0)
+                i.capex = mo.Variable(2400.0)
+                i.k = mo.Variable(100.0)
+            m.h = mo.MultiVariable("Header")
+            with m.h as h:
+                h.start = mo.time.start
+                h.end = mo.time.end
+                h.after = mo.IF(h.start >= m.inputs.switch, 1, 0)
+                h.constr = mo.IF(h.end <= m.inputs.cod, 1, 0).set_regrain(mo.up("sum"))
+            m.e = mo.MultiVariable("E")
+            with m.e as e:
+                e.price_flag = mo.IF(m.h.after == 1, 55, 50)
+                e.price_ruled_flag = mo.IF(m.h.constr == 1, 50, 55)
+                e.n = (mo.time.index - 1).set_regrain(mo.up("mean"))
+                e.pay_ruled_n = m.inputs.base * 1.01 ** e.n
+                e.draw = m.inputs.k * m.h.constr
+                e.customers = mo.Variable([10.0] * 24, regrain=mo.up("last"))
+                e.price = mo.IF(mo.time.start >= m.inputs.switch, 55, 50)
+                e.mrr = e.customers * e.price
+                e.mrr_inline = e.customers * mo.IF(mo.time.start >= m.inputs.switch, 55, 50)
+                e.by_month = e.customers * mo.time.index
+                e.period_end = m.h.end
+                e.prev_end = mo.lag(m.h.end, 1)
+                e.next_start = mo.time.end + 1
+                e.price_lag = mo.IF(e.prev_end >= m.inputs.switch, 55, 50)
+                e.depr = m.inputs.capex / mo.MAX(mo.time.index) * mo.time.months
+                e.span = 1 + mo.time.end - mo.time.start
+                e.debt = mo.recurrence(start=1000.0, formula="{prev} - {a}",
+                                       a=mo.IF(mo.time.index > 6, 100.0, 0.0))
+                e.cum = mo.cumsum(m.inputs.k * mo.IF(mo.time.index >= 3, 1, 0))
+        return m
+
+    @staticmethod
+    def _year(var):
+        from modeleon.core.projection import project_line
+
+        return project_line(var, "year", {}, on_error="absorb")
+
+    @pytest.mark.parametrize("line", [
+        "price_flag",          # a condition on a flag of the dates with no rule
+        "price_ruled_flag",    # ... and on one with a rule: a level switched by it
+        "pay_ruled_n",         # a power over a counter of the period's number, ruled
+        "price_lag",           # a condition on the previous period's end
+    ])
+    def test_a_non_linear_use_of_a_row_of_the_dates_has_no_total(self, line):
+        v = self._year(getattr(self._model().e, line))
+        assert v._value == "#VALUE!"
+        assert "the period's number or dates" in v._regrain_error
+
+    def test_a_condition_on_a_row_of_the_dates_names_the_row(self):
+        v = self._year(self._model().e.price_flag)
+        assert v._regrain_error.startswith(
+            "'price_flag' puts 'after', which depends on the period's number or dates "
+            "(mo.time.index, .start or .end), through mo.IF")
+
+    @pytest.mark.parametrize("line, year", [
+        ("draw", [600.0, 0.0]),               # an amount times a flag folded by 'sum'
+        ("mrr", [6000.0, 6600.0]),            # a product of two lines is a flow
+        ("mrr_inline", [6000.0, 6600.0]),     # ... with the switch written inline too
+        ("by_month", [780.0, 2220.0]),        # ... and with the period's number as a factor
+        ("depr", [1200.0, 1200.0]),           # a reduction over the whole window is a constant
+        ("span", [365, 365]),                 # a duration on the dates
+        ("cum", [1000.0, 2200.0]),            # a running total of a summed flow
+    ])
+    def test_a_linear_use_a_product_a_length_still_fold(self, line, year):
+        v = self._year(getattr(self._model().e, line))
+        assert not getattr(v, "_regrain_error", None), v._regrain_error
+        assert [round(x, 2) for x in v._value] == year
+
+    def test_a_row_that_is_time_stays_time(self):
+        m = self._model()
+        assert self._year(m.e.period_end)._value == [date(2026, 12, 31), date(2027, 12, 31)]
+        assert self._year(m.e.prev_end)._value[1] == date(2026, 12, 31)
+        assert self._year(m.e.next_start)._value == [date(2027, 1, 1), date(2028, 1, 1)]
+
+    def test_dates_counted_by_the_period_s_number_have_no_total(self):
+        m = self._model()
+        with m:
+            m.e.coupon = m.inputs.switch + 30 * mo.time.index
+        assert self._year(m.e.coupon)._value == "#VALUE!"
+
+    def test_a_recurrence_keeps_its_own_error(self):
+        v = self._year(self._model().e.debt)
+        assert "a recurrence's formula is grain-frozen" in v._regrain_error
+
+    def test_a_schedule_counts_through_any_number_of_lines(self):
+        # a flag computed from a flag of the dates, an alias, a lag, a counter
+        # two lines away: each a schedule, so a condition or a power on it
+        # has no total, ruled or not
+        m = mo.Model("m", default_grain="month", default_start="2026-01", default_periods=24)
+        with m:
+            m.i = mo.MultiVariable("I")
+            m.i.cod = mo.DATE(2026, 6, 30)
+            m.i.switch = mo.DATE(2027, 1, 1)
+            m.i.base = mo.Variable(1000.0)
+            m.h = mo.MultiVariable("Timing")
+            with m.h as h:
+                h.construction = mo.IF(mo.time.end <= m.i.cod, 1, 0)
+                h.operations = 1 - h.construction
+                h.after = mo.IF(mo.time.start >= m.i.switch, 1, 0).set_regrain(mo.up("sum"))
+                h.op_month = mo.MAX(0, mo.time.index - 6).set_regrain(mo.up("last"))
+                h.op_year = mo.INT((h.op_month + 11) / 12).set_regrain(mo.up("last"))
+                h.n = (mo.time.index - 1).set_regrain(mo.up("mean"))
+                h.n2 = h.n * 1
+            m.r = mo.MultiVariable("Report")
+            m.r.after = m.h.after
+            m.e = mo.MultiVariable("E")
+            with m.e as e:
+                e.tariff = mo.IF(m.h.operations == 1, 55.0, 50.0)
+                e.price_alias = mo.IF(m.r.after == 1, 55.0, 50.0)
+                e.prev_after = mo.lag(m.h.after, 1).set_regrain(mo.up("sum"))
+                e.price_lag = mo.IF(e.prev_after == 1, 55.0, 50.0)
+                e.esc = 1.03 ** mo.MAX(m.h.op_year - 1, 0)
+                e.pay = m.i.base * 1.01 ** m.h.n2
+        for line in ("tariff", "price_alias", "price_lag", "esc", "pay"):
+            v = self._year(getattr(m.e, line))
+            assert v._value == "#VALUE!", (line, v._value)
+        assert "puts 'operations'" in self._year(m.e.tariff)._regrain_error
+        assert "puts 'n2'" in self._year(m.e.pay)._regrain_error
+
+    def test_a_running_total_or_a_projection_inside_a_condition_is_read(self):
+        m = mo.Model("m", default_grain="month", default_start="2026-01", default_periods=24)
+        with m:
+            m.i = mo.MultiVariable("I")
+            m.i.launch = mo.DATE(2026, 7, 1)
+            m.i.switch = mo.DATE(2027, 1, 1)
+            m.i.base = mo.Variable(1000.0)
+            m.h = mo.MultiVariable("Timing")
+            m.h.after = mo.IF(mo.time.start >= m.i.switch, 1, 0).set_regrain(mo.up("max"))
+            m.e = mo.MultiVariable("E")
+            with m.e as e:
+                e.live = mo.IF(mo.cumsum(mo.IF(mo.time.start >= m.i.launch, 1, 0)) > 6, 55.0, 50.0)
+                e.by_days = mo.IF(mo.cumsum(mo.time.days) > 365, 55.0, 50.0)
+                e.month_no = mo.cumsum(mo.time.months)
+                e.pay = m.i.base * 1.01 ** (e.month_no - 1)
+            m.q = mo.MultiVariable("Q", default_grain="quarter", default_start="2026-Q1",
+                                   default_periods=8)
+            m.q.price = mo.IF(m.h.after.at("quarter") == 1, 55.0, 50.0)
+        for line in (m.e.live, m.e.by_days, m.e.pay, m.q.price):
+            assert self._year(line)._value == "#VALUE!", line.python_name
+        assert self._year(m.e.month_no)._value == [12, 24]      # a running total stays one
+
+    def test_a_condition_that_yields_a_flow_keeps_its_total(self):
+        # a revenue switched on by date, ruled 'sum': a tax and a royalty on
+        # it are flows, summed month by month as 0.2.3 summed them
+        m = mo.Model("m", default_grain="month", default_start="2026-01", default_periods=24)
+        with m:
+            m.i = mo.MultiVariable("I")
+            m.i.launch = mo.DATE(2026, 7, 1)
+            m.p = mo.MultiVariable("PnL")
+            with m.p as p:
+                p.revenue = mo.IF(mo.time.start >= m.i.launch, 5000.0, 0.0).set_regrain(mo.up("sum"))
+                p.opex = mo.Variable([2000.0] * 24, regrain=mo.up("sum"))
+                p.royalty = mo.MIN(p.revenue * 0.1, 400.0)
+                p.tax = mo.IF(p.revenue > 0, p.revenue * 0.2, 0.0)
+                p.ebitda = p.revenue - p.opex
+                p.tax_ebitda = mo.IF(p.ebitda > 0, p.ebitda * 0.2, 0.0)
+        assert self._year(m.p.royalty)._value == [2400.0, 4800.0]
+        assert self._year(m.p.tax)._value == [6000.0, 12000.0]
+        assert self._year(m.p.tax_ebitda)._value == [3600.0, 7200.0]
+
+    def test_a_product_inside_a_condition_or_a_cap_folds(self):
+        m = mo.Model("m", default_grain="month", default_start="2026-01", default_periods=24)
+        with m:
+            m.i = mo.MultiVariable("I")
+            m.i.switch = mo.DATE(2027, 1, 1)
+            m.p = mo.MultiVariable("P")
+            with m.p as p:
+                p.units = mo.Variable([100.0 + k for k in range(24)], regrain=mo.up("sum"))
+                p.price = mo.IF(mo.time.start >= m.i.switch, 55.5, 50.5)
+                p.rounded = mo.ROUND(p.units * p.price, 0)
+                p.floor = mo.MAX(p.units * mo.IF(mo.time.start >= m.i.switch, 55.5, 50.5) - 5100.0, 0.0)
+                p.only_pos = mo.IF(p.units > 0, p.units * mo.IF(mo.time.start >= m.i.switch, 55.5, 50.5), 0.0)
+        assert self._year(m.p.rounded)._value == [63936.0, 78258.0]
+        assert [round(v, 2) for v in self._year(m.p.floor)._value] == [2783.0, 17055.0]
+        assert [round(v, 2) for v in self._year(m.p.only_pos)._value] == [63933.0, 78255.0]
+        assert self._year(m.p.price)._value == "#VALUE!"
+
+    def test_the_order_of_terms_does_not_change_the_answer(self):
+        m = mo.Model("m", default_grain="month", default_start="2026-01", default_periods=24)
+        with m:
+            m.i = mo.MultiVariable("I")
+            m.i.switch = mo.DATE(2027, 1, 1)
+            m.h = mo.MultiVariable("H")
+            m.h.after = mo.IF(mo.time.start >= m.i.switch, 1, 0).set_regrain(mo.up("sum"))
+            m.e = mo.MultiVariable("E")
+            with m.e as e:
+                t = m.h.after * 1.0
+                e.a = mo.IF(t == 1, 55.0, 50.0) + t * 0.0
+                e.b = t * 0.0 + mo.IF(t == 1, 55.0, 50.0)
+        assert self._year(m.e.a)._value == self._year(m.e.b)._value == "#VALUE!"
+
+    def test_a_line_already_at_the_grain_asked_projects_as_it_is(self):
+        m = mo.Model("m", default_grain="month", default_start="2026-01", default_periods=24,
+                     tracks=mo.Tracks("plan", "actual"))
+        with m:
+            m.p = mo.MultiVariable("P")
+            m.p.units = mo.Variable(plan=[100.0] * 24, actual=[90.0] * 24, regrain=mo.up("sum"))
+            m.q = mo.MultiVariable("Q", default_grain="quarter", default_start="2026-Q1",
+                                   default_periods=8)
+            with m.q as q:
+                q.base = mo.Variable(plan=[10.0] * 8, actual=[9.0] * 8, regrain=mo.up("sum"))
+                q.grown = q.base * 1.0 + mo.time.index * 0.5
+        assert m.at("quarter").q.grown.value["plan"][:3] == [10.5, 11.0, 11.5]
+
+    def test_a_refusal_is_kept_so_a_long_ladder_below_it_still_projects(self):
+        # 300 running subtotals below a capex with no rule: each is refused
+        # once, not worked out anew down the ladder, and the rest of the
+        # sheet keeps its totals
+        from modeleon.core.projection import project_model
+
+        m = mo.Model("m", default_grain="month", default_start="2026-01", default_periods=24)
+        with m:
+            m.c = mo.MultiVariable("Costs")
+            with m.c as c:
+                c.units = mo.Variable([100.0] * 24, regrain=mo.up("sum"))
+                c.unrelated = c.units * 2.0
+                for k in range(300):
+                    setattr(c, f"cost{k}", mo.IF(mo.time.index == 4, 120000.0, 0.0) if k == 5
+                            else mo.Variable([100.0] * 24, regrain=mo.up("sum")))
+                c.sub0 = c.cost0 * 1.0
+                for k in range(1, 300):
+                    setattr(c, f"sub{k}", getattr(c, f"sub{k - 1}") + getattr(c, f"cost{k}"))
+        y = project_model(m, "year", on_error="absorb").c
+        assert y.unrelated.value == [2400.0, 2400.0]
+        assert y.sub4.value == [6000.0, 6000.0]
+        assert y.sub299.value == "#VALUE!"
+        assert "is computed from 'cost5'" in y.sub299._regrain_error
+
+    def test_the_messages_say_what_the_formula_does(self):
+        m = mo.Model("m", default_grain="month", default_start="2026-01", default_periods=24)
+        with m:
+            m.i = mo.MultiVariable("I")
+            m.i.base = mo.Variable(1000.0)
+            m.i.launch = mo.DATE(2026, 7, 1)
+            m.e = mo.MultiVariable("E")
+            with m.e as e:
+                e.n = mo.time.index - 1
+                e.growth = m.i.base * 1.01 ** e.n            # its own reason, not "computed from"
+                e.n_r = (mo.time.index - 1).set_regrain(mo.up("mean"))
+                e.rounded = mo.ROUND(e.n_r * 1.5, 0)
+            m.pnl = mo.MultiVariable("PnL")
+            m.pnl.revenue = mo.IF(mo.time.start >= m.i.launch, 5000.0, 0.0)
+            m.pnl.opex = mo.Variable([2000.0] * 24, regrain=mo.up("sum"))
+            m.pnl.ebitda = m.pnl.revenue - m.pnl.opex
+            m.pnl.margin = m.pnl.ebitda / m.pnl.revenue
+            m.report = mo.MultiVariable("Report")
+            m.report.revenue = m.pnl.revenue
+        assert self._year(m.e.growth)._regrain_error.startswith("'growth' puts 'n', which depends on")
+        assert "through mo.ROUND" in self._year(m.e.rounded)._regrain_error
+        assert self._year(m.report.revenue)._regrain_error.startswith(
+            "'m.report.revenue' is computed from 'm.pnl.revenue'")
+        margin = self._year(m.pnl.margin)._regrain_error
+        assert margin.startswith("'margin' is computed from 'revenue'")
+        assert "until 'revenue' has a re-grain rule" in margin
+
+    def test_a_ratio_totals_once_its_source_has_a_rule(self):
+        m = mo.Model("m", default_grain="month", default_start="2026-01", default_periods=24)
+        with m:
+            m.i = mo.MultiVariable("I")
+            m.i.launch = mo.DATE(2026, 7, 1)
+            m.p = mo.MultiVariable("PnL")
+            with m.p as p:
+                p.revenue = mo.IF(mo.time.start >= m.i.launch, 5000.0, 0.0).set_regrain(mo.up("sum"))
+                p.opex = mo.Variable([2000.0 + 100 * k for k in range(24)], regrain=mo.up("sum"))
+                p.ebitda = p.revenue - p.opex
+                p.margin = p.ebitda / p.revenue
+        assert [round(v, 4) for v in self._year(m.p.margin)._value] == [-0.02, 0.25]
+
+    @pytest.mark.parametrize("ruled", [False, True])
+    def test_a_line_that_reads_no_dates_keeps_its_total(self, ruled):
+        # a margin, a tax and a rounded revenue below a price switched by
+        # date: none of them reads the dates itself, ruled price or not
+        from modeleon.core.projection import project_model
+
+        m = mo.Model("m", default_grain="month", default_start="2026-01", default_periods=24)
+        with m:
+            m.inputs = mo.MultiVariable("Inputs")
+            m.inputs.switch = mo.DATE(2027, 1, 1)
+            m.p = mo.MultiVariable("PnL")
+            with m.p as p:
+                p.units = mo.Variable([100.0] * 24, regrain=mo.up("sum"))
+                price = mo.IF(mo.time.start >= m.inputs.switch, 55.0, 50.0)
+                p.price = price.set_regrain(mo.up("mean")) if ruled else price
+                p.revenue = p.units * p.price
+                p.gross = p.revenue - p.units * 30.0
+                p.margin = p.gross / p.revenue
+                p.tax = mo.IF(p.gross > 0, p.gross * 0.25, 0.0)
+                p.rounded = mo.ROUND(p.revenue, 0)
+        y = project_model(m, "year", on_error="absorb").p
+        assert [round(v, 4) for v in y.margin.value] == [0.4, 0.4545]
+        assert y.tax.value == [6000.0, 7500.0]
+        assert y.rounded.value == [60000.0, 66000.0]
+        assert (y.price.value == "#VALUE!") is not ruled
+
+    def test_a_covenant_on_a_schedule_of_the_dates_still_folds(self):
+        # the schedule reads the dates and has its rule; the cover ratio and
+        # its headroom read the schedule's projections and a cash flow typed
+        # in as data, and keep their totals
+        m = self._model()
+        with m:
+            with m.e as e:
+                e.left = (24 - (mo.YEAR(mo.time.start) - 2026) * 12
+                          - mo.MONTH(mo.time.start) + 1).set_regrain(mo.up("first"))
+                e.repay = (m.inputs.capex / 24 * mo.MIN(mo.MAX(e.left, 0), mo.time.months)
+                           ).set_regrain(mo.up("sum"))
+                e.cash = mo.Variable([110.0] * 12 + [180.0] * 12, regrain=mo.up("sum"))
+                e.cash_sched = mo.IF(mo.time.start >= m.inputs.switch, 180.0, 110.0
+                                     ).set_regrain(mo.up("sum"))
+            m.q = mo.MultiVariable("Q", default_grain="quarter", default_start="2026-Q1",
+                                   default_periods=8)
+            with m.q as q:
+                q.cash = m.e.cash.at("quarter")
+                q.repay = m.e.repay.at("quarter")
+                q.cover = q.cash / q.repay
+                q.headroom = q.cover - 1.2
+                q.breach = mo.IF(q.cover < 1.2, 1, 0)
+                q.low = mo.MIN(q.cover)
+                q.is_low = mo.IF(q.cover == q.low, 1, 0)
+                q.cover_s = m.e.cash_sched.at("quarter") / q.repay
+                q.breach_s = mo.IF(q.cover_s < 1.2, 1, 0)
+        for line in ("cover", "headroom", "cover_s"):
+            v = self._year(getattr(m.q, line))
+            assert not getattr(v, "_regrain_error", None), (line, v._regrain_error)
+        assert [round(x, 2) for x in self._year(m.q.cover)._value] == [1.1, 1.8]
+        # a 0/1 flag on a cover that turns on the dates (through the
+        # schedule) needs its rule, as any flag of the dates does
+        for line in ("breach", "is_low", "breach_s"):
+            assert self._year(getattr(m.q, line))._value == "#VALUE!", line
+        m.q.breach.set_regrain(mo.up("sum"))
+        assert self._year(m.q.breach)._value == [4, 0]     # the quarters in breach
+
+    def test_a_long_chain_folds_without_running_out_of_stack(self):
+        # a tax on a total of a thousand lines (a Python sum): the walk over
+        # the chain keeps no frame per line
+        n = 1000
+        m = mo.Model("m", default_grain="month", default_start="2026-01", default_periods=24)
+        with m:
+            m.costs = mo.MultiVariable("Costs")
+            with m.costs as c:
+                lines = []
+                for k in range(n):
+                    setattr(c, f"c{k}", mo.Variable([1.0] * 24, regrain=mo.up("sum")))
+                    lines.append(getattr(c, f"c{k}"))
+            m.s = mo.MultiVariable("Summary")
+            with m.s as s:
+                s.total = sum(lines).set_regrain(mo.up("sum"))
+                s.tax = mo.IF(s.total > 0, s.total * 0.2, 0.0)
+        assert [round(v, 6) for v in m.at("year").s.tax.value] == [n * 12 * 0.2] * 2
+
+    @pytest.mark.parametrize("flag_first", [False, True])
+    def test_a_loop_s_rows_are_judged_whatever_was_projected_first(self, flag_first):
+        # a loan's rows read each other and its repayment starts by the
+        # period's number: every row of it is a schedule, so a rate or a
+        # flag switched on them has no total, whichever line is met first
+        from modeleon.core.projection import project_model
+
+        m = mo.Model("m", default_grain="month", default_start="2026-01", default_periods=24)
+        with m:
+            m.debt = mo.MultiVariable("Debt", loop=True)
+            with m.debt as d:
+                d.opening = mo.lag(d.closing, fill=1200.0)
+                d.interest = d.opening * 0.12 * mo.time.days / 365
+                d.repay = mo.IF(mo.time.index > 6, 100.0, 0.0)
+                d.closing = d.opening + d.interest - d.repay
+            for row, rule in (("opening", mo.frozen(values="first")),
+                              ("interest", mo.frozen(values="sum")),
+                              ("repay", mo.up("sum")), ("closing", mo.frozen(values="last"))):
+                getattr(m.debt, row).set_regrain(rule)
+            m.e = mo.MultiVariable("E")
+            with m.e as e:
+                if flag_first:
+                    e.flag = mo.IF(m.debt.closing > 900, 1, 0)
+                e.step = mo.IF(m.debt.interest > 10, 0.07, 0.06)
+                e.repaying = mo.IF(m.debt.repay > 0, 1, 0)
+        y = project_model(m, "year", on_error="absorb").e
+        assert y.step.value == y.repaying.value == "#VALUE!"
+        assert y.step._regrain_error.startswith("'step' puts 'interest', which depends on")
+        if flag_first:
+            assert y.flag.value == "#VALUE!"
+
+
+class TestSchedulesProductsAndQuotients:
+    """What a product, a quotient, a condition's test and a running total
+    read of the period's number or dates: a product folds as a flow only when
+    a factor is stored data, and never under a power; a number or a level
+    over a line of the dates has no total; a condition's test is read through
+    any line, data or not."""
+
+    @staticmethod
+    def _model():
+        m = mo.Model("m", default_grain="month", default_start="2026-01", default_periods=24)
+        with m:
+            m.i = mo.MultiVariable("I")
+            with m.i as i:
+                i.cod = mo.DATE(2026, 7, 1)
+                i.switch = mo.DATE(2027, 1, 1)
+                i.loan = mo.Variable(2400.0)
+            m.h = mo.MultiVariable("Timing")
+            with m.h as h:
+                h.op = mo.IF(mo.time.start >= m.i.cod, 1, 0).set_regrain(mo.up("sum"))
+                h.esc = (1.02 ** ((mo.time.index - 1) / 12)).set_regrain(mo.up("mean"))
+                h.left = (25 - mo.time.index).set_regrain(mo.up("first"))
+                h.ops = mo.IF(mo.time.end > m.i.cod, 1, 0).set_regrain(mo.up("sum"))
+            m.e = mo.MultiVariable("E")
+        return m
+
+    @staticmethod
+    def _year(var):
+        from modeleon.core.projection import project_line
+
+        return project_line(var, "year", {}, on_error="absorb")
+
+    def test_a_product_under_a_power_has_no_total(self):
+        m = self._model()
+        with m:
+            m.e.pay = 1000.0 * 1.03 ** (m.h.op * (mo.time.index - 6))
+        assert self._year(m.e.pay)._value == "#VALUE!"
+
+    def test_a_product_of_schedules_has_no_total(self):
+        # a tariff: a price times a flag of the dates times an indexation,
+        # no stored data in it — a schedule, whose total the author says
+        m = self._model()
+        with m:
+            with m.e as e:
+                e.tariff = 55.0 * mo.IF(mo.time.start >= m.i.cod, 1, 0) * 1.02 ** ((mo.time.index - 1) / 12)
+                e.ruled = 55.0 * m.h.op * m.h.esc
+                e.square = mo.time.index * mo.time.index
+                e.units = mo.Variable([100.0] * 24, regrain=mo.up("sum"))
+                e.revenue = e.units * mo.IF(mo.time.start >= m.i.switch, 55.0, 50.0)
+        for line in ("tariff", "ruled", "square"):
+            assert self._year(getattr(m.e, line))._value == "#VALUE!", line
+        assert self._year(m.e.revenue)._value == [60000.0, 66000.0]
+
+    def test_a_product_with_the_period_s_length_is_a_flow(self):
+        # a tariff a day times an operations flag times the days, interest
+        # on a balance of the dates for the days: amounts for the period
+        m = self._model()
+        with m:
+            with m.e as e:
+                e.revenue = 100.0 * m.h.op * mo.time.days
+                e.bal = mo.recurrence(start=1200.0, formula="{prev} - {a}", a=m.h.op * 50.0
+                                      ).set_regrain(mo.frozen(values="last"))
+                e.interest = e.bal * 0.12 * mo.time.days / 365
+        assert self._year(m.e.revenue)._value == [18400.0, 36500.0]
+        assert not getattr(self._year(m.e.interest), "_regrain_error", None)
+
+    def test_a_number_over_a_line_of_the_dates_has_no_total(self):
+        m = self._model()
+        with m:
+            m.e.per_period = m.i.loan / m.h.left
+        v = self._year(m.e.per_period)
+        assert v._value == "#VALUE!"
+        assert "puts 'left', which depends on" in v._regrain_error
+        assert "through a quotient" in v._regrain_error
+
+    def test_a_condition_s_test_is_read_through_a_product_and_through_data(self):
+        m = self._model()
+        with m:
+            with m.e as e:
+                e.units = mo.Variable([100.0] * 24, regrain=mo.up("sum"))
+                e.installed = mo.Variable([40.0] * 24, regrain=mo.up("mean"))
+                e.online = (e.installed * m.h.op).set_regrain(mo.up("mean"))
+                e.by_op = mo.IF(m.h.op * mo.time.index > 12, 55.0, 50.0)
+                e.by_units = mo.IF(e.units * mo.time.index > 1200, 55.0, 50.0)
+                e.ppa = mo.IF(e.online > 0, 55.0, 50.0)
+        for line in ("by_op", "by_units", "ppa"):
+            assert self._year(getattr(m.e, line))._value == "#VALUE!", line
+        assert "puts 'online', which depends on" in self._year(m.e.ppa)._regrain_error
+
+    def test_a_flow_written_with_product_average_or_a_rule_per_step_keeps_its_total(self):
+        m = self._model()
+        with m:
+            with m.e as e:
+                e.rev = mo.IF(mo.time.start >= m.i.cod, 5000.0, 0.0).set_regrain(mo.up("sum"))
+                e.rev_steps = mo.IF(mo.time.start >= m.i.cod, 5000.0, 0.0).set_regrain(
+                    mo.up({("month", "quarter"): "sum", ("month", "year"): "sum"}))
+                e.tax_product = mo.IF(e.rev > 0, mo.PRODUCT(e.rev, 0.2), 0.0)
+                e.tax_average = mo.IF(e.rev > 0, mo.AVERAGE(e.rev, e.rev) * 0.2, 0.0)
+                e.tax_steps = mo.IF(e.rev_steps > 0, e.rev_steps * 0.2, 0.0)
+        for line in ("tax_product", "tax_average", "tax_steps"):
+            assert self._year(getattr(m.e, line))._value == [6000.0, 12000.0], line
+
+    def test_one_number_summed_from_a_schedule_is_a_number(self):
+        m = self._model()
+        with m:
+            with m.e as e:
+                e.units = mo.Variable([100.0 + k for k in range(24)], regrain=mo.up("sum"))
+                e.ops_months = mo.SUM(m.h.ops)
+                e.big = mo.IF(e.units > e.ops_months, 1, 0)
+        assert self._year(m.e.big)._value == [12, 12]
+
+    def test_a_running_total_of_the_period_s_length_counts_the_periods(self):
+        m = self._model()
+        with m:
+            m.e.price = mo.IF(mo.cumsum(mo.time.days / 365) > 1, 55.0, 50.0)
+        v = self._year(m.e.price)
+        assert v._value == "#VALUE!"
+        assert "a running total built on the period's number, dates or length" in v._regrain_error
+
+    def test_a_running_total_of_arithmetic_on_the_dates_has_no_total(self):
+        m = self._model()
+        with m:
+            m.e.cum_cost = mo.cumsum(1000.0 * 1.01 ** (mo.time.index - 1))
+            m.e.live = mo.cumsum(mo.IF(mo.time.start >= m.i.cod, 1, 0))
+        assert self._year(m.e.cum_cost)._value == "#VALUE!"
+        assert self._year(m.e.live)._value == [6, 18]        # a running count is one
+
+    def test_dates_moved_by_a_condition_are_refused_by_name(self):
+        from modeleon.core.projection import project_line
+
+        m = self._model()
+        with m:
+            with m.e as e:
+                e.pay_date = mo.time.end + mo.IF(mo.time.start >= m.i.switch, 30, 0)
+                e.later = mo.MAX(mo.time.end, m.i.cod)
+        for line in ("pay_date", "later"):
+            with pytest.raises(ValueError, match="the period's number or dates"):
+                project_line(getattr(m.e, line), "year", {}, on_error="raise")
+
+    def test_a_schedule_added_to_a_duration_is_read(self):
+        m = self._model()
+        with m:
+            m.e.price = mo.IF(mo.time.end - mo.time.start + m.h.op * 100 > 50, 55.0, 50.0)
+        assert "puts 'op'" in self._year(m.e.price)._regrain_error
+
+    def test_a_long_chain_of_lines_without_rules_projects_as_deep_as_before(self):
+        # the law adds no frame of its own to the recompute of a chain
+        m = mo.Model("m", default_grain="month", default_start="2026-01", default_periods=24)
+        with m:
+            m.c = mo.MultiVariable("Costs")
+            lines = []
+            for k in range(200):
+                setattr(m.c, f"c{k}", mo.Variable([1.0] * 24, regrain=mo.up("sum")))
+                lines.append(getattr(m.c, f"c{k}"))
+            m.c.total = sum(lines)
+        assert m.at("year").c.total.value == [2400.0, 2400.0]
+
+    def test_the_rules_offered_include_a_ratio(self):
+        m = self._model()
+        with m:
+            m.e.price = mo.IF(mo.time.start >= m.i.switch, 55.0, 50.0)
+        assert "mo.ratio('num', 'den') for a ratio" in self._year(m.e.price)._regrain_error
+
+
+class TestHowAValueAddsUp:
+    """How the law tells a flow from a level when a condition, a product or a
+    quotient meets the period's number or dates: stored data, the period's
+    length, a flow among the factors and the change in a balance make a
+    flow; a 0/1 flag only gates what it multiplies."""
+
+    @staticmethod
+    def _model():
+        m = mo.Model("m", default_grain="month", default_start="2026-01", default_periods=24)
+        with m:
+            m.i = mo.MultiVariable("I")
+            with m.i as i:
+                i.cod = mo.DATE(2026, 7, 1)
+                i.switch = mo.DATE(2027, 1, 1)
+                i.loan = mo.Variable(24000.0)
+            m.h = mo.MultiVariable("Timing")
+            with m.h as h:
+                h.op = mo.IF(mo.time.start >= m.i.cod, 1, 0).set_regrain(mo.up("sum"))
+                h.price = mo.IF(mo.time.start >= m.i.switch, 55.0, 50.0).set_regrain(mo.up("mean"))
+                h.left = (25 - mo.time.index).set_regrain(mo.up("last"))
+            m.e = mo.MultiVariable("E")
+        return m
+
+    @staticmethod
+    def _year(var):
+        from modeleon.core.projection import project_line
+
+        return project_line(var, "year", {}, on_error="absorb")
+
+    @staticmethod
+    def _sums(var):
+        v = var.value
+        return [round(sum(v[:12]), 2), round(sum(v[12:]), 2)]
+
+    def _folds_as_its_sum(self, var):
+        got = self._year(var)
+        assert not getattr(got, "_regrain_error", None), got._regrain_error
+        assert [round(x, 2) for x in got._value] == self._sums(var)
+
+    def test_the_period_s_length_on_a_line_of_its_own_or_counted_makes_an_amount(self):
+        m = self._model()
+        with m:
+            with m.e as e:
+                e.balance = (m.i.loan * (1 - (mo.time.index - 1) / 24)).set_regrain(mo.up("last"))
+                e.year_frac = mo.time.days / 365
+                e.interest = e.balance * m.h.price / 1000 * e.year_frac
+                e.hours = mo.time.days * 24
+                e.gen = (10.0 * e.hours * m.h.op).set_regrain(mo.up("sum"))
+                e.revenue = e.gen * m.h.price
+                e.by_yearfrac = e.balance * m.h.price / 1000 * mo.YEARFRAC(mo.time.start, mo.time.end + 1)
+        for line in (m.e.interest, m.e.revenue, m.e.by_yearfrac):
+            self._folds_as_its_sum(line)
+
+    def test_a_product_with_stored_data_is_a_flow_so_a_tax_below_it_keeps_its_total(self):
+        m = self._model()
+        with m:
+            with m.e as e:
+                e.revenue = mo.Variable([1000.0 + 20 * k for k in range(24)], regrain=mo.up("sum"))
+                e.headcount = mo.Variable([5.0 + k // 6 for k in range(24)], regrain=mo.up("last"))
+                e.payroll = e.headcount * m.h.price
+                e.ebt = e.revenue - e.revenue * 0.4 - e.payroll
+                e.tax = mo.IF(e.ebt > 0, e.ebt * 0.2, 0.0)
+        self._folds_as_its_sum(m.e.payroll)
+        self._folds_as_its_sum(m.e.tax)
+
+    def test_the_change_in_a_balance_is_a_flow(self):
+        m = self._model()
+        with m:
+            with m.e as e:
+                e.ebitda = mo.Variable([5000.0] * 24, regrain=mo.up("sum"))
+                e.capex = mo.IF(mo.time.index == 4, 9000.0, 0.0).set_regrain(mo.up("sum"))
+                e.nwc = mo.Variable([300.0 + 15 * k for k in range(24)], regrain=mo.up("last"))
+                e.fcf = e.ebitda - e.capex - (e.nwc - mo.lag(e.nwc))
+                e.dividend = mo.IF(e.fcf > 0, e.fcf * 0.5, 0.0)
+        self._folds_as_its_sum(m.e.dividend)
+
+    def test_a_typed_list_with_an_input_cell_in_it_is_stored_data(self):
+        m = self._model()
+        with m:
+            with m.e as e:
+                e.launch_units = mo.Variable(130.0)
+                values = [100.0 + 5 * k for k in range(24)]
+                values[3] = e.launch_units
+                e.units = mo.Variable(values, regrain=mo.up("sum"))
+                e.revenue = e.units * m.h.price
+        self._folds_as_its_sum(m.e.revenue)
+
+    def test_a_flag_times_a_level_of_the_dates_is_a_schedule(self):
+        m = self._model()
+        with m:
+            with m.e as e:
+                e.tariff = m.h.op * m.h.price
+                e.tariff_round = mo.ROUND(m.h.op * m.h.price, 2)
+                e.pay = m.h.op * m.i.loan / m.h.left
+                e.gated = mo.IF(mo.time.start >= m.i.switch, m.h.op * 55.0, m.h.op * 50.0)
+        for line in ("tariff", "tariff_round", "pay", "gated"):
+            assert self._year(getattr(m.e, line))._value == "#VALUE!", line
+
+    def test_a_running_total_inside_a_formula_is_read(self):
+        m = self._model()
+        with m:
+            with m.e as e:
+                e.closing = m.i.loan + mo.cumsum(10.0 * mo.time.index)
+                e.cost = mo.cumsum(1000.0 * 1.05 ** mo.MAX(mo.time.index - 12, 0))
+                e.cum_rev = mo.cumsum(m.h.op * m.h.price * 1000.0)
+        assert self._year(m.e.closing)._value == "#VALUE!"
+        assert self._year(m.e.cost)._value == "#VALUE!"
+        v = m.e.cum_rev.value
+        assert self._year(m.e.cum_rev)._value == [v[11], v[23]]      # a running total of its sum

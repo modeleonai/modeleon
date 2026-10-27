@@ -229,7 +229,7 @@ def _text_of(v: Any) -> str:
         return ''
     if isinstance(v, str):
         return v
-    if isinstance(v, bool):
+    if _logical(v):
         return 'TRUE' if v else 'FALSE'
     if isinstance(v, date):
         v = _serial(v)
@@ -318,10 +318,23 @@ def _parse_number(text: str) -> int | float:
     return x / 100 if percent else x
 
 
+def _numpy_scalar(v: Any, kinds: str) -> bool:
+    """A numpy boolean or number, or a 0-d array of one, whose dtype kind
+    is among ``kinds``."""
+    kind = getattr(getattr(v, 'dtype', None), 'kind', None)
+    return getattr(v, 'ndim', None) == 0 and kind is not None and kind in kinds
+
+
+def _logical(v: Any) -> bool:
+    """TRUE or FALSE: Python's boolean, or numpy's, which a comparison over
+    numpy numbers gives."""
+    return isinstance(v, bool) or _numpy_scalar(v, 'b')
+
+
 def _number_of(v: Any) -> int | float:
     """The number the spreadsheet reads an operand as: a blank is 0,
     TRUE 1, a date its serial, a duration its days, numeric text its
-    number."""
+    number, a ``Decimal`` or a numpy value the value it holds."""
     if v is None:
         return 0
     if isinstance(v, bool):
@@ -337,7 +350,13 @@ def _number_of(v: Any) -> int | float:
     if isinstance(v, (int, float)):
         return v
     if isinstance(v, numbers.Real):
-        return float(v)
+        return _number_of(float(v))             # a numpy NaN is #NUM! as a float's is
+    if isinstance(v, decimal.Decimal):
+        if not v.is_finite():
+            raise OverflowError(f"{v!r} is not a number a cell holds")
+        return _number_of(float(v))
+    if _numpy_scalar(v, 'biuf'):
+        return _number_of(v.item())             # a Python bool, int or float
     raise TypeError(f"{v!r} is not a number")
 
 
@@ -439,7 +458,7 @@ def _substitute(text: Any, old_text: Any, new_text: Any, instance_num: Any = Non
 
 
 def _value(text: Any) -> Any:
-    if isinstance(text, bool):
+    if _logical(text):
         return '#VALUE!'
     return _number_of(text)
 
@@ -525,7 +544,7 @@ def _text(value: Any, format_text: Any, warned: set[str]) -> Any:
             v = _parse_number(v)
         except TypeError:
             return v                    # text that is not a number is given back as it is
-    if isinstance(v, bool):
+    if _logical(v):
         return 'TRUE' if v else 'FALSE'
     if not fmt:
         return ''                       # an empty format shows nothing

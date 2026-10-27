@@ -1048,6 +1048,35 @@ def test_a_list_holding_a_total_of_a_loop_row_waits_for_the_loop():
     assert m.x.npv.value == pytest.approx(300.0 / 1.01 + 6.0 / 1.01 ** 2)
 
 
+def _npv_over_a_loop_total(f_unit):
+    m = model(4)
+    with m:
+        m.inp = mo.MultiVariable("Inputs")
+        with m.inp as i:
+            i.rate = mo.Variable(0.01)
+            i.repay = mo.Variable([10.0] * 4, unit="EUR")
+            i.f = mo.Variable(6.0, unit=f_unit)
+        m.x = mo.MultiVariable("X", loop=True)
+        with m.x as x:
+            x.npv = mo.NPV(m.inp.rate, [mo.SUM(x.balance), m.inp.f])
+            x.balance = mo.lag(x.balance, fill=100.0) - m.inp.repay
+    return m
+
+
+def test_a_list_holding_a_total_of_a_loop_row_carries_its_lines_unit():
+    # Read when the loop closes, the list's lines — the total of a row of
+    # the loop, an input — are in one unit, and NPV carries it.
+    m = _npv_over_a_loop_total("EUR")
+    assert str(m.x.npv.unit) == "EUR"
+    assert m.x.npv.value == pytest.approx(300.0 / 1.01 + 6.0 / 1.01 ** 2)
+
+
+def test_a_list_holding_a_total_of_a_loop_row_in_two_units_is_refused():
+    with pytest.raises(ValueError, match=r"x\.npv: mo\.NPV takes its values in one unit; "
+                                         r"the line SUM\(balance\) and 'f' are in EUR and USD"):
+        _npv_over_a_loop_total("USD")
+
+
 def test_a_downstream_recurrence_refuses_two_units_when_the_loop_closes():
     # Run again from its formula when the loop closes, the template is read
     # for units then, and a mix is reported under the row.

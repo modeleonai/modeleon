@@ -7,6 +7,111 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4] — 2026-10-27
+
+### Added
+
+- **`PMT`, `FV` and `PV` run inside a loop container.** A row of a
+  `loop=True` container may call them over the loop's own rows, one call
+  per period, as it already calls `IPMT`, `PPMT`, `NPER` and `RATE`: a
+  payment worked out each month on the balance as it stands,
+  `d.payment = -mo.PMT(rate, months_left, d.open)`, is a live `=-PMT(…)`
+  over that month's cells in each column. A month with no term left is
+  `#NUM!`; guard it on the term, `mo.IF(months_left > 0, -mo.PMT(…), 0)`
+  — paid at the start of a period, the spreadsheet itself can show a
+  meaningless number there, which `IFERROR` would let through. An amount
+  in another unit than the loan (a balloon in EUR) is refused when the
+  loop closes. 0.2.3 refused such a row (`PMT reads a whole series`).
+
+### Changed
+
+- **`model.at(grain)` raises for a line with no re-grain rule whose total
+  turns on the period's number or dates**, and its total cells show
+  `#VALUE!` (see Fixed). A flow switched on by date, which 0.2.3 summed
+  right, now needs `.set_regrain(mo.up('sum'))`, and a level read off the
+  period's dates (the days left to a maturity), which 0.2.3 gave its value
+  at the period's end, `mo.up('last')`.
+
+### Fixed
+
+- **A formula whose total turns on the period's number or dates has no
+  total without a re-grain rule.** A condition on `mo.time.index`, `.start`
+  or `.end` was summed as a flow, so a price of 50 switched by date
+  totalled 600 a year; arithmetic on them was recomputed at the coarser
+  grain, so a payroll grown by `mo.time.index` totalled one month's pay.
+  A formula with no rule of its own now shows `#VALUE!` in its total cells
+  when it does arithmetic on them (`base * 1.01 ** (mo.time.index - 1)`,
+  `k * mo.time.index`, a date stepped by the period's number, a running
+  total of such a formula, also inside a larger formula), multiplies
+  schedules of them (`55 * cod_flag * indexation`, a 0/1 flag times a
+  price of the dates), divides a number, a level or a flagged number by
+  one (`loan / months_left`), or puts them through a condition (`mo.IF`,
+  a comparison, `AND` / `OR` / `NOT`, `CHOOSE`, `MIN` / `MAX`, `ROUND` /
+  `INT` / `MOD` / `ABS`) or a power — directly, or through any line whose
+  value turns on them, stored data in it or not — when the condition
+  yields fixed numbers, a level or a schedule; one that may yield a flow
+  (a tax `mo.IF(revenue > 0, revenue * 0.2, 0)` on a revenue with its
+  rule) is summed as 0.2.3 summed it. A schedule is a line computed from the
+  period's number or dates and fixed numbers alone — a flag of the dates,
+  a counter of the periods, an amount switched on by a date, `1 - flag`,
+  its lag, alias, running total or `.at(...)` — at any distance and
+  whatever its rule. A line that adds, subtracts or scales a refused one
+  (`price * 2`, `k * flag`, `revenue - opex`) is refused too, and names
+  it, until that one has its rule. `model.at(grain)`, which returned those
+  numbers, raises a `ValueError` that names the line, what it reads, and
+  the rule to give: `.set_regrain(mo.up('sum'))` for a flow or a 0/1 flag,
+  `mo.up('mean')` for a level such as a price, `mo.up('last')` for a
+  balance, `mo.ratio('num', 'den')` for a ratio; `to_excel` writes the
+  cells without a warning. Some totals 0.2.3 got right need the rule too:
+  a flow switched on by date or by the period's number (revenue from a
+  launch date, a one-off capex in month 4, a repayment after a grace
+  period, a 0/1 flag whose sum counted its months), a flow guarded by a
+  condition on a balance of the dates (`mo.IF(balance > 0, balance * rate,
+  0)`), and the lines that add, subtract or scale them. A line computed
+  from a level with a number (`capacity * ramp`, with `ramp` re-grained by
+  `'mean'`) totals as a level, and `1 - flag` with the flag summed counts
+  the 1 once, so such a line needs a rule of its own. Still folding
+  without a rule: the period's length (`mo.time.days`, `.months`), a
+  duration on the dates (`end - start`), time arithmetic on the dates
+  (`mo.time.end + 1`), a row that is the time itself (`h.end =
+  mo.time.end`, or its lag), a line already at the grain asked, a ratio of
+  flows (`gross / revenue`, recomputed as `Σgross / Σrevenue`), the
+  change in a balance (`nwc - mo.lag(nwc)`), and a product of two lines
+  one of which is stored data, the period's length or a flow
+  (`customers * price`, `headcount * salary`, `units * mo.IF(…)`,
+  `units * mo.time.index`, `tariff * flag * mo.time.days`, `balance *
+  rate * year_frac` with `year_frac = mo.time.days / 365`, `gen *
+  tariff` with `gen` re-grained by `'sum'`, also inside a `ROUND`, a
+  `MAX` or an `IF`) — so a margin, a tax or a rounded revenue below a
+  price switched by date keep their totals.
+- **`PMT`, `FV` and `PV` give the spreadsheet's results at the edges.**
+  The result is `#NUM!` where the recalculated book shows it: `PMT` over
+  a term of 0, paid at the start of a period at -100%, or at a rate
+  below -100% (the spreadsheet raises `1 + rate` to the term through a
+  logarithm; 0.2.3 gave the annuity over a whole term, `PMT(-1.5, 2,
+  1000)` = -500); `PV` at -100% over a positive term; a fractional term
+  at a rate below -100%; `(1 + rate) ** nper` or the result too large
+  for a cell. An error a cell holds is the result, over scalars as over
+  a series. 0.2.3 raised over scalars (`ZeroDivisionError`,
+  `OverflowError`, a `TypeError` over an error or a complex power) and
+  gave `#DIV/0!` or a complex number in a period. A `type` other than 0
+  reads as 1, as `IPMT` and `PPMT` read it, where 0.2.3 took a type of 2
+  as a multiplier. `PMT` is the payment `IPMT` and `PPMT` split,
+  `(1 + rate) ** nper - 1` taken through `expm1`, so a rate of 1e-12
+  keeps its digits — and an ordinary payment's last digits move, so an
+  identity built on it (`FV` of the payment back to 0) need not come out
+  exact: compare with `ROUND` or a tolerance. `PV` discounts by
+  `(1 + rate) ** -nper`, as the spreadsheet does, so `PV(1, 5000, -10)`
+  is 10 where 0.2.3 overflowed.
+- **A `Decimal` or a numpy value reads as the value it holds** — a numpy
+  boolean, which a comparison over numpy numbers gives, as TRUE or FALSE;
+  a `Decimal` or a 0-d array as its number; a NaN of either as `#NUM!`,
+  as a float's — in `IPMT`, `PPMT`, `NPER`, `RATE`, `SLN`, `EXP`, `LN`,
+  `POWER`, `VALUE`, `TEXT`, `LEFT`'s count and the other functions that
+  read an operand as the spreadsheet does, where 0.2.3 gave `#VALUE!`
+  (and a numpy NaN as `nan`). `PMT`, `FV` and `PV`, which computed it,
+  still do.
+
 ## [0.2.3] — 2026-10-26
 
 ### Added

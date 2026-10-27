@@ -33,7 +33,7 @@ Shapes:
   cells: ``PERCENTILE_INC([a, b, c], k)``.
 - ``'scalar'`` — a plain call over its arguments, written like an
   element-wise one, that a loop container does not run period by period
-  (``PMT``, ``FV``, ``YEARFRAC``).
+  (``YEARFRAC``, ``DAYS``).
 
 A name the workbook stores with a prefix (``_xlfn.`` for the functions
 Excel added after 2007) registers it as ``file_prefix``; a name Excel

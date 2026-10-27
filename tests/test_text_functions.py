@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import logging
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 
+import numpy as np
 import pytest
 
 import modeleon as mo
@@ -673,6 +675,18 @@ class TestTheSharedLaw:
         assert TEXT(mo.Variable(["#REF!", 1.5]), "0.0").value == ["#REF!", "1.5"]
         assert VALUE("#NAME?").value == "#NAME?"
         assert SUBSTITUTE("abc", "b", "#NULL!").value == "#NULL!"
+
+    def test_a_decimal_or_a_numpy_value_reads_as_the_value_it_holds(self):
+        # A comparison over numpy numbers gives numpy's boolean: TRUE or
+        # FALSE, as Python's. A Decimal or a 0-d array is its number, and
+        # a NaN of either is #NUM!, as a float's is.
+        flag = np.float64(0.05) > 0
+        assert VALUE(flag).value == VALUE(True).value == "#VALUE!"
+        assert TEXT(flag, "0.00").value == TEXT(True, "0.00").value == "TRUE"
+        assert LEFT(np.True_, 2).value == LEFT(True, 2).value == "TR"
+        assert TEXT(Decimal("2"), "0.00").value == "2.00"
+        assert LEFT("hello", np.array(2, dtype=np.int8)).value == "he"
+        assert VALUE(Decimal("NaN")).value == VALUE(np.float32("nan")).value == "#NUM!"
 
     def test_text_that_only_starts_with_a_hash_is_text(self):
         assert LEFT("#12", 1).value == "#"

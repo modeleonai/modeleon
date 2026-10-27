@@ -247,8 +247,10 @@ def _resolve_periods(periods, variables: Dict[str, Any]) -> Tuple[int, Optional[
             "recurrence() couldn't determine `periods`: it counts them from a "
             "list-valued Variable among its template inputs (the line it rolls). "
             "A line grown from scalars alone is no recurrence but a formula of "
-            "the period's time, e.g. base * (1 + g) ** (mo.time.index - 1); "
-            "outside a model with a time window, pass periods=N."
+            "the period's time with the rule it totals by, e.g. (base * (1 + g) "
+            "** (mo.time.index - 1)).set_regrain(mo.up('sum')) for a flow, "
+            "mo.up('last') for a balance; outside a model with a time window, "
+            "pass periods=N."
         )
 
     if isinstance(periods, Variable):

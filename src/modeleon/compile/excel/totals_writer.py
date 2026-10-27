@@ -157,6 +157,7 @@ def bucket_cells(
         bucket_refs[kind] = refs_of
 
     out: Dict[str, Dict[str, Any]] = {}
+    position_memo: Dict[Any, Any] = {}
     for vid, refs in _stable(bucket_refs, plan):
         kind = refs["kind"]
         var = native[vid]
@@ -171,7 +172,8 @@ def bucket_cells(
         authored = rule is None and (getattr(var, "_track_role", None) is not None
                                      or getattr(var, "_expr_is_track_specific", False))
         tracked = (None if rule is not None or authored else
-                   _tracked_fold(var, native, kind, *books[kind], bucket_refs[kind]))
+                   _tracked_fold(var, native, kind, *books[kind], bucket_refs[kind],
+                                 position_memo))
         if (rule is None and not authored
                 and _sums_its_months(var, pvar, tracked, plan.buckets[kind], sheet_name)):
             # Computed month by month and summed into the bucket (an IF, a
@@ -438,7 +440,7 @@ def _operands(expr: Any) -> list:
 
 def _tracked_fold(var: Variable, native: Dict[str, Variable], kind: str,
                   merged: Dict[str, Any], sheets: Dict[str, Any],
-                  periodic: Dict[str, list]) -> Any:
+                  periodic: Dict[str, list], position_memo: Dict[Any, Any]) -> Any:
     """How a row of a tracked formula line folds into a bucket, or None.
 
     The line's display row and each track's row (``x__track_actual``) carry
@@ -446,10 +448,11 @@ def _tracked_fold(var: Variable, native: Dict[str, Variable], kind: str,
     their operands' rows on the same track. The formula is projected to
     the bucket with its own cache, so every projected operand is known by
     the line it came from and maps to that line's bucket cells: the
-    display row's, and each track's row's. Returns ``(projected, track,
-    translator)``."""
+    display row's, and each track's row's; what the position law found is
+    shared across the lines (``position_memo``). Returns ``(projected,
+    track, translator)``."""
     from .blend_writer import TRACK_INFIX
-    from ...core.projection import project_variable
+    from ...core.projection import position_cache, project_variable
 
     vid = getattr(var, "id", "") or ""
     track = getattr(var, "_track_role", None)
@@ -468,7 +471,7 @@ def _tracked_fold(var: Variable, native: Dict[str, Variable], kind: str,
     lines = _operands(source._expr)
     if not any(type(getattr(v, "_value", None)).__name__ == "TrackValues" for v in lines):
         return None
-    cache: Dict[int, Any] = {}
+    cache = position_cache(position_memo)
     try:
         projected = project_variable(source, kind, cache)
     except Exception:  # noqa: BLE001 — a projection must never kill the book

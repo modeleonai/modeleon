@@ -79,11 +79,14 @@ OLD_NAMES = OLD_PASSTHROUGH | OLD_ELEMENTWISE
 # Of the range-taking ones, these read whole series and give one number;
 # the others take fixed arguments.
 OLD_REDUCTIONS = {"SUM", "AVERAGE", "MIN", "MAX", "COUNT"}
-# Written as given, without a helper, until they gained one.
-# TEXT and RATE, plain calls before, are one call per period now, so a
-# loop container runs them; COUNT stays a reduction.
+# Written as given, without a helper, until they gained one; COUNT stays
+# a reduction.
 GAINED_A_HELPER = {"COUNT", "TEXT", "RATE"}
-NOW_ELEMENTWISE = {"TEXT", "RATE"}
+# One call per period now, so a loop container runs them: TEXT and RATE,
+# plain calls before, with the helpers they gained; PMT, FV and PV, which
+# already read a series period by period, since a call over one period's
+# numbers gives that period's cell (an error as the result, never a raise).
+NOW_ELEMENTWISE = {"TEXT", "RATE", "PMT", "FV", "PV"}
 
 # The names added since: shape, file prefix, the argument
 # positions written as ranges (None: every list argument).
@@ -291,7 +294,7 @@ class TestTheOldNamesKeepTheirSpecs:
         assert not any(spec(n).bare for n in GAINED_A_HELPER)
         assert all(callable(getattr(functions, n, None)) for n in GAINED_A_HELPER)
         assert spec("COUNT").shape == "reduction"
-        assert {spec(n).shape for n in NOW_ELEMENTWISE} == {"elementwise"}
+        assert {spec(n).shape for n in NOW_ELEMENTWISE & GAINED_A_HELPER} == {"elementwise"}
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -341,7 +344,8 @@ class TestQueries:
         assert spec("SUM").shape == "reduction"
         assert spec("NPV").shape == "range"
         assert spec("IF").shape == "elementwise"
-        assert spec("PMT").shape == "scalar"
+        assert spec("PMT").shape == "elementwise"
+        assert spec("YEARFRAC").shape == "scalar"
         assert is_range_taking("SUM") and is_range_taking("NPV")
         assert not is_range_taking("IF") and not is_range_taking("PMT")
 
@@ -379,7 +383,8 @@ class TestQueries:
         assert admits_in_loop("MAX", 2) and admits_in_loop("MIN", 3)
         assert not admits_in_loop("MAX", 1)
         assert not admits_in_loop("NPV", 2) and not admits_in_loop("SUMPRODUCT", 2)
-        assert not admits_in_loop("PMT", 3) and not admits_in_loop("YEARFRAC", 2)
+        assert admits_in_loop("PMT", 3) and admits_in_loop("PV", 5)
+        assert not admits_in_loop("YEARFRAC", 2)
 
     def test_the_prefix_and_the_excel_name(self):
         assert file_prefix("DAYS") == "_xlfn." and excel_name("DAYS") == "DAYS"
