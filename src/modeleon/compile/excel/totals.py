@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Subtotal columns interleaved with the native periods.
+"""Subtotal columns beside the native periods.
 
 The book form every finance team builds by hand:
 
     Jan   Feb   Mar   (Q1)   Apr … Dec   (Q4)   (year)
 
 ``ExcelView(timeline={'totals': ['quarter', 'year']})`` declares it;
+``'totals_at': 'end'`` stands every total after the last period
+instead, a block per kind, so a line's periods stay one run:
+
+    Jan … Dec   (Q1) … (Q4)   (year)
+
 this module owns the geometry (which physical column each month and
 each bucket lands in) and the CONTENT rule for a bucket cell:
 
@@ -38,14 +43,14 @@ from ...core.time import article, bucket_ranges
 #: meeting (they used to: the native columns were spelled ``'month'``).
 NATIVE = "period"
 
-#: One interleaved column: ``(NATIVE, i)`` / ``('quarter', bi)`` /
+#: One period-area column: ``(NATIVE, i)`` / ``('quarter', bi)`` /
 #: ``('year', bi)`` — in on-sheet order.
 ColKey = Tuple[str, int]
 
 
 @dataclass
 class TotalsPlan:
-    """The interleave for ONE sheet."""
+    """The period and total columns of ONE sheet."""
 
     kinds: Tuple[str, ...]
     n: int                                   # native period count
@@ -74,6 +79,10 @@ class TotalsPlan:
     #: The sheet's own ruler — what its native captions shorten to under
     #: a tier (an hour keeps its clock, "13:00", under its day).
     grain: Optional[str] = None
+    #: Where the total columns stand: ``'between'`` — each after its
+    #: bucket's last period — or ``'end'`` — every period first, then a
+    #: block per kind, the finest first, each in time order.
+    at: str = "between"
 
 
     def native_col(self, i: int) -> int:
@@ -95,8 +104,11 @@ def build_totals_plan(
     n: int,
     base_col: int,
     stride: int = 1,
+    at: str = "between",
 ) -> Optional[TotalsPlan]:
-    """The interleave for a sheet whose periods start at ``base_col``.
+    """The columns of a sheet whose periods start at ``base_col``: each
+    bucket's total after its last period (``at='between'``), or every
+    period first and then a block of totals per kind (``at='end'``).
 
     ``None`` when nothing is to be inserted — totals undeclared, no
     periods, or no declared kind is coarser than the native grain (a
@@ -108,24 +120,36 @@ def build_totals_plan(
     )
     if not usable or n <= 0:
         return None
-    plan = TotalsPlan(kinds=usable, n=n)
+    plan = TotalsPlan(kinds=usable, n=n, at=at)
     for kind in usable:
         plan.buckets[kind] = [
             (label, lo, hi)
             for (label, lo, hi) in bucket_ranges(grain, kind, str(start), n)
         ]
-    # Walk the periods; a bucket column follows its last period —
-    # quarter before year where both close on the same month.
-    ends: Dict[str, Dict[int, int]] = {
-        kind: {hi: bi for bi, (_l, _lo, hi) in enumerate(plan.buckets[kind])}
-        for kind in usable
-    }
-    for i in range(n):
-        plan.columns.append((NATIVE, i))
-        for kind in usable:
-            bi = ends[kind].get(i + 1)
-            if bi is not None:
-                plan.columns.append((kind, bi))
+    # The kinds finest first, whatever order they were declared in: a
+    # quarter's total before its year's (declared year-first, the year's
+    # total stood inside Q4's span and their header cells overlapped),
+    # the quarter block before the year block.
+    fine_first = sorted(usable, key=GREGORIAN.rank)
+    if at == "end":
+        # Every period first, so a line's periods are one run; then a
+        # block per kind, each in time order.
+        plan.columns = [(NATIVE, i) for i in range(n)] + [
+            (kind, bi) for kind in fine_first for bi in range(len(plan.buckets[kind]))
+        ]
+    else:
+        # Walk the periods; a bucket column follows its last period —
+        # quarter before year where both close on the same month.
+        ends: Dict[str, Dict[int, int]] = {
+            kind: {hi: bi for bi, (_l, _lo, hi) in enumerate(plan.buckets[kind])}
+            for kind in usable
+        }
+        for i in range(n):
+            plan.columns.append((NATIVE, i))
+            for kind in fine_first:
+                bi = ends[kind].get(i + 1)
+                if bi is not None:
+                    plan.columns.append((kind, bi))
     for offset, key in enumerate(plan.columns):
         plan.col_of[key] = base_col + offset * stride
     plan.depth = 1 + len(usable)
@@ -366,7 +390,10 @@ def header_rows(
     span carrying its own name ("Total Q1") from the bucket's OWN tier
     down through the month row. A quarter's total is a quarter-level
     number, so it starts where "Q1" starts; the year's starts where
-    "2026" does. Plain data, not openpyxl calls: the .xlsx writer
+    "2026" does. With every total after the last period (``plan.at ==
+    'end'``) a bucket's span covers its own periods only, and a total,
+    with no tier above it to say its year, carries its full name:
+    "Total Q1 2026". Plain data, not openpyxl calls: the .xlsx writer
     paints and merges it, and any other renderer can draw the same
     header from it.
     """
@@ -386,12 +413,17 @@ def header_rows(
         cells = []
         for bi, (blabel, lo, hi) in enumerate(plan.buckets[kind]):
             first = plan.col_of[(NATIVE, lo)]
-            # …up to but NOT including its own total column: that one
-            # carries the bucket's "Total" label, starting on this very
-            # row. Swallowing it left the label nowhere to go but the
-            # month row, one tier below the thing it totals. The total
-            # is a GROUP too, so "before it" means one full stride.
-            last = plan.col_of[(kind, bi)] - 1
+            if plan.at == "end":
+                # Its own periods, up to the column that follows the last
+                # of them: the next period, or the first total.
+                last = plan.col_of[plan.columns[hi]] - 1
+            else:
+                # …up to but NOT including its own total column: that one
+                # carries the bucket's "Total" label, starting on this very
+                # row. Swallowing it left the label nowhere to go but the
+                # month row, one tier below the thing it totals. The total
+                # is a GROUP too, so "before it" means one full stride.
+                last = plan.col_of[(kind, bi)] - 1
             if last < first:
                 continue
             cells.append({
@@ -428,14 +460,14 @@ def header_rows(
         rowspan = month_row - label_row + 1
         target = next(r for r in rows if r["row"] == label_row)
         for bi, (blabel, _lo, _hi) in enumerate(plan.buckets[kind]):
+            # At the end no tier stands over a total to say its year.
+            name = (display_label(blabel, kind, plan.style) if plan.at == "end"
+                    else short_label(blabel, kind, plan.style, tiered(kind)))
             target["cells"].append({
                 "col": plan.col_of[(kind, bi)],
                 "colspan": plan.stride,
                 "rowspan": rowspan,
-                "label": (
-                    f"{plan.totals_word} "
-                    f"{short_label(blabel, kind, plan.style, tiered(kind))}"
-                ),
+                "label": f"{plan.totals_word} {name}",
                 "kind": kind,
             })
         target["cells"].sort(key=lambda c: c["col"])

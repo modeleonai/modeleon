@@ -268,8 +268,8 @@ def _fit_time(name: str, var: Any, window: Any, home: Any) -> None:
             t._start, t._grain = window.start, window.grain
             t._first_day = first_day
             # Its window moved: a formula placed over it is placed again.
-            from .variable_ops import _windows_changed
-            _windows_changed()
+            from .variable_ops import _windows_moved
+            _windows_moved()
             continue
         def _from(start: Any, first: Any) -> str:
             return first.isoformat() if first is not None else str(start)
@@ -561,6 +561,8 @@ def _transplant(target: Any, component: Any) -> None:
     # The formulas placed through ``target`` while it had no window: they
     # are placed again when the row it becomes is adopted.
     readers = target.__dict__.get('_placed_through')
+    # A range read from ``target`` reads the new definition again.
+    watched = target.__dict__.get('_watched')
     state = dict(component.__dict__)
     if isinstance(state.get('_value'), list):
         # Its own list: an alias must not share the source row's values.
@@ -575,6 +577,13 @@ def _transplant(target: Any, component: Any) -> None:
         if own:
             readers.extend(own)
         target.__dict__['_placed_through'] = readers
+    # The ranges read from ``target`` stay its own (those read from
+    # ``component`` are that object's), and read it again.
+    target.__dict__.pop('_watched', None)
+    if watched:
+        from .variable_ops import _line_written
+        target.__dict__['_watched'] = watched
+        _line_written(target)
 
 
 def _become_forward(placeholder: Any, component: Any) -> Any:
@@ -943,9 +952,14 @@ class _MVLifecycle:
             existing._qualified_id = None
             existing._python_name = None
         # Its lines leave the window they ran on: a formula placed
-        # through them is placed again (``variable_ops``).
-        from .variable_ops import _windows_changed
-        _windows_changed()
+        # through them is placed again (``variable_ops``). A container's
+        # lines move with it, so a range over them is read again too; a
+        # line a range reads announces its own detach as a write.
+        from .variable_ops import _windows_changed, _windows_moved
+        if isinstance(existing, MultiVariableBase):
+            _windows_moved()
+        else:
+            _windows_changed()
         self.__dict__.pop(name, None)
         if name in self._component_names:
             self._component_names.remove(name)

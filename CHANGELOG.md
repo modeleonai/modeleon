@@ -7,6 +7,104 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5] — 2026-10-29
+
+### Added
+
+- **Total columns after the last period.** `timeline={'totals':
+  ['quarter', 'year'], 'totals_at': 'end'}` stands every total column
+  after the last period — the periods, then a block per kind, the finest
+  first (Jan … Dec 2027, Total Q1 2026 … Total Q4 2027, Total 2026, Total
+  2027), each total carrying its full name — so a line's periods stay one
+  run, and a function that reads a whole row as one range (`MATCH`,
+  `INDEX`, `XLOOKUP`, `LARGE`, `RANK`, a percentile, `MAXIFS`) stays a
+  live formula there. `'between'`, the form 0.2.4 writes, is the default;
+  a nearer view says it to take an inherited `'end'` back. Any other word
+  is refused by name.
+
+### Changed
+
+- **Metric columns speak the model's language.** In a compare layout the
+  deviation, its percent, the share and the year-on-year columns are
+  captioned by the model's own track names: tracks named in Cyrillic
+  («план», «факт») read «откл», «откл %», «уд. вес», «% роста»; any other
+  model reads Var, Var %, Share, % of PY — whichever spelling selected
+  the column (0.2.4 captioned a column the way its selection was
+  spelled, so an English model asked for «откл» got «откл»). The
+  year-on-year column, this period over the same one a year earlier, is
+  "% of PY" where 0.2.4 wrote "Growth %": 132% of last year, not 132%
+  growth.
+
+- **A row read across total columns is written as its runs.** With total
+  columns between the periods, a function that reads several references
+  — `SUM`, `AVERAGE`, `MIN`, `MAX`, `COUNT`, `COUNTA`, `PRODUCT`, `MEDIAN`,
+  the spreads, `NPV` — takes one argument per run of the row's cells
+  (`=SUM(Data!C5:E5, Data!G5:I5, …)`), where 0.2.4 listed every cell
+  (`SUM`, `MIN`, `MAX`, `AVERAGE`, `COUNT`, `COUNTA`, `NPV`) or wrote the
+  number (`PRODUCT`, `MEDIAN`, the spreads); `COUNTIF`, `COUNTIFS`, `SUMIF`
+  and `SUMIFS` are one call per run, summed, `AVERAGEIF` and `AVERAGEIFS`
+  the ratio of those sums over the numeric cells matched, and `SUM(a *
+  b)` a `SUMPRODUCT` per run — all live where 0.2.4 wrote the number; a
+  running total inside a formula, which 0.2.4 listed cell by cell, is
+  written as runs too. A row sliced or rolled across a total, a window
+  stepping over periods (`row[0:24:2]`, in any book), and a row of a
+  compare layout (its periods a group apart) follow the same rule. A
+  call that would take more than 255 arguments or 8,192 characters
+  carries the cell's value, and `check_compat` says which limit — a
+  stepped window 0.2.4 listed past 255 cells carries its value now. A
+  reader of one ordered range — `MATCH`, `INDEX`, `XLOOKUP`, `VLOOKUP`,
+  `HLOOKUP`, `LARGE`, `SMALL`, a percentile or quartile, `RANK`, `MAXIFS`,
+  `MINIFS`, `IRR`, `XIRR`, `XNPV`, a block of rows — still carries its
+  value in such a book, and `check_compat` now names the call (a block
+  of rows, the rows read) and the way out: the total columns after the
+  last period (`'totals_at': 'end'`), or, for an `INDEX` of one period
+  by number or of the last by `COUNT`, that period by position
+  (`line[2]`, `line[-1]`); a cell that is not one run for another reason
+  says so.
+- **Total columns walk the kinds finest first.** Declared coarse first
+  (`['year', 'quarter']`), the year's total now stands after Q4's, as a
+  fine-first declaration stands it; 0.2.4 stood it before, and the header
+  cells over it overlapped.
+
+### Fixed
+
+- **A header row's totals.** The rows a workbook repeats at the top of
+  each sheet (`default_header`) carry their bucket cells — a year total
+  over quarters — as the bucket cell of the row they repeat
+  (`=Timing!F7`; `=F7` on the anchor's own sheet), in the row's number
+  format. They were empty, so a book viewed by its totals alone showed
+  blank header rows. A row whose own sheet draws no such total gives
+  the value instead.
+- **A total column's formula reads the months, not the totals.** A
+  formula line that reads a whole row (`c / mo.MAX(c)`, `mo.COUNTIF(c,
+  '>50')`) had its year cell read the year totals (`=N3 / MAX(N3, AA3)`),
+  a number `model.at('year')` never gives; it reads the months now
+  (`=N3 / MAX(B3:M3, O3:Z3)`), on a tracked line too, and a total cell no
+  formula can stand for carries the total's value.
+- **Calls per record over the same lines share one range.** A call per
+  record over a table's lines — the rank of each record among its peers,
+  a `SUMIFS`, a `MATCH`, a median — depends on the range as one dependency
+  instead of on each peer; its source text lists the peers in one text,
+  written once per read of the range and shared by every call over it;
+  and before each call the range is read again only when one of its lines
+  was written to (a write reads again just the ranges read from that
+  line) or a window moved, instead of reading every line again. A rank
+  per record over 10,000 records builds in about 2 seconds instead of 42,
+  a `SUMIFS` per record over 50 groups in about 4.5 instead of 115, each
+  in about 100 MB instead of 3 to 4 GB, and assigning the calls again one
+  by one reads no range again. What a call works out can still read many
+  peers each time: a statistic over tracked lines is worked out again in
+  every call, and a criteria or lookup value that many records share is
+  matched against each of those records in every call. A range read again
+  after a window moved, or after a formula among its lines was placed
+  anew, gives what a fresh call gives. A statistic over a list holding a
+  tracked line reads its lines as the same call over them one by one does
+  — by date and key by key, refusing what that call refuses (a line
+  reaching past the window or short of it, another grain, keys beside
+  periods) — where 0.2.4 paired lines of one length by position, repeated
+  a line of one period in every period, and refused lines of other
+  lengths. `dependencies` still lists every line a call reads.
+
 ## [0.2.4] — 2026-10-27
 
 ### Added

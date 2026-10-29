@@ -1331,24 +1331,33 @@ class TestExcelViewTracksParam:
 
     def test_older_metric_spellings_still_select_their_columns(self):
         # "откл" and "уд.вес" are the older spellings of var and share,
-        # still accepted, and a column is captioned the way it was
-        # spelled. The non-Latin text is deliberate: it is the
-        # compatibility surface under test.
+        # still accepted; a column is captioned in the MODEL's language,
+        # whichever spelling selected it: English for tracks named in
+        # Latin, Russian for tracks named in Cyrillic. The non-Latin
+        # text is deliberate: it is the compatibility surface under test.
         old, old_values = self._metrics_book(['откл', 'уд.вес'])
         new, new_values = self._metrics_book(['var', 'share'])
-        assert [old.cell(2, c).value for c in range(2, 6)] == [
-            'plan', 'actual', 'откл', 'уд. вес',
-        ]
-        assert [new.cell(2, c).value for c in range(2, 6)] == [
-            'plan', 'actual', 'Var', 'Share',
-        ]
-        # The same metrics under either caption: the same live cells.
+        for ws in (old, new):
+            assert [ws.cell(2, c).value for c in range(2, 6)] == [
+                'plan', 'actual', 'Var', 'Share',
+            ]
+        # The same metrics in either spelling: the same live cells.
         assert old.cell(3, 4).value == '=C3 - B3'
         assert old.cell(3, 5).value == '=B3 / B5'
         for c in (4, 5, 8, 9):
             assert old.cell(3, c).value == new.cell(3, c).value
-        assert old_values['A · откл'] == new_values['A · Var'] == [2.0, -2.0]
-        assert old_values['A · уд. вес'] == new_values['A · Share'] == [0.25, 0.5]
+        assert old_values['A · Var'] == new_values['A · Var'] == [2.0, -2.0]
+        assert old_values['A · Share'] == new_values['A · Share'] == [0.25, 0.5]
+
+    def test_metric_captions_follow_tracks_named_in_cyrillic(self):
+        # A model whose tracks are named in Cyrillic reads its metric
+        # columns in Russian, whichever spelling selected them.
+        for metrics in (['var', 'share'], ['откл', 'уд.вес']):
+            ws, values = self._metrics_book(metrics, plan='план')
+            assert [ws.cell(2, c).value for c in range(2, 6)] == [
+                'план', 'actual', 'откл', 'уд. вес',
+            ]
+            assert values['A · откл'] == [2.0, -2.0]
 
     def test_share_measures_against_total_in_either_spelling(self):
         # A share's denominator is the section's line named "total" —
@@ -1369,15 +1378,15 @@ class TestExcelViewTracksParam:
         # The deviation subtracts the track named "plan" — or "план",
         # the older spelling (the non-Latin name is deliberate). The
         # plan is declared FIRST, so a positional rule would get the
-        # sign backwards.
-        for plan in ('plan', 'план'):
+        # sign backwards. The caption is the model's language.
+        for plan, var in (('plan', 'Var'), ('план', 'откл')):
             ws, values = self._metrics_book(['var'], plan=plan)
             assert [ws.cell(2, c).value for c in range(2, 5)] == [
-                plan, 'actual', 'Var',
+                plan, 'actual', var,
             ]
             assert ws.cell(3, 4).value == '=C3 - B3'
-            assert values['A · Var'] == [2.0, -2.0]
-            assert values['B · Var'] == [-2.0, 2.0]
+            assert values[f'A · {var}'] == [2.0, -2.0]
+            assert values[f'B · {var}'] == [-2.0, 2.0]
 
     def test_vocabularies(self):
         with pytest.raises(ValueError, match="blend"):

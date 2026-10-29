@@ -3055,14 +3055,14 @@
 ],
 [
 [
-"year",
+"quarter",
 0
 ],
 8
 ],
 [
 [
-"quarter",
+"year",
 0
 ],
 9
@@ -3090,11 +3090,11 @@
 4
 ],
 [
-"year",
+"quarter",
 0
 ],
 [
-"quarter",
+"year",
 0
 ]
 ],
@@ -3104,12 +3104,12 @@
 "cells": [
 {
 "col": 3,
-"colspan": 5,
+"colspan": 6,
 "kind": "year",
 "label": "2024"
 },
 {
-"col": 8,
+"col": 9,
 "colspan": 1,
 "kind": "year",
 "label": "Total 2024",
@@ -3122,12 +3122,12 @@
 "cells": [
 {
 "col": 3,
-"colspan": 6,
+"colspan": 5,
 "kind": "quarter",
 "label": "Q1"
 },
 {
-"col": 9,
+"col": 8,
 "colspan": 1,
 "kind": "quarter",
 "label": "Total Q1",
@@ -14515,14 +14515,14 @@
 ],
 [
 [
-"year",
+"quarter",
 0
 ],
 10
 ],
 [
 [
-"quarter",
+"year",
 0
 ],
 11
@@ -14914,14 +14914,14 @@
 ],
 [
 [
-"year",
+"quarter",
 1
 ],
 67
 ],
 [
 [
-"quarter",
+"year",
 1
 ],
 68
@@ -14957,11 +14957,11 @@
 6
 ],
 [
-"year",
+"quarter",
 0
 ],
 [
-"quarter",
+"year",
 0
 ],
 [
@@ -15185,11 +15185,11 @@
 61
 ],
 [
-"year",
+"quarter",
 1
 ],
 [
-"quarter",
+"year",
 1
 ]
 ],
@@ -17402,14 +17402,14 @@
 ],
 [
 [
-"year",
+"quarter",
 0
 ],
 4
 ],
 [
 [
-"quarter",
+"year",
 0
 ],
 5
@@ -17421,11 +17421,11 @@
 0
 ],
 [
-"year",
+"quarter",
 0
 ],
 [
-"quarter",
+"year",
 0
 ]
 ],
@@ -17435,12 +17435,12 @@
 "cells": [
 {
 "col": 3,
-"colspan": 1,
+"colspan": 2,
 "kind": "year",
 "label": "2026"
 },
 {
-"col": 4,
+"col": 5,
 "colspan": 1,
 "kind": "year",
 "label": "Total 2026",
@@ -17453,12 +17453,12 @@
 "cells": [
 {
 "col": 3,
-"colspan": 2,
+"colspan": 1,
 "kind": "quarter",
 "label": "Q1"
 },
 {
-"col": 5,
+"col": 4,
 "colspan": 1,
 "kind": "quarter",
 "label": "Total Q1",
@@ -25088,14 +25088,14 @@
 ],
 [
 [
-"year",
+"quarter",
 0
 ],
 43
 ],
 [
 [
-"quarter",
+"year",
 0
 ],
 44
@@ -25263,11 +25263,11 @@
 39
 ],
 [
-"year",
+"quarter",
 0
 ],
 [
-"quarter",
+"year",
 0
 ]
 ],
@@ -28170,15 +28170,15 @@
 ],
 [
 [
-"year",
-0
+"quarter",
+1
 ],
 8
 ],
 [
 [
-"quarter",
-1
+"year",
+0
 ],
 9
 ]
@@ -28205,12 +28205,12 @@
 3
 ],
 [
-"year",
-0
-],
-[
 "quarter",
 1
+],
+[
+"year",
+0
 ]
 ],
 "depth": 3,
@@ -28219,12 +28219,12 @@
 "cells": [
 {
 "col": 3,
-"colspan": 5,
+"colspan": 6,
 "kind": "year",
 "label": "2026"
 },
 {
-"col": 8,
+"col": 9,
 "colspan": 1,
 "kind": "year",
 "label": "Total 2026",
@@ -28250,12 +28250,12 @@
 },
 {
 "col": 6,
-"colspan": 3,
+"colspan": 2,
 "kind": "quarter",
 "label": "Q2"
 },
 {
-"col": 9,
+"col": 8,
 "colspan": 1,
 "kind": "quarter",
 "label": "Total Q2",
@@ -30584,15 +30584,15 @@
 ],
 [
 [
-"month",
-0
+"day",
+1
 ],
 29
 ],
 [
 [
-"day",
-1
+"month",
+0
 ],
 30
 ],
@@ -30605,15 +30605,15 @@
 ],
 [
 [
-"month",
-1
+"day",
+2
 ],
 32
 ],
 [
 [
-"day",
-2
+"month",
+1
 ],
 33
 ],
@@ -30731,24 +30731,24 @@
 24
 ],
 [
-"month",
-0
-],
-[
 "day",
 1
+],
+[
+"month",
+0
 ],
 [
 "period",
 25
 ],
 [
-"month",
-1
-],
-[
 "day",
 2
+],
+[
+"month",
+1
 ],
 [
 "year",
@@ -33926,14 +33926,14 @@
 ],
 [
 [
-"year",
+"quarter",
 0
 ],
 29
 ],
 [
 [
-"quarter",
+"year",
 0
 ],
 30
@@ -34045,11 +34045,11 @@
 25
 ],
 [
-"year",
+"quarter",
 0
 ],
 [
-"quarter",
+"year",
 0
 ]
 ],
@@ -35575,14 +35575,14 @@
 ],
 [
 [
-"month",
+"day",
 0
 ],
 5
 ],
 [
 [
-"day",
+"month",
 0
 ],
 6
@@ -35617,14 +35617,14 @@
 ],
 [
 [
-"month",
+"day",
 1
 ],
 11
 ],
 [
 [
-"day",
+"month",
 1
 ],
 12
@@ -35647,11 +35647,11 @@
 1
 ],
 [
-"month",
+"day",
 0
 ],
 [
-"day",
+"month",
 0
 ],
 [
@@ -35671,11 +35671,11 @@
 4
 ],
 [
-"month",
+"day",
 1
 ],
 [
-"day",
+"month",
 1
 ],
 [
@@ -35720,12 +35720,12 @@
 "cells": [
 {
 "col": 3,
-"colspan": 2,
+"colspan": 3,
 "kind": "month",
 "label": "Dec"
 },
 {
-"col": 5,
+"col": 6,
 "colspan": 1,
 "kind": "month",
 "label": "Total Dec",
@@ -35733,12 +35733,12 @@
 },
 {
 "col": 8,
-"colspan": 3,
+"colspan": 4,
 "kind": "month",
 "label": "Jan"
 },
 {
-"col": 11,
+"col": 12,
 "colspan": 1,
 "kind": "month",
 "label": "Total Jan",
@@ -35751,12 +35751,12 @@
 "cells": [
 {
 "col": 3,
-"colspan": 3,
+"colspan": 2,
 "kind": "day",
 "label": "31"
 },
 {
-"col": 6,
+"col": 5,
 "colspan": 1,
 "kind": "day",
 "label": "Total 31",
@@ -35764,12 +35764,12 @@
 },
 {
 "col": 8,
-"colspan": 4,
+"colspan": 3,
 "kind": "day",
 "label": "01"
 },
 {
-"col": 12,
+"col": 11,
 "colspan": 1,
 "kind": "day",
 "label": "Total 01",
@@ -37533,14 +37533,14 @@
 ],
 [
 [
-"year",
+"quarter",
 0
 ],
 5
 ],
 [
 [
-"quarter",
+"year",
 0
 ],
 6
@@ -37568,14 +37568,14 @@
 ],
 [
 [
-"year",
+"quarter",
 1
 ],
 10
 ],
 [
 [
-"quarter",
+"year",
 1
 ],
 11
@@ -37591,11 +37591,11 @@
 1
 ],
 [
-"year",
+"quarter",
 0
 ],
 [
-"quarter",
+"year",
 0
 ],
 [
@@ -37611,11 +37611,11 @@
 4
 ],
 [
-"year",
+"quarter",
 1
 ],
 [
-"quarter",
+"year",
 1
 ]
 ],
@@ -37625,12 +37625,12 @@
 "cells": [
 {
 "col": 3,
-"colspan": 2,
+"colspan": 3,
 "kind": "year",
 "label": "2025"
 },
 {
-"col": 5,
+"col": 6,
 "colspan": 1,
 "kind": "year",
 "label": "Total 2025",
@@ -37638,12 +37638,12 @@
 },
 {
 "col": 7,
-"colspan": 3,
+"colspan": 4,
 "kind": "year",
 "label": "2026"
 },
 {
-"col": 10,
+"col": 11,
 "colspan": 1,
 "kind": "year",
 "label": "Total 2026",
@@ -37656,12 +37656,12 @@
 "cells": [
 {
 "col": 3,
-"colspan": 3,
+"colspan": 2,
 "kind": "quarter",
 "label": "Q4"
 },
 {
-"col": 6,
+"col": 5,
 "colspan": 1,
 "kind": "quarter",
 "label": "Total Q4",
@@ -37669,12 +37669,12 @@
 },
 {
 "col": 7,
-"colspan": 4,
+"colspan": 3,
 "kind": "quarter",
 "label": "Q1"
 },
 {
-"col": 11,
+"col": 10,
 "colspan": 1,
 "kind": "quarter",
 "label": "Total Q1",
@@ -39038,14 +39038,14 @@
 ],
 [
 [
-"month",
+"day",
 0
 ],
 5
 ],
 [
 [
-"day",
+"month",
 0
 ],
 6
@@ -39073,14 +39073,14 @@
 ],
 [
 [
-"month",
+"day",
 1
 ],
 10
 ],
 [
 [
-"day",
+"month",
 1
 ],
 11
@@ -39103,11 +39103,11 @@
 1
 ],
 [
-"month",
+"day",
 0
 ],
 [
-"day",
+"month",
 0
 ],
 [
@@ -39123,11 +39123,11 @@
 4
 ],
 [
-"month",
+"day",
 1
 ],
 [
-"day",
+"month",
 1
 ],
 [
@@ -39159,12 +39159,12 @@
 "cells": [
 {
 "col": 3,
-"colspan": 2,
+"colspan": 3,
 "kind": "month",
 "label": "Jan"
 },
 {
-"col": 5,
+"col": 6,
 "colspan": 1,
 "kind": "month",
 "label": "Total Jan",
@@ -39172,12 +39172,12 @@
 },
 {
 "col": 7,
-"colspan": 3,
+"colspan": 4,
 "kind": "month",
 "label": "Feb"
 },
 {
-"col": 10,
+"col": 11,
 "colspan": 1,
 "kind": "month",
 "label": "Total Feb",
@@ -39190,12 +39190,12 @@
 "cells": [
 {
 "col": 3,
-"colspan": 3,
+"colspan": 2,
 "kind": "day",
 "label": "31"
 },
 {
-"col": 6,
+"col": 5,
 "colspan": 1,
 "kind": "day",
 "label": "Total 31",
@@ -39203,12 +39203,12 @@
 },
 {
 "col": 7,
-"colspan": 4,
+"colspan": 3,
 "kind": "day",
 "label": "01"
 },
 {
-"col": 11,
+"col": 10,
 "colspan": 1,
 "kind": "day",
 "label": "Total 01",
@@ -40780,14 +40780,14 @@
 ],
 [
 [
-"year",
+"quarter",
 0
 ],
 8
 ],
 [
 [
-"quarter",
+"year",
 0
 ],
 9
@@ -40815,11 +40815,11 @@
 4
 ],
 [
-"year",
+"quarter",
 0
 ],
 [
-"quarter",
+"year",
 0
 ]
 ],
@@ -40829,12 +40829,12 @@
 "cells": [
 {
 "col": 3,
-"colspan": 5,
+"colspan": 6,
 "kind": "year",
 "label": "2026"
 },
 {
-"col": 8,
+"col": 9,
 "colspan": 1,
 "kind": "year",
 "label": "Total 2026",
@@ -40847,12 +40847,12 @@
 "cells": [
 {
 "col": 3,
-"colspan": 6,
+"colspan": 5,
 "kind": "quarter",
 "label": "Q1"
 },
 {
-"col": 9,
+"col": 8,
 "colspan": 1,
 "kind": "quarter",
 "label": "Total Q1",
@@ -41898,14 +41898,14 @@
 ],
 [
 [
-"month",
+"day",
 0
 ],
 6
 ],
 [
 [
-"day",
+"month",
 0
 ],
 7
@@ -41932,11 +41932,11 @@
 2
 ],
 [
-"month",
+"day",
 0
 ],
 [
-"day",
+"month",
 0
 ],
 [
@@ -41968,12 +41968,12 @@
 "cells": [
 {
 "col": 3,
-"colspan": 3,
+"colspan": 4,
 "kind": "month",
 "label": "Mar"
 },
 {
-"col": 6,
+"col": 7,
 "colspan": 1,
 "kind": "month",
 "label": "Total Mar",
@@ -41986,12 +41986,12 @@
 "cells": [
 {
 "col": 3,
-"colspan": 4,
+"colspan": 3,
 "kind": "day",
 "label": "29"
 },
 {
-"col": 7,
+"col": 6,
 "colspan": 1,
 "kind": "day",
 "label": "Total 29",
@@ -43173,14 +43173,14 @@
 ],
 [
 [
-"year",
+"quarter",
 0
 ],
 6
 ],
 [
 [
-"quarter",
+"year",
 0
 ],
 7
@@ -43200,11 +43200,11 @@
 2
 ],
 [
-"year",
+"quarter",
 0
 ],
 [
-"quarter",
+"year",
 0
 ]
 ],
@@ -43214,12 +43214,12 @@
 "cells": [
 {
 "col": 3,
-"colspan": 3,
+"colspan": 4,
 "kind": "year",
 "label": "2026"
 },
 {
-"col": 6,
+"col": 7,
 "colspan": 1,
 "kind": "year",
 "label": "Total 2026",
@@ -43232,12 +43232,12 @@
 "cells": [
 {
 "col": 3,
-"colspan": 4,
+"colspan": 3,
 "kind": "quarter",
 "label": "Q1"
 },
 {
-"col": 7,
+"col": 6,
 "colspan": 1,
 "kind": "quarter",
 "label": "Total Q1",
@@ -45270,14 +45270,14 @@
 ],
 [
 [
-"month",
+"day",
 0
 ],
 27
 ],
 [
 [
-"day",
+"month",
 0
 ],
 28
@@ -45388,11 +45388,11 @@
 23
 ],
 [
-"month",
+"day",
 0
 ],
 [
-"day",
+"month",
 0
 ],
 [
@@ -48327,14 +48327,14 @@
 ],
 [
 [
-"year",
+"quarter",
 0
 ],
 27
 ],
 [
 [
-"quarter",
+"year",
 0
 ],
 28
@@ -48438,11 +48438,11 @@
 23
 ],
 [
-"year",
+"quarter",
 0
 ],
 [
-"quarter",
+"year",
 0
 ]
 ],
@@ -49457,14 +49457,14 @@
 ],
 [
 [
-"month",
+"day",
 0
 ],
 4
 ],
 [
 [
-"day",
+"month",
 0
 ],
 5
@@ -49483,11 +49483,11 @@
 0
 ],
 [
-"month",
+"day",
 0
 ],
 [
-"day",
+"month",
 0
 ],
 [
@@ -49519,12 +49519,12 @@
 "cells": [
 {
 "col": 3,
-"colspan": 1,
+"colspan": 2,
 "kind": "month",
 "label": "Oct"
 },
 {
-"col": 4,
+"col": 5,
 "colspan": 1,
 "kind": "month",
 "label": "Total Oct",
@@ -49537,12 +49537,12 @@
 "cells": [
 {
 "col": 3,
-"colspan": 2,
+"colspan": 1,
 "kind": "day",
 "label": "21"
 },
 {
-"col": 5,
+"col": 4,
 "colspan": 1,
 "kind": "day",
 "label": "Total 21",
@@ -50392,14 +50392,14 @@
 ],
 [
 [
-"year",
+"quarter",
 0
 ],
 4
 ],
 [
 [
-"quarter",
+"year",
 0
 ],
 5
@@ -50411,11 +50411,11 @@
 0
 ],
 [
-"year",
+"quarter",
 0
 ],
 [
-"quarter",
+"year",
 0
 ]
 ],
@@ -50425,12 +50425,12 @@
 "cells": [
 {
 "col": 3,
-"colspan": 1,
+"colspan": 2,
 "kind": "year",
 "label": "2026"
 },
 {
-"col": 4,
+"col": 5,
 "colspan": 1,
 "kind": "year",
 "label": "Total 2026",
@@ -50443,12 +50443,12 @@
 "cells": [
 {
 "col": 3,
-"colspan": 2,
+"colspan": 1,
 "kind": "quarter",
 "label": "Q4"
 },
 {
-"col": 5,
+"col": 4,
 "colspan": 1,
 "kind": "quarter",
 "label": "Total Q4",
@@ -52925,15 +52925,15 @@
 ],
 [
 [
-"month",
-0
+"day",
+2
 ],
 35
 ],
 [
 [
-"day",
-2
+"month",
+0
 ],
 36
 ],
@@ -53075,12 +53075,12 @@
 29
 ],
 [
-"month",
-0
-],
-[
 "day",
 2
+],
+[
+"month",
+0
 ],
 [
 "year",
@@ -56650,14 +56650,14 @@
 ],
 [
 [
-"year",
+"quarter",
 0
 ],
 33
 ],
 [
 [
-"quarter",
+"year",
 0
 ],
 34
@@ -56785,11 +56785,11 @@
 29
 ],
 [
-"year",
+"quarter",
 0
 ],
 [
-"quarter",
+"year",
 0
 ]
 ],
@@ -58088,14 +58088,14 @@
 ],
 [
 [
-"year",
+"quarter",
 0
 ],
 4
 ],
 [
 [
-"quarter",
+"year",
 0
 ],
 5
@@ -58107,11 +58107,11 @@
 0
 ],
 [
-"year",
+"quarter",
 0
 ],
 [
-"quarter",
+"year",
 0
 ]
 ],
@@ -58121,12 +58121,12 @@
 "cells": [
 {
 "col": 3,
-"colspan": 1,
+"colspan": 2,
 "kind": "year",
 "label": "2024"
 },
 {
-"col": 4,
+"col": 5,
 "colspan": 1,
 "kind": "year",
 "label": "Total 2024",
@@ -58139,12 +58139,12 @@
 "cells": [
 {
 "col": 3,
-"colspan": 2,
+"colspan": 1,
 "kind": "quarter",
 "label": "Q4"
 },
 {
-"col": 5,
+"col": 4,
 "colspan": 1,
 "kind": "quarter",
 "label": "Total Q4",
@@ -59707,14 +59707,14 @@
 ],
 [
 [
-"year",
+"quarter",
 0
 ],
 5
 ],
 [
 [
-"quarter",
+"year",
 0
 ],
 6
@@ -59742,14 +59742,14 @@
 ],
 [
 [
-"year",
+"quarter",
 1
 ],
 10
 ],
 [
 [
-"quarter",
+"year",
 1
 ],
 11
@@ -59765,11 +59765,11 @@
 1
 ],
 [
-"year",
+"quarter",
 0
 ],
 [
-"quarter",
+"year",
 0
 ],
 [
@@ -59785,11 +59785,11 @@
 4
 ],
 [
-"year",
+"quarter",
 1
 ],
 [
-"quarter",
+"year",
 1
 ]
 ],
@@ -59799,12 +59799,12 @@
 "cells": [
 {
 "col": 3,
-"colspan": 2,
+"colspan": 3,
 "kind": "year",
 "label": "2025"
 },
 {
-"col": 5,
+"col": 6,
 "colspan": 1,
 "kind": "year",
 "label": "Total 2025",
@@ -59812,12 +59812,12 @@
 },
 {
 "col": 7,
-"colspan": 3,
+"colspan": 4,
 "kind": "year",
 "label": "2026"
 },
 {
-"col": 10,
+"col": 11,
 "colspan": 1,
 "kind": "year",
 "label": "Total 2026",
@@ -59830,12 +59830,12 @@
 "cells": [
 {
 "col": 3,
-"colspan": 3,
+"colspan": 2,
 "kind": "quarter",
 "label": "Q4"
 },
 {
-"col": 6,
+"col": 5,
 "colspan": 1,
 "kind": "quarter",
 "label": "Total Q4",
@@ -59843,12 +59843,12 @@
 },
 {
 "col": 7,
-"colspan": 4,
+"colspan": 3,
 "kind": "quarter",
 "label": "Q1"
 },
 {
-"col": 11,
+"col": 10,
 "colspan": 1,
 "kind": "quarter",
 "label": "Total Q1",
@@ -62906,15 +62906,15 @@
 ],
 [
 [
-"year",
-0
+"quarter",
+3
 ],
 18
 ],
 [
 [
-"quarter",
-3
+"year",
+0
 ],
 19
 ],
@@ -62927,15 +62927,15 @@
 ],
 [
 [
-"year",
-1
+"quarter",
+4
 ],
 21
 ],
 [
 [
-"quarter",
-4
+"year",
+1
 ],
 22
 ]
@@ -63002,24 +63002,24 @@
 11
 ],
 [
-"year",
-0
-],
-[
 "quarter",
 3
+],
+[
+"year",
+0
 ],
 [
 "period",
 12
 ],
 [
-"year",
-1
-],
-[
 "quarter",
 4
+],
+[
+"year",
+1
 ]
 ],
 "depth": 3,
@@ -63028,12 +63028,12 @@
 "cells": [
 {
 "col": 3,
-"colspan": 15,
+"colspan": 16,
 "kind": "year",
 "label": "2026"
 },
 {
-"col": 18,
+"col": 19,
 "colspan": 1,
 "kind": "year",
 "label": "Total 2026",
@@ -63041,12 +63041,12 @@
 },
 {
 "col": 20,
-"colspan": 1,
+"colspan": 2,
 "kind": "year",
 "label": "2027"
 },
 {
-"col": 21,
+"col": 22,
 "colspan": 1,
 "kind": "year",
 "label": "Total 2027",
@@ -63098,12 +63098,12 @@
 },
 {
 "col": 15,
-"colspan": 4,
+"colspan": 3,
 "kind": "quarter",
 "label": "Q4"
 },
 {
-"col": 19,
+"col": 18,
 "colspan": 1,
 "kind": "quarter",
 "label": "Total Q4",
@@ -63111,12 +63111,12 @@
 },
 {
 "col": 20,
-"colspan": 2,
+"colspan": 1,
 "kind": "quarter",
 "label": "Q1"
 },
 {
-"col": 22,
+"col": 21,
 "colspan": 1,
 "kind": "quarter",
 "label": "Total Q1",
@@ -66828,15 +66828,15 @@
 ],
 [
 [
-"year",
-0
+"quarter",
+3
 ],
 18
 ],
 [
 [
-"quarter",
-3
+"year",
+0
 ],
 19
 ],
@@ -66947,15 +66947,15 @@
 ],
 [
 [
-"year",
-1
+"quarter",
+7
 ],
 35
 ],
 [
 [
-"quarter",
-7
+"year",
+1
 ],
 36
 ],
@@ -66975,15 +66975,15 @@
 ],
 [
 [
-"year",
-2
+"quarter",
+8
 ],
 39
 ],
 [
 [
-"quarter",
-8
+"year",
+2
 ],
 40
 ]
@@ -67050,12 +67050,12 @@
 11
 ],
 [
-"year",
-0
-],
-[
 "quarter",
 3
+],
+[
+"year",
+0
 ],
 [
 "period",
@@ -67118,12 +67118,12 @@
 23
 ],
 [
-"year",
-1
-],
-[
 "quarter",
 7
+],
+[
+"year",
+1
 ],
 [
 "period",
@@ -67134,12 +67134,12 @@
 25
 ],
 [
-"year",
-2
-],
-[
 "quarter",
 8
+],
+[
+"year",
+2
 ]
 ],
 "depth": 3,
@@ -68643,15 +68643,15 @@
 ],
 [
 [
-"year",
-0
+"quarter",
+1
 ],
 7
 ],
 [
 [
-"quarter",
-1
+"year",
+0
 ],
 8
 ]
@@ -68674,12 +68674,12 @@
 2
 ],
 [
-"year",
-0
-],
-[
 "quarter",
 1
+],
+[
+"year",
+0
 ]
 ],
 "depth": 3,
@@ -68688,12 +68688,12 @@
 "cells": [
 {
 "col": 3,
-"colspan": 4,
+"colspan": 5,
 "kind": "year",
 "label": "2026"
 },
 {
-"col": 7,
+"col": 8,
 "colspan": 1,
 "kind": "year",
 "label": "Total 2026",
@@ -68719,12 +68719,12 @@
 },
 {
 "col": 6,
-"colspan": 2,
+"colspan": 1,
 "kind": "quarter",
 "label": "Q2"
 },
 {
-"col": 8,
+"col": 7,
 "colspan": 1,
 "kind": "quarter",
 "label": "Total Q2",

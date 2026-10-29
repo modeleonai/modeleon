@@ -4,11 +4,15 @@
 Every call over the same lines — the rank of each record among its peers,
 a ``SUMIFS`` per record over the records' fields, a ``MATCH`` per record —
 reads the range once and shares it: one AST node that every call's formula
-holds, the cells, their names in the source, the unit they share and what
-is derived from them (the numbers sorted, the cells indexed by value). The
-workbook writes the range once per sheet. A call reads the lines again when
-one holds another value — replaced, or a list changed in place — or
-another unit or path than it held when read.
+holds and depends on as one dependency (the node depends on its lines), the
+cells, the unit they share and what is derived from them (the numbers
+sorted, the cells indexed by value); a call's source names the lines as
+they were named when the range was read, in one text every call over it
+shares. The workbook writes the range once per sheet. A range is read
+again when one of its lines was written to since (its value replaced, its
+unit, its path, its placement) — a write reads again only the ranges read
+from that line —, when a window moved, or when a list a line holds was
+changed in place.
 
 The scale tests count the work, never the clock: a table twice as long
 costs twice the work, not four times.
@@ -18,12 +22,14 @@ import copy
 import datetime as dt
 import gc
 import pickle
+import warnings
 
 import pytest
 from openpyxl import load_workbook
 
 import modeleon as mo
 from modeleon.compile.excel.renderer import ExcelRenderer
+from modeleon.core import variable
 from modeleon.core.expr import ListExpr
 from modeleon.functions import criteria, lookup, statistics
 
@@ -226,6 +232,49 @@ class TestScale:
         assert counted["tested"] == 1
         assert (first.value, pattern.value, found.value, second.value) == (1, 11, 11, 10)
 
+    def test_each_call_checks_its_range_without_reading_the_lines_again(self, monkeypatch):
+        reads = [0]
+        real = criteria._VALUE
+
+        def value(var):
+            reads[0] += 1
+            return real(var)
+
+        monkeypatch.setattr(criteria, "_VALUE", value)
+
+        def ranked(n, field):
+            m = _model()
+            with m:
+                recs = _comps(m, n)
+                peers = [getattr(r, field) for r in recs]
+                reads[0] = 0
+                with m.comps:
+                    for r in recs:
+                        r.rank = mo.RANK_EQ(getattr(r, field), peers).set_display_name("Rank")
+            return reads[0]
+
+        # Each line's value read once, by the first call: the check before
+        # each reuse compares two counts, not every line — n reads for n
+        # calls, where a check reading each line made n² of them. A line
+        # holding a list keeps its cells compared at each reuse.
+        assert (ranked(60, "multiple"), ranked(120, "multiple")) == (60, 120)
+        assert (ranked(60, "rev"), ranked(120, "rev")) == (60, 120)
+
+        # How a line is shown is no part of what a range reads: a peer named
+        # or styled between the calls reads nothing again. Its unit is.
+        m = _model()
+        with m:
+            recs = _comps(m, 10)
+            peers = [r.multiple for r in recs]
+            reads[0] = 0
+            with m.comps:
+                for r in recs:
+                    r.rank = mo.RANK_EQ(r.multiple, peers)
+                    r.multiple.set_display_name("Multiple (x)").set_style(bold=True)
+            assert reads[0] == 10
+            recs[0].multiple.unit = "x"
+            assert mo.LARGE(peers, 1).value == 9.0 and reads[0] == 20
+
     def test_a_median_per_record_is_worked_out_once(self, counted):
         def mid(n):
             m = _model()
@@ -262,6 +311,58 @@ class TestOneNode:
             other = mo.RANK_EQ(recs[0].multiple, peers[::-1])
             assert other._expr.args[1] is not again._expr.args[0]
 
+    def test_a_call_over_the_same_list_finds_its_range_by_the_list(self, monkeypatch):
+        looked_up = [0]
+        real = criteria._find
+
+        def find(*args):
+            looked_up[0] += 1
+            return real(*args)
+
+        monkeypatch.setattr(criteria, "_find", find)
+        m = _model()
+        with m:
+            recs = _comps(m, 6)
+            peers = [r.multiple for r in recs]
+            ranks = [mo.RANK_EQ(r.multiple, peers) for r in recs]
+            # Looked up by its lines once; then found by the list itself.
+            assert looked_up[0] == 1
+            peers.reverse()                     # changed in place: another range
+            top = mo.LARGE(peers, 1)
+            assert looked_up[0] == 2
+            assert top._expr.args[0] is not ranks[0]._expr.args[1]
+            assert [item.var for item in top._expr.args[0].items] == peers
+            assert mo.LARGE(peers, 6)._expr.args[0] is top._expr.args[0]
+            assert looked_up[0] == 2
+
+    def test_a_list_is_compared_with_its_range_a_tuple_is_its_range(self, monkeypatch):
+        compared = [0]
+        real = criteria.operator.is_
+
+        def is_(a, b):
+            compared[0] += 1
+            return real(a, b)
+
+        m = _model()
+        with m:
+            recs = _comps(m, 8)
+            peers = [r.multiple for r in recs]
+            fixed = tuple(peers)
+            mo.LARGE(peers, 1)
+            mo.LARGE(fixed, 1)
+            monkeypatch.setattr(criteria.operator, "is_", is_)
+            for r in recs:
+                mo.RANK_EQ(r.multiple, peers)
+            # A list may have changed since: each call compares its items.
+            assert compared[0] == 8 * 8
+            compared[0] = 0
+            for r in recs:
+                mo.RANK_EQ(r.multiple, fixed)
+            # A tuple cannot: found once, it is its range at once after.
+            assert compared[0] == 0
+            assert mo.RANK_EQ(recs[0].multiple, fixed)._expr.args[1] \
+                is mo.RANK_EQ(recs[0].multiple, peers)._expr.args[1]
+
     def test_a_copy_or_a_pickle_takes_the_formula_and_reads_the_lines_again(self):
         m = _model()
         with m:
@@ -286,6 +387,217 @@ class TestOneNode:
             del rank
             gc.collect()
             assert key not in criteria._LISTS
+
+
+class TestOneDependency:
+    @staticmethod
+    def _ranked(n):
+        m = _model()
+        with m:
+            recs = _comps(m, n)
+            peers = [r.multiple for r in recs]
+            with m.comps:
+                for r in recs:
+                    r.rank = mo.RANK_EQ(r.multiple, peers).set_display_name("Rank")
+        return recs, peers
+
+    def test_a_call_per_record_holds_the_range_as_one_entry(self):
+        for n in (60, 120):
+            recs, peers = self._ranked(n)
+            held = [r.rank._dependency_refs for r in recs]
+            # Its number and the range: 2n entries over the table, not n².
+            assert sum(map(len, held)) == 2 * n
+            node = held[0][1]
+            assert all(refs[0] is r.multiple and refs[1] is node for r, refs in zip(recs, held))
+            assert [item.var for item in node.items] == peers
+            assert recs[0].rank._dependency_lines() == peers
+            assert recs[0].rank.dependencies == {line.id for line in peers}
+
+    def test_a_sumifs_per_record_holds_its_ranges_and_its_key(self):
+        def held(n):
+            m = _model()
+            with m:
+                recs = _txs(m, n, groups=n // 4)
+                amounts, regions = [r.amount for r in recs], [r.region for r in recs]
+                with m.tx:
+                    for r in recs:
+                        r.total = mo.SUMIFS(amounts, regions, r.region).set_display_name("Tot")
+            return sum(len(r.total._dependency_refs) for r in recs)
+
+        assert (held(60), held(120)) == (3 * 60, 3 * 120)
+
+    def test_every_line_reads_what_it_read_when_each_call_listed_its_lines(self, monkeypatch):
+        def reads(var):
+            ids = [line.id for line in var._dependency_lines()]
+            return [i if not i.startswith("__floating__") else "<floating>" for i in ids]
+
+        shared = _records_model()
+        _read_by_each_call(monkeypatch)
+        each = _records_model()
+        for (name, a), (_, b) in zip(shared.walk(), each.walk()):
+            if isinstance(a, mo.Variable):
+                assert reads(a) == reads(b), name
+                assert len(a.dependencies) == len(b.dependencies), name
+                assert a.dependencies - {d for d in a.dependencies if "__floating__" in d} \
+                    == b.dependencies - {d for d in b.dependencies if "__floating__" in d}, name
+        assert shared.detect_cycles() is None and each.detect_cycles() is None
+
+    def test_no_call_keeps_a_text_that_lists_its_lines(self):
+        recs, peers = self._ranked(6)
+        parts = [r.rank._source_call[1][1] for r in recs]
+        assert all(part is parts[0] for part in parts)
+        assert all("_source_code" not in r.rank.__dict__ for r in recs)
+        listed = ", ".join(f"r{k}.multiple" for k in range(6))
+        assert recs[2].rank.source_code == f"RANK_EQ(multiple, [{listed}])"
+
+    def test_a_call_keeps_the_names_its_lines_had_when_it_was_made(self):
+        # As the rest of a call's source does; a call made after the move
+        # names the lines as they are named then.
+        m = _model()
+        with m:
+            m.s = mo.MultiVariable("S")
+            m.t = mo.MultiVariable("T")
+            m.s.a, m.s.b = mo.Variable(1.0), mo.Variable(2.0)
+            lines = [m.s.a, m.s.b]
+            top = mo.LARGE(lines, 1)
+            assert top.source_code == "LARGE([s.a, s.b], 1)"
+            m.t.a = m.s.remove("a")
+            assert top.source_code == "LARGE([s.a, s.b], 1)"
+            assert mo.Variable(top).source_code == "LARGE([s.a, s.b], 1)"
+            assert mo.LARGE(lines, 1).source_code == "LARGE([t.a, s.b], 1)"
+
+    @pytest.mark.parametrize("peers_are", ["lines", "formulas", "per-period formulas",
+                                           "elements", "ranked"])
+    def test_rebuilding_calls_one_by_one_reads_the_range_once(self, monkeypatch, peers_are):
+        # A call replaced by its own name detaches the one before it; the
+        # peers it reads stay where they are, so their range is not read
+        # again for each call rebuilt — named lines, unnamed formulas, which
+        # each detach moving a window has asked where they run, elements of
+        # rows; nor when a range reads the calls themselves (``ranked``): a
+        # call detached marks that range alone. What a formula over the
+        # range takes from its lines (``_range_reads``) is worked out once.
+        reads = []
+        worked_out = []
+        original, original_reads = criteria._Lines._read, variable._range_reads
+
+        def counted(self):
+            reads.append(1)
+            return original(self)
+
+        def counted_reads(node):
+            shared = node.__dict__.get("_lines")
+            if shared is None or shared.stale or variable._RANGE_READS not in shared.kept:
+                worked_out.append(1)
+            return original_reads(node)
+
+        def rebuild(n):
+            m = _model()
+            with m:
+                m.p = mo.MultiVariable("P")
+                for i in range(n):
+                    value = {"elements": [float(i), 0.0, 0.0],
+                             "per-period formulas": [float(i)] * 3}.get(peers_are, float(i))
+                    setattr(m.p, f"x{i}", mo.Variable(value))
+                lines = [getattr(m.p, f"x{i}") for i in range(n)]
+                peers = {"formulas": [x * 1 for x in lines],
+                         "per-period formulas": [x * 1 for x in lines],
+                         "elements": [x[0] for x in lines]}.get(peers_are, lines)
+                m.r = mo.MultiVariable("R")
+                for i in range(n):
+                    setattr(m.r, f"rank{i}", mo.RANK_EQ(peers[i], peers))
+                ranks = [getattr(m.r, f"rank{i}") for i in range(n)]
+                if peers_are == "ranked":
+                    m.top = mo.COUNTIF(ranks, "<=10")
+            monkeypatch.setattr(criteria._Lines, "_read", counted)
+            monkeypatch.setattr(variable, "_range_reads", counted_reads)
+            reads.clear()
+            worked_out.clear()
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                with m:
+                    for i in range(n):
+                        setattr(m.r, f"rank{i}", mo.RANK_EQ(peers[i], peers))
+            rebuilt = len(reads) + len(worked_out)
+            if peers_are == "ranked":
+                # The calls detached were written to: a range over them is
+                # read again, once.
+                before = len(reads)
+                assert mo.COUNTIF(ranks, "<=10").value == 10 and len(reads) == before + 1
+            monkeypatch.setattr(criteria._Lines, "_read", original)
+            monkeypatch.setattr(variable, "_range_reads", original_reads)
+            assert m.r.rank0.value == ([n] * 3 if peers_are == "per-period formulas" else n)
+            return rebuilt
+
+        assert rebuild(40) == 0 and rebuild(80) == 0
+
+    def test_a_write_to_a_line_reads_again_only_the_ranges_read_from_it(self, monkeypatch):
+        reads = []
+        original = criteria._Lines._read
+
+        def counted(self):
+            reads.append(1)
+            return original(self)
+
+        m = _model()
+        with m:
+            recs = _comps(m, 6)
+            multiples = [r.multiple for r in recs]
+            firsts = [r.rev[0] for r in recs]       # elements of rows: 0, 1, ... 5
+            assert (mo.LARGE(multiples, 1).value, mo.LARGE(firsts, 1).value) == (5.0, 5.0)
+            monkeypatch.setattr(criteria._Lines, "_read", counted)
+            recs[0].multiple._value = 9.0           # as a loop closing writes it
+            assert mo.LARGE(firsts, 1).value == 5.0 and len(reads) == 0
+            assert mo.LARGE(multiples, 1).value == 9.0 and len(reads) == 1
+            recs[1].rev.unit = "EUR"                # the row an element of ``firsts`` names
+            assert mo.LARGE(multiples, 2).value == 5.0 and len(reads) == 1
+            assert mo.LARGE(firsts, 2).value == 4.0 and len(reads) == 2
+
+    def test_a_source_text_pickles_with_every_protocol(self):
+        m = _model()
+        with m:
+            m.s = mo.MultiVariable("S")
+            m.s.a, m.s.b = mo.Variable(1.0), mo.Variable(2.0)
+            m.s.top = mo.LARGE([m.s.a, m.s.b], 1)
+        for protocol in range(pickle.HIGHEST_PROTOCOL + 1):
+            twin = pickle.loads(pickle.dumps(m, protocol=protocol))
+            assert twin.s.top.source_code == "LARGE([s.a, s.b], 1)", protocol
+            assert twin.s.top.value == 2.0
+
+    def test_a_range_over_a_line_reading_time_reads_time(self, monkeypatch):
+        def calls():
+            m = mo.Model("m", default_grain="month", default_start="2026-01", default_periods=3)
+            with m:
+                m.s = mo.MultiVariable("S")
+                m.s.days = mo.time.days * 1.0
+                m.s.a = mo.Variable([1.0, 2.0, 3.0])
+                return [mo.MEDIAN([m.s.a, m.s.days]), mo.MEDIAN([m.s.a, m.s.a * 2])]
+
+        shared = calls()
+        _read_by_each_call(monkeypatch)
+        each = calls()
+        assert [c._reads_time for c in shared] == [c._reads_time for c in each] == [True, False]
+        assert [c.value for c in shared] == [c.value for c in each]
+
+    def test_a_model_of_calls_over_ranges_copies_and_pickles(self, tmp_path):
+        m = _records_model()
+        m.to_excel(tmp_path / "model.xlsx")
+        for twin in (copy.deepcopy(m), pickle.loads(pickle.dumps(m))):
+            for (name, a), (_, b) in zip(m.walk(), twin.walk()):
+                if isinstance(a, mo.Variable):
+                    assert (b.value, b.source_code) == (a.value, a.source_code), name
+                    assert len(b.dependencies) == len(a.dependencies), name
+            twin.to_excel(tmp_path / "twin.xlsx")
+            for sheet in ("Comps", "Summary"):
+                assert (_rows(tmp_path / "twin.xlsx", sheet)
+                        == _rows(tmp_path / "model.xlsx", sheet))
+            # A call over the twin's lines reads them, and a write to one is
+            # seen; the model's own lines are not the twin's.
+            peers = [twin.comps._component(f"r{k}").multiple for k in range(8)]
+            assert mo.LARGE(peers, 2).value == m.s.top.value
+            twin.comps._component("r0").multiple._value = 99.0
+            assert mo.LARGE(peers, 1).value == 99.0
+            assert mo.LARGE([m.comps._component(f"r{k}").multiple for k in range(8)],
+                            1).value == 7.0
 
 
 class TestTheWriterWalksAListOnce:
@@ -430,6 +742,226 @@ class TestReadAgain:
             m.t.a = line
             assert mo.LARGE(lines, 1).source_code == "LARGE([t.a, s.b], 1)"
 
+    def test_an_element_of_a_row_is_named_by_its_row_as_it_is_named_then(self):
+        class Rec(mo.MultiVariableClass):
+            def compute(self, rev):
+                self.rev = mo.Variable(rev)
+
+        m = _model()
+        with m:
+            m.comps = mo.MultiVariable("Comps")
+        recs = [Rec(rev=[float(k), 2.0 * k, 3.0]) for k in range(4)]   # before they join
+        firsts = [r.rev[0] for r in recs]
+        before = mo.RANK_EQ(firsts[0], firsts)
+        with m:
+            for k, r in enumerate(recs):
+                setattr(m.comps, f"r{k}", r)
+        listed = ", ".join(f"r{k}.rev[0]" for k in range(4))
+        assert mo.RANK_EQ(firsts[1], firsts).source_code.endswith(f", [{listed}])")
+        # A call made before keeps the names its lines had then.
+        assert before.source_code.endswith(", [rev[0], rev[0], rev[0], rev[0]])")
+
+        with m:
+            m.c = mo.MultiVariable("C")
+            m.d = mo.MultiVariable("D")
+            m.c.row = mo.Variable([1.0, 2.0, 3.0])
+        row = m.c.row
+        pair = [row[0], row[2]]
+        assert mo.LARGE(pair, 1).source_code == "LARGE([c.row[0], c.row[2]], 1)"
+        m.c.remove("row")
+        assert "c.row" not in mo.LARGE(pair, 1).source_code
+        with m:
+            m.d.row2 = row
+        assert mo.LARGE(pair, 1).source_code == "LARGE([d.row2[0], d.row2[2]], 1)"
+
+    def test_lines_with_tracks_on_two_windows_are_read_by_their_dates(self, monkeypatch):
+        def medians():
+            m = mo.Model("m", default_grain="month", default_start="2026-01", default_periods=3,
+                         tracks=mo.Tracks("plan", "actual"))
+            with m:
+                m.a = mo.MultiVariable("A")
+                m.b = mo.MultiVariable("B", default_grain="month", default_start="2026-02",
+                                       default_periods=3)
+                m.a.x = mo.Variable(plan=[1.0, 2.0, 3.0], actual=[1.5, 2.5, 3.5])
+                m.a.z = mo.Variable(plan=[5.0, 6.0, 7.0], actual=[5.0, 6.5, 7.0])
+                m.b.y = mo.Variable(plan=[10.0, 20.0, 30.0], actual=[10.0, 20.0, 30.0])
+                one = mo.MEDIAN([m.a.x, m.a.z]).value
+                # Not paired by position: refused, as ``mo.MEDIAN(m.a.x, m.b.y)`` is.
+                with pytest.raises(ValueError, match="holds tracks on 3 period"):
+                    mo.MEDIAN([m.a.x, m.b.y])
+            return {role: one[role] for role in one.roles}
+
+        shared = medians()
+        _read_by_each_call(monkeypatch)
+        assert shared == medians() == {"plan": [3.0, 4.0, 5.0], "actual": [3.25, 4.5, 5.25]}
+
+    def test_a_window_moved_is_read_again(self, monkeypatch):
+        def medians():
+            m = mo.Model("m", default_grain="month", default_start="2026-01", default_periods=4)
+            with m:
+                m.a = mo.MultiVariable("A")
+                m.b = mo.MultiVariable("B", default_grain="month", default_start="2026-01",
+                                       default_periods=4)
+                m.a.x = mo.Variable([1.0, 2.0, 3.0, 4.0], extend=mo.zero())
+                m.b.y = mo.Variable([10.0, 20.0, 30.0, 40.0], extend=mo.zero())
+                lines = [m.a.x, m.b.y]
+                first = mo.MEDIAN(lines).value
+                m.b.default_start = "2026-02"       # B's line now runs a month later
+                return first, mo.MEDIAN(lines).value
+
+        shared = medians()
+        _read_by_each_call(monkeypatch)
+        assert shared == medians() == ([5.5, 11.0, 16.5, 22.0], [0.5, 6.0, 11.5, 17.0, 20.0])
+
+    def test_a_line_moved_to_another_window_is_read_by_its_dates(self, monkeypatch):
+        def medians():
+            m = mo.Model("m", default_grain="month", default_start="2026-01", default_periods=4)
+            with m:
+                m.a = mo.MultiVariable("A")
+                m.b = mo.MultiVariable("B", default_grain="month", default_start="2026-02",
+                                       default_periods=4)
+                m.a.x = mo.Variable([1.0, 2.0, 3.0, 4.0], extend=mo.zero())
+                m.a.y = mo.Variable([10.0, 20.0, 30.0, 40.0], extend=mo.zero())
+                lines = [m.a.x, m.a.y]
+                first = mo.MEDIAN(lines).value
+                m.b.y = m.a.remove("y")
+                return first, mo.MEDIAN(lines).value
+
+        shared = medians()
+        _read_by_each_call(monkeypatch)
+        assert shared == medians() == ([5.5, 11.0, 16.5, 22.0], [0.5, 6.0, 11.5, 17.0, 20.0])
+
+    def test_a_formula_among_the_lines_placed_anew_is_read_again(self, monkeypatch):
+        def medians():
+            m = mo.Model("m", default_grain="month", default_start="2026-01", default_periods=4)
+            with m:
+                m.b = mo.MultiVariable("B", default_grain="month", default_start="2026-02",
+                                       default_periods=4)
+                m.b.y = mo.Variable([10.0, 20.0, 30.0, 40.0], extend=mo.zero())
+                x = mo.Variable([1.0, 2.0, 3.0, 4.0], extend=mo.zero())
+                lines = [x * 1, m.b.y * 1]
+                # ``x`` has no window yet: its formula is read by position.
+                first = mo.MEDIAN(lines).value
+                m.a = mo.MultiVariable("A")
+                m.a.x = x                       # from January now: no one window
+                with pytest.raises(ValueError, match="does not cover the combined window"):
+                    mo.MEDIAN(lines)
+                return first
+
+        shared = medians()
+        _read_by_each_call(monkeypatch)
+        assert shared == medians() == [5.5, 11.0, 16.5, 22.0]
+
+    def test_a_formula_among_the_lines_is_read_again_once_it_runs_elsewhere(self, monkeypatch):
+        # A line that a formula among the lines reads moves: the window the
+        # formula runs on may have moved, so where it runs is asked again,
+        # and the range is read again only when it runs elsewhere.
+        reads = []
+        original = criteria._Lines._read
+
+        def counted(self):
+            reads.append(1)
+            return original(self)
+
+        def medians(count):
+            reads.clear()
+            m = mo.Model("m", default_grain="month", default_start="2026-01", default_periods=4)
+            with m:
+                m.a = mo.MultiVariable("A")
+                m.c = mo.MultiVariable("C")
+                m.b = mo.MultiVariable("B", default_grain="month", default_start="2026-02",
+                                       default_periods=4)
+                m.a.x = mo.Variable([1.0, 2.0, 3.0, 4.0])
+                m.a.y = mo.Variable([10.0, 20.0, 30.0, 40.0])
+                lines = [m.a.x * 1, m.a.y * 1]
+                first = mo.MEDIAN(lines).value
+                if count:
+                    monkeypatch.setattr(criteria._Lines, "_read", counted)
+                m.c.y = m.a.remove("y")             # on the model's window still
+                same = mo.MEDIAN(lines).value
+                assert len(reads) == 0
+                m.b.y = m.c.remove("y")             # from February: no one window
+                with pytest.raises(ValueError, match="does not cover the combined window"):
+                    mo.MEDIAN(lines)
+                assert len(reads) == (1 if count else 0)
+            monkeypatch.setattr(criteria._Lines, "_read", original)
+            return first, same
+
+        shared = medians(True)
+        _read_by_each_call(monkeypatch)
+        assert shared == medians(False) == ([5.5, 11.0, 16.5, 22.0], [5.5, 11.0, 16.5, 22.0])
+
+    @pytest.mark.parametrize("window", [{}, {"default_grain": "month"}])
+    def test_a_named_formula_on_no_window_of_its_own_is_read_again_once_it_runs_elsewhere(
+            self, monkeypatch, window):
+        # Named in containers that declare no dated window, a formula runs on
+        # the window of the line it reads, as an unnamed one does.
+        def medians():
+            m = mo.Model("m", **window)
+            with m:
+                m.a = mo.MultiVariable("A", default_grain="month", default_start="2026-01",
+                                       default_periods=3)
+                m.c = mo.MultiVariable("C", default_grain="month", default_start="2026-02",
+                                       default_periods=3)
+                m.b = mo.MultiVariable("B", default_grain="month", default_start="2026-02",
+                                       default_periods=2)
+                m.s = mo.MultiVariable("S")
+                m.a.x = mo.Variable([1.0, 2.0, 3.0])
+                m.b.y = mo.Variable([10.0, 20.0], extend=mo.zero())
+                m.s.g = m.a.x * 1
+                lines = [m.s.g, m.b.y]
+                first = mo.MEDIAN(lines)
+                m.c.x = m.a.remove("x")             # x, so g, runs from February
+                again = mo.MEDIAN(lines)
+            return [(r.value, r.time.start) for r in (first, again)]
+
+        shared = medians()
+        _read_by_each_call(monkeypatch)
+        assert shared == medians() == [([0.5, 6.0, 11.5], "2026-01"),
+                                       ([5.5, 11.0, 1.5], "2026-02")]
+
+    def test_a_formula_on_an_open_loop_is_read_again_once_its_line_is_adopted(self):
+        # A formula on a loop not closed yet keeps no placement: adopted, the
+        # line it reads moves it all the same.
+        def close(read_first):
+            m = mo.Model("m", default_grain="month", default_start="2026-01", default_periods=3)
+            with m:
+                m.e = mo.MultiVariable("E", default_grain="month", default_start="2026-02",
+                                       default_periods=3)
+                m.q = mo.Variable([10.0, 20.0, 30.0])
+                x = mo.Variable([1.0, 2.0, 3.0])
+                d = mo.MultiVariable("D", loop=True)
+                with d:
+                    d.a = mo.Variable([1.0, 2.0, 3.0])
+                    p = x + mo.lag(d.b, fill=0.0)
+                    held = mo.MEDIAN([p, m.q]) if read_first else None
+                    m.e.x = x                       # p runs from February now
+                    d.b = d.a + mo.MEDIAN([p, m.q])
+                m.d = d
+            return held
+
+        for read_first in (False, True):
+            with pytest.raises(ValueError, match="does not cover the combined window"):
+                close(read_first)
+
+    def test_a_line_lets_go_of_the_ranges_dropped(self):
+        m = _model()
+        with m:
+            m.c = mo.MultiVariable("C")
+            m.c.x = mo.Variable(1.0)
+            longest = 0
+            for k in range(100):
+                mo.MEDIAN([m.c.x, mo.Variable(float(k))]).value     # read once, dropped
+                gc.collect()
+                longest = max(longest, len(m.c.x._watched))
+            assert longest <= 8
+            kept = [mo.MEDIAN([m.c.x, mo.Variable(float(k))]) for k in range(100)]
+            assert len(m.c.x._watched) < 2 * len(kept) + 8
+            del kept
+            gc.collect()
+            m.c.x.set_unit("x")                     # a write lets go of them too
+            assert len(m.c.x._watched) == 0
+
     def test_a_list_changed_is_another_range(self):
         m = _model()
         with m:
@@ -474,6 +1006,29 @@ class TestALoopClosing:
                 d.top = mo.LARGE([d.a, d.c], 1)
                 d.b = d.a + d.c
         return m
+
+    def test_a_row_read_ahead_among_the_lines_is_read_as_its_line(self, monkeypatch):
+        def model():
+            m = mo.Model("m", default_grain="year", default_start="2026", default_periods=4)
+            with m:
+                m.d = mo.MultiVariable("D", loop=True)
+                with m.d as d:
+                    d.a = mo.Variable([1.0, 5.0, 2.0, 4.0])
+                    d.c = mo.lag(d.b, fill=0.0) + 1.0
+                    d.mid = mo.MEDIAN([d.a, d.b])       # ``b`` read before its line
+                    d.top = mo.LARGE([d.a, d.b], 1)
+                    d.b = d.a + d.c
+            return m
+
+        from modeleon.core.loops import loop_rows
+        shared = model()
+        _read_by_each_call(monkeypatch)
+        plain = model()
+        assert shared.d.b.value == plain.d.b.value == [2.0, 8.0, 11.0, 16.0]
+        assert shared.d.mid.value == plain.d.mid.value == [1.5, 6.5, 6.5, 10.0]
+        assert shared.d.top.value == plain.d.top.value == [2.0, 8.0, 11.0, 16.0]
+        assert ([v.path for v in loop_rows(shared.d.b)]
+                == [v.path for v in loop_rows(plain.d.b)])
 
     def test_the_rows_are_read_again(self, monkeypatch):
         shared = self._model()

@@ -31,7 +31,7 @@ import math
 import os
 import weakref
 from datetime import date, datetime, time, timedelta
-from typing import Any, List, Optional, Sequence, Tuple, TYPE_CHECKING
+from typing import Any, Iterable, List, Optional, Sequence, Tuple, TYPE_CHECKING
 
 from .expr import BinOp, Compare, Expr, Literal, UnaryOp, VarRef
 from .shape import keys_along
@@ -392,6 +392,81 @@ _UNREAD = object()
 _WINDOWS_EPOCH = int.from_bytes(os.urandom(6), 'big')
 
 
+#: Counts the moves of a window a range's lines run on (:func:`_windows_moved`):
+#: a container's window set or deleted, a container detached, a time line
+#: read again for another window, a copy. A line detached is not one of
+#: them: a line a range reads announces its own detach as a write. The
+#: count starts at random, as the placements' does.
+_RANGE_WINDOWS = [int.from_bytes(os.urandom(6), 'big')]
+
+
+def _windows_moved() -> None:
+    """A container's window moved (or the windows its lines run on may
+    have): the placements kept on formulas are walked again, and every
+    range is read again before it is reused."""
+    _windows_changed()
+    _RANGE_WINDOWS[0] += 1
+
+
+class _Ranges(list):
+    """The ranges read from a line (``functions/criteria.py``), each held
+    weakly: a write to the line marks each of them to be read again before
+    it is reused (:func:`_line_written`), and no other range. A copy or a
+    pickle of the line starts with none: a range over a copy is read where
+    it is used."""
+
+    __slots__ = ('limit',)
+
+    def __init__(self, refs: Iterable[Any] = ()) -> None:
+        super().__init__(refs)
+        #: The length at which the ranges dropped since are let go.
+        self.limit = 8
+
+    def __reduce__(self) -> Tuple[Any, ...]:
+        return (_Ranges, ())
+
+    def prune(self) -> None:
+        """Let go of the ranges dropped; the next time is when the ranges
+        left have doubled, so a line holds at most as many dropped ranges
+        as live ones, and never more than eight besides."""
+        self[:] = [ref for ref in self if ref() is not None]
+        self.limit = max(8, 2 * len(self))
+
+
+def _watch(line: Any, ref: Any) -> None:
+    """Note on ``line`` that the range ``ref`` (a weak reference to it)
+    was read from it — once per range: the range notes each of its lines
+    when it is made, never again (a line among many ranges is not looked
+    for among them)."""
+    held = line.__dict__.get('_watched')
+    if held is None:
+        line.__dict__['_watched'] = _Ranges((ref,))
+        return
+    held.append(ref)
+    if len(held) >= held.limit:
+        held.prune()
+
+
+def _line_written(line: Any) -> None:
+    """``line``, which a range was read from, was written to — through
+    ``Variable.__setattr__``, its expression set, a row read ahead taking
+    its line's definition, its placement dropped: each range read from it
+    is marked (``stale``) and read again before it is reused; the ranges
+    dropped since are let go."""
+    held = line.__dict__.get('_watched')
+    if not held:
+        return
+    dropped = False
+    for ref in held:
+        shared = ref()
+        if shared is None:
+            dropped = True
+        else:
+            shared.stale = True
+    if dropped:
+        held.prune()
+
+
 class _Readers(list):
     """The formulas placed through a line, held weakly
     (:func:`_placed_through`). A copy or a pickle of the line starts with
@@ -406,7 +481,7 @@ class _Readers(list):
 
 
 def _readers_anew() -> "_Readers":
-    _windows_changed()
+    _windows_moved()
     return _Readers()
 
 
@@ -548,7 +623,12 @@ def _forget_placements(line: Any) -> None:
             node = ref()
             if node is not None and id(node) not in seen:
                 seen.add(id(node))
-                node.__dict__.pop('_reads_on', None)
+                fields = node.__dict__
+                fields.pop('_reads_on', None)
+                if fields.get('_watched'):
+                    # A range holding the formula aligns it anew — one on an
+                    # open loop too, which keeps no placement to drop.
+                    _line_written(node)
                 stack.append(node)
 
 

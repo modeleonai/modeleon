@@ -45,9 +45,11 @@ class ExcelTranslator:
         var_to_sheet: Optional[Dict[str, str]] = None,
         identity_cells: Optional[Dict[int, "tuple[str, int]"]] = None,
         time: Optional[Any] = None,
+        periods: Optional[Dict[str, VariableAddresses]] = None,
     ):
         self.renderer = ExcelRenderer(addresses, var_to_sheet,
-                                      identity_cells=identity_cells, time=time)
+                                      identity_cells=identity_cells, time=time,
+                                      periods=periods)
         self.walker = Walker(self.renderer)
 
     # Back-compat shims — some callers read these through the
@@ -106,9 +108,12 @@ class ExcelTranslator:
         # What stands behind the two flags below, filled as the walk
         # goes: ``(node, literal)`` for each sub-expression written as a
         # number inside the formula, and the nodes no formula could be
-        # written around (``check_compat`` lists them per cell).
+        # written around, each with its cause where one is known — a
+        # :class:`~.renderer.NotOneRun`, else None (``check_compat``
+        # lists them per cell).
         self.last_render_inlined_terms = self.renderer.inlined = []
         self.last_render_lossy_terms = self.renderer.lossy = []
+        self.last_render_lossy_causes = self.renderer.lossy_causes = []
         emitted = self.walker.render(expr, ctx)
         # A lossy positional collapse (see RenderCtx.lossy_inline) —
         # surfaced to the caller so the cell can carry the VALUE

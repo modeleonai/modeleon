@@ -69,10 +69,11 @@ class _VariableInit:
     _value: Any
     _expr: Optional[Expr]
     _raw_formula_str: Optional[str]
-    _dependency_refs: List["Variable"]
+    _dependency_refs: List[Any]
 
     if TYPE_CHECKING:
         def _set_expr(self, expr: Expr) -> None: ...
+        def _take_source(self, other: "Variable") -> None: ...
 
     @staticmethod
     def _resolve_keys(keys) -> tuple[Optional[list], Optional["Variable"]]:
@@ -109,10 +110,7 @@ class _VariableInit:
                 self._dependency_refs = list(formula._dependency_refs)
             else:
                 self._set_expr(VarRef(formula))
-            # One read: the source text may be rendered on read.
-            source_code = formula._source_code
-            if source_code is not None:
-                self._source_code = source_code
+            self._take_source(formula)
             return var_type
 
         if isinstance(formula, list) and len(formula) > 0:
@@ -190,10 +188,7 @@ class _VariableInit:
                 setattr(self, '_awaits', set(awaits))      # declared on Variable
             if getattr(value, '_loop_error', None):
                 self._loop_error = value._loop_error
-            # One read: the source text may be rendered on read.
-            source_code = value._source_code
-            if source_code is not None:
-                self._source_code = source_code
+            self._take_source(value)
             return var_type, value_type
 
         if (isinstance(value, list) and len(value) > 0

@@ -478,7 +478,7 @@ def _zero_one(var: Any) -> bool:
     tracks = list(value.values()) if isinstance(value, TrackValues) else [value]
     if not tracks or not all(isinstance(t, list) for t in tracks):
         return False
-    items = [x for t in tracks for x in t if x is not None]
+    items = [x for t in tracks if isinstance(t, list) for x in t if x is not None]
     return bool(items) and all(isinstance(x, (bool, int, float)) and x in (0, 1)
                                for x in items)
 
@@ -1428,6 +1428,13 @@ def _project_variable(var: Variable, grain: str, cache: Dict[int, Any], key: int
             _refuse_rolled_position(var, grain, cache)
             result = _cumsum(project_variable(var._cumsum_source, grain, cache))
             result._display_name = var._display_name
+        elif (var._role_kwargs is None and var.is_formula
+                and var._expr is not None and not _ruled
+                and var._value.time_length is None):
+            # One cell per track — a reduction over the horizon (a SUM of
+            # a plan/actual line, an NPV) — is the same number at every
+            # grain, as the untracked branch below copies it.
+            result = var.copy()
         elif (var._role_kwargs is None and var.is_formula
                 and var._expr is not None and not _ruled):
             try:

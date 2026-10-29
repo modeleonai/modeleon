@@ -64,11 +64,21 @@ def bucket_cells(
     var_to_sheet: Dict[str, str],
     sheet_name: str,
     projected: Dict[str, Dict[str, Variable]] | None = None,
+    mirrors: Any = None,
+    plans: Any = None,
 ) -> Dict[str, Dict[str, Any]]:
     """Every bucket cell's CONTENT — ``{ref: {"formula": str|None,
     "value": Any, "id": vid}}`` — the single computation behind the
     .xlsx writer and any other renderer of the totals, so no two
     renderings of a bucket cell can disagree.
+
+    ``mirrors`` — the header rows repeated at the top of this sheet, as
+    ``(source, mirror)`` pairs (the source a Variable or its id): each
+    bucket of a mirror reads the bucket cell of the row it repeats —
+    ``=Timing!F7`` — found through ``plans``, the plans of every sheet
+    by name (its own included); where that row has no such cell the
+    bucket is the row's projected value. Their cells carry
+    ``"mirror": True`` and the SOURCE's id.
 
     ``projected`` — pre-computed ``{kind: {place: projected Var}}``
     from a caller that already ran :func:`project_model` (e.g. one that
@@ -107,14 +117,17 @@ def bucket_cells(
     # One translator per kind: every periodic line's "periods" are its
     # BUCKET cells, everything else (constants, cross-sheet operands)
     # keeps its native address — which is exactly how a hand-built
-    # book's quarter formula reads.
+    # book's quarter formula reads. A line read as a range (``MAX(n)``,
+    # ``COUNTIF(n, ">50")``) is its months, as the engine's total reads
+    # it: a reduction over the line is one number at every grain.
     translators: Dict[str, ExcelTranslator] = {}
     bucket_refs: Dict[str, Dict[str, list]] = {}
     books: Dict[str, Any] = {}
     for kind in plan.kinds:
         merged = dict(addresses)
         sheets = dict(var_to_sheet)
-        books[kind] = (merged, sheets)
+        months: Dict[str, VariableAddresses] = {}
+        books[kind] = (merged, sheets, months)
         refs_of: Dict[str, list] = {}
         for vid, addr in addresses.items():
             if var_to_sheet.get(vid) != sheet_name:
@@ -141,6 +154,7 @@ def bucket_cells(
                 slot = VariableAddresses(
                     name="", formula=refs[0], values=refs,
                 )
+                months[vid] = addr
             else:
                 # A constant reads the same in every bucket — its
                 # native cell IS its quarter and its year.
@@ -153,7 +167,7 @@ def bucket_cells(
                 # back to an inlined literal and the bucket goes dead.
                 merged[pvar.id] = slot
                 sheets[pvar.id] = sheet_name
-        translators[kind] = ExcelTranslator(merged, sheets)
+        translators[kind] = ExcelTranslator(merged, sheets, periods=months)
         bucket_refs[kind] = refs_of
 
     out: Dict[str, Dict[str, Any]] = {}
@@ -237,6 +251,11 @@ def bucket_cells(
                     inlined = bool(getattr(translators[kind], "last_render_inlined", False))
                 except Exception:  # noqa: BLE001 — degrade to the number
                     value = _bucket_value(pvar, bi, var) if pvar is not None else None
+                if formula is not None and translators[kind].last_render_lossy:
+                    # No formula stands for it here (a reader of one range
+                    # over months that are not one run): the number.
+                    formula = None
+                    value = _bucket_value(pvar, bi, var) if pvar is not None else None
             elif pvar is not None and getattr(pvar, "_expr", None) is not None:
                 try:
                     formula = translators[kind].translate(
@@ -251,6 +270,8 @@ def bucket_cells(
                     inlined = bool(getattr(translators[kind], "last_render_inlined", False))
                 except Exception:
                     value = _bucket_value(pvar, bi, var)
+                if formula is not None and translators[kind].last_render_lossy:
+                    formula, value = None, _bucket_value(pvar, bi, var)
                 if isinstance(formula, str) and "TrackValues(" in formula:
                     # An operand the address book cannot place inlined a
                     # whole tracked value: the number, never that text.
@@ -270,7 +291,90 @@ def bucket_cells(
                 "cached": (_bucket_value(pvar, bi, var)
                            if own_time and pvar is not None and formula is not None else None),
             }
+    _mirror_bucket_cells(mirrors, plan, plans, addresses, var_to_sheet, sheet_name, out)
     return out
+
+
+def _qualified(ref: str, sheet: Any, here: str) -> str:
+    """``ref`` as a formula on ``here`` names it: bare on its own sheet,
+    else with the sheet, quoted when its name needs it."""
+    from .renderer import _UNQUOTED_SHEET_NAME
+
+    if not sheet or sheet == here:
+        return ref
+    if _UNQUOTED_SHEET_NAME.match(sheet):
+        return f"{sheet}!{ref}"
+    return "'" + sheet.replace("'", "''") + f"'!{ref}"
+
+
+def _source_of(src: Any, mirror: Any) -> tuple:
+    """``(id, Variable)`` of the row a header mirror repeats — the pair
+    names it by the object or by its id; the mirror knows the object."""
+    src_id = src if isinstance(src, str) else getattr(src, "id", None)
+    source = getattr(mirror, "_mirror_of", None)
+    if source is None and not isinstance(src, str):
+        source = src
+    return src_id, source
+
+
+def _mirror_bucket_cells(
+    mirrors: Any,
+    plan: TotalsPlan,
+    plans: Any,
+    addresses: Dict[str, VariableAddresses],
+    var_to_sheet: Dict[str, str],
+    sheet_name: str,
+    out: Dict[str, Dict[str, Any]],
+) -> None:
+    """Into ``out``: the bucket cells of the header rows repeated at the
+    top of the sheet (``default_header``). A mirror is no row of the
+    model — the layout makes it — so the lines' pass never meets it, and
+    its buckets stood empty while its periods read the row they repeat.
+    Each reads the bucket cell of its row (``=Timing!F7``, ``=F7`` on the
+    anchor's own sheet); a row with no such cell (its sheet draws no such
+    bucket) gives its projected value instead."""
+    from ...core.projection import project_line
+
+    for src, mirror in mirrors or ():
+        src_id, source = _source_of(src, mirror)
+        maddr = addresses.get(getattr(mirror, "id", "") or "")
+        saddr = addresses.get(src_id or "")
+        if (src_id is None or source is None or maddr is None or not maddr.values
+                or saddr is None or not saddr.values or not _is_periodic(source)):
+            continue
+        src_sheet = var_to_sheet.get(src_id)
+        src_plan = (plans or {}).get(src_sheet) if plans is not None else (
+            plan if src_sheet == sheet_name else None)
+        mrow, srow = _row_of(maddr.values[0]), _row_of(saddr.values[0])
+        mslot = getattr(mirror, "_col_slot", 0) or 0
+        sslot = getattr(source, "_col_slot", 0) or 0
+        projected: Dict[str, Any] = {}
+        for kind in plan.kinds:
+            for bi in range(len(plan.buckets[kind])):
+                ref = f"{_col_letter(plan.cell((kind, bi), mslot))}{mrow}"
+                if ref in out:
+                    continue
+                formula = value = target = None
+                if (src_plan is not None and (kind, bi) in src_plan.col_of
+                        and bi < len(src_plan.buckets.get(kind, ()))):
+                    target = f"{_col_letter(src_plan.cell((kind, bi), sslot))}{srow}"
+                    formula = "=" + _qualified(target, src_sheet, sheet_name)
+                else:
+                    if kind not in projected:
+                        try:
+                            projected[kind] = project_line(source, kind, {}, on_error="absorb")
+                        except Exception as exc:  # noqa: BLE001 — the book never dies of a header
+                            logger.warning("totals: a header row's %s projection failed: %s",
+                                           kind, exc)
+                            projected[kind] = None
+                    pv = projected[kind]
+                    value = _bucket_value(pv, bi, source) if pv is not None else None
+                out[ref] = {
+                    "formula": formula, "value": value, "id": src_id, "inlined": False,
+                    "cached": None, "mirror": True,
+                    # The cell the formula shows: its value once known.
+                    "reference": None if formula is None else formula[1:],
+                }
 
 
 def write_totals(
@@ -280,21 +384,39 @@ def write_totals(
     addresses: Dict[str, VariableAddresses],
     var_to_sheet: Dict[str, str],
     sheet_name: str,
+    mirrors: Any = None,
+    plans: Any = None,
+    mirror_look: Dict[str, Any] | None = None,
 ) -> None:
+    """Write the sheet's bucket cells — the lines' own and, with
+    ``mirrors`` and ``plans`` (see :func:`bucket_cells`), the header
+    rows' — bold, in each row's number format; a header row's in
+    ``mirror_look`` too, as its period cells are."""
     from openpyxl.styles import Font
 
+    from .cached_values import remember_reference
+    from .writer import _apply_styling
+
     native = _walk_vars(sheet_mv)
-    cells = bucket_cells(sheet_mv, plan, addresses, var_to_sheet, sheet_name)
+    sources = dict(_source_of(src, mirror) for src, mirror in mirrors or ())
+    cells = bucket_cells(sheet_mv, plan, addresses, var_to_sheet, sheet_name,
+                         mirrors=mirrors, plans=plans)
     for ref, spec in cells.items():
         cell = ws[ref]
         if spec["formula"] is not None:
             cell.value = spec["formula"]
             if spec.get("cached") is not None:
                 remember(ws, ref, spec["cached"])
+            elif spec.get("reference"):
+                remember_reference(ws, ref, spec["reference"])
         elif spec["value"] is not None:
             cell.value = spec["value"]
         cell.font = Font(bold=True)
+        if spec.get("mirror") and mirror_look:
+            _apply_styling(cell, {**mirror_look, "bold": True})
         var = native.get(spec["id"])
+        if var is None and spec.get("mirror"):
+            var = sources.get(spec["id"])
         fmt = resolve_number_format(var) if var is not None else None
         if fmt:
             cell.number_format = fmt
@@ -440,6 +562,7 @@ def _operands(expr: Any) -> list:
 
 def _tracked_fold(var: Variable, native: Dict[str, Variable], kind: str,
                   merged: Dict[str, Any], sheets: Dict[str, Any],
+                  months: Dict[str, VariableAddresses],
                   periodic: Dict[str, list], position_memo: Dict[Any, Any]) -> Any:
     """How a row of a tracked formula line folds into a bucket, or None.
 
@@ -449,8 +572,8 @@ def _tracked_fold(var: Variable, native: Dict[str, Variable], kind: str,
     the bucket with its own cache, so every projected operand is known by
     the line it came from and maps to that line's bucket cells: the
     display row's, and each track's row's; what the position law found is
-    shared across the lines (``position_memo``). Returns ``(projected,
-    track, translator)``."""
+    shared across the lines (``position_memo``). A line read as a range is
+    its ``months``. Returns ``(projected, track, translator)``."""
     from .blend_writer import TRACK_INFIX
     from ...core.projection import position_cache, project_variable
 
@@ -493,7 +616,7 @@ def _tracked_fold(var: Variable, native: Dict[str, Variable], kind: str,
                 twin = f"{mirror.id}{TRACK_INFIX}{key[len(prefix):]}"
                 book[twin] = merged[key]
                 book_sheets[twin] = sheets.get(key)
-    return projected, track, ExcelTranslator(book, book_sheets)
+    return projected, track, ExcelTranslator(book, book_sheets, periods=months)
 
 
 def _tracked_bucket(tracked: Any, bi: int, sheet_name: str, slot: Any,
@@ -510,7 +633,7 @@ def _tracked_bucket(tracked: Any, bi: int, sheet_name: str, slot: Any,
                                            track_role=track)
         except Exception:  # noqa: BLE001 — degrade to the number
             formula = None
-        if formula and "TrackValues(" not in formula:
+        if formula and "TrackValues(" not in formula and not translator.last_render_lossy:
             return formula, None, bool(getattr(translator, "last_render_inlined", False))
     value = getattr(projected, "_value", None)
     if type(value).__name__ == "TrackValues":

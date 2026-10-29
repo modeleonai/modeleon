@@ -29,18 +29,19 @@ directly.
 
 from collections import namedtuple
 from contextvars import ContextVar
-from typing import (Optional, Set, Any, Dict, List, Sequence, Tuple, TYPE_CHECKING, Self,
-                    overload)
+from typing import (Optional, Set, Any, Dict, FrozenSet, List, Sequence, Tuple, TYPE_CHECKING,
+                    Self, overload)
 
 from .humanize import humanize_identifier
 from .component import Component
-from .expr import Expr, MethodCall, Paren, Regrain, Restrict, Subscript, TimeRef, VarRef
+from .expr import (BinOp, Compare, Expr, FuncCall, ListExpr, Literal, MethodCall, Paren,
+                   Regrain, Restrict, Subscript, TimeRef, UnaryOp, VarRef)
 from .qpath import QPath
 from .regrain import RegrainSpec
 from .shape import Shape
 from .tracks import TrackValues
 from .variable_init import _VariableInit
-from .variable_ops import _VariableArithmetic, _forget_placements
+from .variable_ops import _VariableArithmetic, _forget_placements, _line_written
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -136,6 +137,96 @@ def series_at_grain(label: str, values: Any, loc: 'TimeLoc', spec: Any, grain: s
     return out, labels[0], coarse_first_day(loc.start, loc.grain, loc.first_day, grain), ranges, rule
 
 
+# ─── A range read as one ────────────────────────────────────────────
+#
+# A call over a list of lines — a conditional total, a statistic, a lookup
+# — holds the range as one AST node that every call over the same lines
+# shares (``functions/criteria.py`` keeps what it read of the lines under
+# the node's ``_lines``). A formula holding it depends on the node, and the
+# node on its lines: ``_dependency_refs`` keeps the node as ONE entry, so
+# the rank of each of n records among them holds n entries, not n². A
+# reader that needs the lines asks :meth:`Variable._dependency_lines`.
+
+
+def _reads(expr: Any, out: List[Any]) -> None:
+    """What ``expr`` reads, appended to ``out`` in the order of
+    ``expr.iter_refs()``: each Variable, and a range read as one as its
+    node. Every operator result is walked here: the node types are told
+    apart by identity, any other node walked by its own ``iter_refs``."""
+    kind = type(expr)
+    if kind is VarRef:
+        out.append(expr.var)
+    elif kind is BinOp or kind is Compare:
+        _reads(expr.left, out)
+        _reads(expr.right, out)
+    elif kind is FuncCall:
+        for arg in expr.args:
+            _reads(arg, out)
+    elif kind is ListExpr:
+        if '_lines' in expr.__dict__:
+            out.append(expr)
+        else:
+            for item in expr.items:
+                _reads(item, out)
+    elif kind is Paren:
+        _reads(expr.inner, out)
+    elif kind is UnaryOp:
+        _reads(expr.operand, out)
+    elif kind is not Literal and kind is not TimeRef:
+        out.extend(expr.iter_refs())
+
+
+def _lines_read(refs: Sequence[Any]) -> List['Variable']:
+    """The lines a ``_dependency_refs`` list reads: each range read as one
+    in its lines' place, in the order they are first read, each once — the
+    lines the formula's own walk (``iter_refs``) meets. A list holding no
+    range is returned as it stands."""
+    for ref in refs:
+        if isinstance(ref, Expr):
+            break
+    else:
+        return list(refs)
+    seen: Set[int] = set()
+    out: List['Variable'] = []
+    for ref in refs:
+        for var in (ref.iter_refs() if isinstance(ref, Expr) else (ref,)):
+            if id(var) not in seen:
+                seen.add(id(var))
+                out.append(var)
+    return out
+
+
+#: Where :func:`_range_reads` keeps its answer among what a range keeps.
+_RANGE_READS = ('range reads',)
+
+
+def _range_reads(node: ListExpr) -> Tuple[bool, Optional[FrozenSet[Any]]]:
+    """What a formula over the range ``node`` takes from its lines: whether
+    one reads ``mo.time``, and the rows read ahead of their line they wait
+    on — worked out once per read of the range, kept with what was read
+    (the node's ``_lines``), which a write to one of its lines marks to be
+    read again (``stale``). A copy of the node keeps nothing: worked out
+    each time."""
+    shared = node.__dict__.get('_lines')
+    kept = shared.kept if shared is not None and not shared.stale else None
+    if kept is not None:
+        found: Optional[Tuple[bool, Optional[FrozenSet[Any]]]] = kept.get(_RANGE_READS)
+        if found is not None:
+            return found
+    reads_time = False
+    awaits: Set[Any] = set()
+    for var in node.iter_refs():
+        reads_time = reads_time or var._reads_time
+        if var._forward_of is not None:
+            awaits.add(var)
+        elif var._awaits:
+            awaits.update(var._awaits)
+    found = (reads_time, frozenset(awaits) if awaits else None)
+    if kept is not None:
+        kept[_RANGE_READS] = found
+    return found
+
+
 #: Every field ``Variable.__init__`` starts from, with its default — written
 #: into a new instance's ``__dict__`` in one step; the constructor then
 #: writes only what differs. Immutable values only (the two per-instance
@@ -189,7 +280,10 @@ class _SourceCode:
     public setter, the ``None`` an adopted typed-dates line writes — lands
     in ``__dict__`` and wins. With none written, the text follows what the
     instance says it is: its own formula (``_source_is_formula``, the IF
-    family) or the one text its list items share (``_source_items``, a
+    family), a call composed from its parts (``_source_call``: the function
+    and the text of each argument, a list of lines in the one text written
+    when its range was read — a call over a range keeps no text listing
+    every line), or the one text its list items share (``_source_items``, a
     ``Variable([a, b, ...])`` compound), else None. The formula render
     inlines every anonymous operand, so the helpers used to pay for it at
     every call for a text almost nobody reads; nested conditions paid for
@@ -207,12 +301,20 @@ class _SourceCode:
             return self
         if obj._source_is_formula:
             return obj.formula
+        call = obj._source_call
+        if call is not None:
+            func, parts = call
+            return f"{func}({', '.join(map(str, parts))})"
         items = obj._source_items
         if items is not None:
             return _shared_source_code(obj, items)
         return None
 
 _object_setattr = object.__setattr__
+
+#: How a line is shown — what no range reads of its lines: written to a
+#: line a range was read from, they leave the range as it was read.
+_SHOWN_ONLY = frozenset({'_display_name', '_description', '_excel_props', '_excel_layout'})
 
 def _under_settings(node: Any) -> bool:
     """True when ``node`` is, or sits inside, a container that holds
@@ -261,8 +363,13 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
     #: instance (see :class:`_SourceCode`): the Variable's own formula, or
     #: the text the Variables of its list share.
     _source_is_formula: bool = False
+    _source_call: Optional[Tuple[str, Tuple[Any, ...]]] = None
     _source_items: Optional[Tuple['Variable', ...]] = None
     _source_code = _SourceCode()
+    #: The ranges read from it (``functions/criteria.py``), held weakly
+    #: (``variable_ops._Ranges``): a write to it marks each of them to be
+    #: read again before it is reused.
+    _watched: Optional[List[Any]] = None
 
     """
     Pure variable - computation logic only
@@ -498,10 +605,12 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
         # rendering of a ``pyformula=`` input, which marks the Variable as
         # an input) all start as None; ``_source_code`` (a friendlier source
         # snippet the ``functions/*`` helpers set) is derived on read.
-        # _dependency_refs mirrors _expr.iter_refs() (with dedup); populated by
-        # construction sites that build an AST. Kept as a cached list rather
-        # than a live property so callers don't re-walk the tree on every read.
-        self._dependency_refs: List['Variable'] = []
+        # _dependency_refs mirrors _expr.iter_refs() (with dedup), a range
+        # read as one kept as its node (``_dependency_lines`` expands it);
+        # populated by construction sites that build an AST. Kept as a cached
+        # list rather than a live property so callers don't re-walk the tree
+        # on every read.
+        self._dependency_refs: List[Any] = []
         if unit is not None:
             resolved_unit = self._resolve_unit(unit)
             if resolved_unit is not None:
@@ -1054,6 +1163,9 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
         # with plain attributes of its own.
         if name[:1] == '_' or name in self._PLAIN_ATTRS or hasattr(type(self), name):
             _object_setattr(self, name, value)
+            if self._watched and name not in _SHOWN_ONLY:
+                # A range was read from this line: it is read again.
+                _line_written(self)
             return
         self._bind_track(name, value)
 
@@ -2016,6 +2128,19 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
         """
         self._source_code = None if value is None else str(value)
 
+    def _take_source(self, other: 'Variable') -> None:
+        # The source text of ``other``, whose expression this Variable
+        # takes: a call over a range keeps composing its text when it is
+        # read (``_source_call``); any other text is read once — it may be
+        # rendered on read — and kept.
+        if (other._source_call is not None and '_source_code' not in other.__dict__
+                and not other._source_is_formula):
+            self._source_call = other._source_call
+            return
+        source_code = other._source_code
+        if source_code is not None:
+            self._source_code = source_code
+
     def _source_from_formula(self) -> None:
         # ``_source_code`` reads as the formula, rendered when read (see
         # ``_SourceCode``). A text written before (``elementwise`` stamps
@@ -2048,8 +2173,9 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
         refs in one step.
 
         Preserves order of first occurrence; deduplicates by object identity.
-        Construction sites and operator methods assign via this setter so
-        ``_expr`` and ``_dependency_refs`` stay consistent.
+        A list of lines read as one range (a call over a range) is one
+        entry, its node. Construction sites and operator methods assign via
+        this setter so ``_expr`` and ``_dependency_refs`` stay consistent.
         """
         # Plain instance fields: no class declares a descriptor for any of
         # them, so they go straight into ``__dict__`` — what ``__setattr__``
@@ -2057,38 +2183,49 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
         # operator result gets its expression through here.
         fields = self.__dict__
         fields['_expr'] = value
+        if '_watched' in fields:
+            # A range was read from this line: it is read again.
+            _line_written(self)
         if value is None:
             fields['_dependency_refs'] = []
             fields['_reads_time'] = False
             return
-        seen = set()
-        refs: List['Variable'] = []
-        for var in value.iter_refs():
-            key = id(var)
-            if key not in seen:
-                seen.add(key)
-                refs.append(var)
-        fields['_dependency_refs'] = refs
+        found: List[Any] = []
+        _reads(value, found)
         # A re-grained value is computed FOR its own window — whatever time
         # its native source read lives in the source's window.
         reads_time = isinstance(value, TimeRef)
-        if not reads_time and not isinstance(value, Regrain):
-            for r in refs:
-                if getattr(r, '_reads_time', False):
-                    reads_time = True
-                    break
-        fields['_reads_time'] = reads_time
+        regrained = isinstance(value, Regrain)
         # A formula over a row that is not assigned yet computes a
         # provisional value: remember what it waits on, and let the
-        # placeholder find it when the loop closes.
-        awaits = None
-        for var in refs:
-            if var._forward_of is not None:
+        # placeholder find it when the loop closes. A range's lines tell
+        # it once for every formula over them (``_range_reads``).
+        awaits: Optional[Set[Any]] = None
+        seen = set()
+        refs: List[Any] = []
+        for ref in found:
+            key = id(ref)
+            if key in seen:
+                continue
+            seen.add(key)
+            refs.append(ref)
+            if type(ref) is ListExpr:
+                lines_time, held = _range_reads(ref)
+                reads_time = reads_time or (lines_time and not regrained)
+                if held:
+                    awaits = awaits or set()
+                    awaits.update(held)
+                continue
+            if not reads_time and not regrained and ref._reads_time:
+                reads_time = True
+            if ref._forward_of is not None:
                 awaits = awaits or set()
-                awaits.add(var)
-            elif var._awaits:
+                awaits.add(ref)
+            elif ref._awaits:
                 awaits = awaits or set()
-                awaits.update(var._awaits)
+                awaits.update(ref._awaits)
+        fields['_dependency_refs'] = refs
+        fields['_reads_time'] = reads_time
         fields['_awaits'] = awaits
         if awaits:
             for placeholder in awaits:
@@ -2105,6 +2242,13 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
         # ``object.__setattr__``; going there directly skips a Python-level
         # call on every operator.
         _object_setattr(self, 'expr', expr)
+
+    def _dependency_lines(self) -> List['Variable']:
+        # The Variables this one reads directly: ``_dependency_refs`` with
+        # each range read as one expanded into its lines, in the order they
+        # are first read, each once. Every reader that needs lines — cycles,
+        # the loops' order, ``dependencies`` — reads them here.
+        return _lines_read(self._dependency_refs)
 
     def _as_operand(self, parenthesize: bool = False) -> Expr:
         """Return this Variable as an operand in a larger expression.
@@ -2133,12 +2277,13 @@ class Variable(_VariableInit, _VariableArithmetic, Component):
 
         Derived from ``_dependency_refs`` (the source of truth): each
         arithmetic operation / helper records the Variable objects it
-        reads from, and this property projects them to their current
-        ``.id`` strings on every access. Rooted Variables get qualified
+        reads from — a call over a range, the range as one entry — and
+        this property projects every line they read to its current
+        ``.id`` string on every access. Rooted Variables get qualified
         paths (``"acme.pnl.revenue"``); unrooted ones get their floating
         path (``"__floating__.v3"``).
         """
-        return {ref.id for ref in self._dependency_refs}
+        return {ref.id for ref in self._dependency_lines()}
     
     # ``python_name`` read-only property inherited from :class:`Base`.
     # ``excel_props`` property, ``set_style``, ``set_display_name``

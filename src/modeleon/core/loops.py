@@ -58,6 +58,9 @@ from .expr import (
     SelfRef, Subscript, UnaryOp, VarRef,
 )
 from .unit import UNSETTLED
+# This module is first imported once ``variable`` has loaded, never while
+# it loads, so the import below is safe.
+from .variable import _lines_read
 
 
 class Dependents:
@@ -274,7 +277,8 @@ def settle(placeholder: Any) -> None:
 
 
 def _refs(v: Any) -> List[Any]:
-    return list(getattr(v, '_dependency_refs', None) or ())
+    # The lines ``v`` reads, a range read as one in its lines' place.
+    return _lines_read(getattr(v, '_dependency_refs', None) or ())
 
 
 def _closure(starts: List[Any]) -> List[Any]:

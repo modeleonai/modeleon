@@ -918,6 +918,7 @@ class LayoutEngine:
                         window.grain,
                         style,
                         view.time_totals_word or "Total",
+                        view.time_totals_at or "between",
                     )
                     self._totals_ids[sheet_name] = id(sheet_mv)
                     # The hierarchical header: one row per bucket kind
@@ -1854,7 +1855,8 @@ class LayoutEngine:
             )
 
     def _apply_totals(self) -> None:
-        """Interleave subtotal columns into every declaring sheet.
+        """Place subtotal columns on every declaring sheet — between the
+        periods, or after the last one.
 
         Runs AFTER addresses and period starts exist: native month
         cells move right past the inserted bucket columns — the
@@ -1866,7 +1868,7 @@ class LayoutEngine:
         from .totals import NATIVE, build_totals_plan
 
         for sheet, decl in self._totals_decl.items():
-            kinds, start, grain, style, totals_word = decl
+            kinds, start, grain, style, totals_word, at = decl
             base = self.period_start_by_sheet.get(sheet)
             if not base:
                 continue
@@ -1880,7 +1882,7 @@ class LayoutEngine:
                 (len(self.addresses[v].values) for v in vids), default=0
             )
             stride = self.groups_by_sheet.get(sheet, (1,))[0]
-            plan = build_totals_plan(kinds, grain, start, n, base, stride)
+            plan = build_totals_plan(kinds, grain, start, n, base, stride, at)
             if plan is None:
                 continue
             plan.style = style

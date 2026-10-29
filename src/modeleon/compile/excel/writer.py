@@ -228,7 +228,17 @@ def write_laid_out_sheet(
     if plan is not None:
         from .totals_writer import write_totals
 
-        write_totals(ws, sheet_mv, plan, addresses, var_to_sheet, sheet_name)
+        # The header rows repeated at the top take their buckets from the
+        # rows they repeat, dressed as their period cells are.
+        _header = engine.header_by_sheet.get(key)
+        _view = resolve_excel_view(sheet_mv)
+        _mirror_look = {
+            **_differs_from_book(_font_props(_view.base_font), book_font or {}),
+            **((_view.band_styles or {}).get('mirror') or {'italic': True}),
+        }
+        write_totals(ws, sheet_mv, plan, addresses, var_to_sheet, sheet_name,
+                     mirrors=_header.mirrors if _header is not None else (),
+                     plans=engine.totals_by_sheet, mirror_look=_mirror_look)
     # The blend row references its track subrows instead of baking
     # the splice — fill an actual in the file and "live" moves.
     from .blend_writer import write_blend_links
@@ -463,20 +473,24 @@ def _has_tracked(mv: "MultiVariableBase") -> bool:
 #: semantics); a renderer that prints plain percentages multiplies
 #: the same numbers by 100.
 _METRIC_REGISTRY = ("var", "var%", "share", "growth%")
+#: Captions in the model's own language. ``growth%`` is this period over
+#: the same one a year earlier (132% = 132% of it), so "% of PY", never
+#: a growth rate. A model whose tracks are named in Cyrillic («план»,
+#: «факт») reads its metric columns in Russian; any other in English —
+#: whichever spelling the selection came in.
 _METRIC_LABELS = {
-    "var": "Var", "var%": "Var %", "share": "Share", "growth%": "Growth %",
+    "var": "Var", "var%": "Var %", "share": "Share", "growth%": "% of PY",
+}
+_METRIC_LABELS_RU = {
+    "var": "откл", "var%": "откл %", "share": "уд. вес", "growth%": "% роста",
 }
 _METRIC_FORMATS = {"var%": "0.0%", "share": "0.0%", "growth%": "0%"}
 #: Which metrics need the given/follow PAIR visible — without it the
 #: number has no meaning and the column drops.
 _METRIC_NEEDS_PAIR = {"var", "var%"}
-#: Other spellings of the same metrics, accepted as selections; a
-#: column selected this way is captioned the way it was spelled.
+#: Other spellings of the same metrics, accepted as selections.
 _METRIC_SPELLINGS = {
-    "откл": ("var", "откл"),
-    "откл%": ("var%", "откл %"),
-    "уд.вес": ("share", "уд. вес"),
-    "%роста": ("growth%", "% роста"),
+    "откл": "var", "откл%": "var%", "уд.вес": "share", "%роста": "growth%",
 }
 #: The line a share is measured against, in either spelling.
 _TOTAL_NAMES = ("total", "итого")
@@ -484,19 +498,28 @@ _TOTAL_NAMES = ("total", "итого")
 _PLAN_NAMES = ("plan", "план")
 
 
-def _resolve_metric_keys(selection, pair_available) -> list[tuple[str, str]]:
+def _resolve_metric_keys(selection, pair_available,
+                         cyrillic=False) -> list[tuple[str, str]]:
     """The metric selection as ``(key, caption)`` pairs: ``None`` = the
     deviation alone, ``[]`` = explicitly none; registry order
-    regardless of the order the selection lists them in."""
-    chosen: dict[str, str] = {}
-    for spelled in (["var"] if selection is None else selection):
-        key, caption = _METRIC_SPELLINGS.get(
-            spelled, (spelled, _METRIC_LABELS.get(spelled, spelled)))
-        chosen.setdefault(key, caption)
+    regardless of the order the selection lists them in. Captions are
+    the model's language (``cyrillic``: its tracks are named so)."""
+    labels = _METRIC_LABELS_RU if cyrillic else _METRIC_LABELS
+    chosen = {_METRIC_SPELLINGS.get(spelled, spelled)
+              for spelled in (["var"] if selection is None else selection)}
     return [
-        (k, chosen[k]) for k in _METRIC_REGISTRY
+        (k, labels[k]) for k in _METRIC_REGISTRY
         if k in chosen and (k not in _METRIC_NEEDS_PAIR or pair_available)
     ]
+
+
+def _named_in_cyrillic(decl, roles) -> bool:
+    """Whether a model's tracks are named (or labelled) in Cyrillic — the
+    language its metric captions follow."""
+    words = list(roles)
+    if decl is not None:
+        words += [decl.label(r) for r in roles if r in decl]
+    return any('Ѐ' <= ch <= 'ӿ' for w in words for ch in str(w))
 
 
 def _section_total_of(child):
@@ -597,7 +620,8 @@ def _compare_plan(decl, selection, roles,
         )
         if minuend and minuend != sub:
             pair = (minuend, sub)
-    metric_keys = _resolve_metric_keys(metrics, pair is not None)
+    metric_keys = _resolve_metric_keys(
+        metrics, pair is not None, cyrillic=_named_in_cyrillic(decl, all_roles))
     metric_base = len(visible)
     hidden = [
         r for r in (given, follow, blend)
@@ -2216,10 +2240,11 @@ def _write_sheet(
         if _vid in addresses:
             for cell_addr in addresses[_vid].values:
                 _own_max_col = max(_own_max_col, coordinate_to_tuple(cell_addr)[1])
-    # The totals interleaved with the periods are this sheet's columns
-    # too, the closing ones included: a final quarter's and year's total
-    # stand right of every line's own value cell, and a full-width row's
-    # line and a section band stopped one column short of them.
+    # The total columns are this sheet's columns too, the closing ones
+    # included: a final quarter's and year's total — every total, when
+    # they stand after the last period — stand right of every line's own
+    # value cell, and a full-width row's line and a section band stopped
+    # one column short of them.
     _plan_cols = getattr(totals_plan, "col_of", None)
     _totals_end = (
         max(_plan_cols.values()) + max(getattr(totals_plan, "stride", 1), 1) - 1
@@ -2279,8 +2304,9 @@ def _write_sheet(
             if totals_plan is not None:
                 # HIERARCHICAL header — "year" over "quarters" over
                 # "months": each bucket is a merged span over its
-                # months, its finer buckets, and its own total column
-                # (which therefore carries no month-row label).
+                # months (and the finer totals between them), and its
+                # own total column names itself from the bucket's tier
+                # down through the month row.
                 from .totals import header_rows
 
                 _plan = totals_plan
@@ -2294,7 +2320,10 @@ def _write_sheet(
                 # column stays ungrouped. Excel then draws its own
                 # ± over the columns, and collapsing a year works in
                 # the workbook itself. Summary RIGHT of detail — where
-                # our totals stand.
+                # our totals stand. With every total after the last
+                # period the same levels make the months one group and
+                # the quarter block the next: a fold hides every month,
+                # the next every quarter, and the years stay.
                 ws.sheet_properties.outlinePr.summaryRight = True
                 from ...core.calendar import GREGORIAN as _cal
                 from .totals import NATIVE as _native
@@ -2725,7 +2754,7 @@ def _write_sheet(
         # bare (a CellIs "notEqual 0" rule would also paint error
         # tokens and any text) — so the band repaints itself
         # when the file's values are edited. A multi-range sqref
-        # because totals columns interleave with the months; the
+        # because total columns may stand between the months; the
         # relative anchor is the range's first cell and Excel walks
         # it across every covered cell.
         _bg_nz = _normalize_color(props.get("bg_nonzero"))

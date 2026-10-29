@@ -22,7 +22,7 @@ import re
 import warnings
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from typing import Any, Callable, Dict, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
 
 from .addresses import VariableAddresses
 from ...core.errors import CrossScopeReferenceWarning
@@ -67,6 +67,9 @@ _UNQUOTED_SHEET_NAME = re.compile(r"[A-Za-z_]\w*\Z")
 #: Excel keeps at most 8192 characters of one formula, the ``=`` among
 #: them; a longer one sends the whole book to repair.
 _MAX_FORMULA_CHARS = 8192
+
+#: Excel's limit on the arguments of one call.
+_MAX_ARGS = 255
 
 # A cell reference on its own — an optional sheet, quoted or bare, and
 # a coordinate: the only term a ``+`` chain may fold into a range.
@@ -216,6 +219,84 @@ def _contiguous_run(refs: list) -> bool:
     else:
         return False
     return all(b - a == 1 for a, b in zip(run, run[1:]))
+
+
+def _run_spans(refs: List[str]) -> List[tuple[int, int]]:
+    """The runs of these cell refs, as ``[lo, hi)`` positions: each the
+    longest stretch of cells side by side on one row, or one under another
+    in one column, in order — one direction a run (``totals.compact_refs``
+    walks them the same way). Total columns between a line's months break
+    its row into such runs. Refs it cannot read are one run, as
+    :func:`_contiguous_run` takes them."""
+    from openpyxl.utils.cell import coordinate_to_tuple
+
+    try:
+        cells = [coordinate_to_tuple(r.split("!")[-1].replace("$", "")) for r in refs]
+    except Exception:
+        return [(0, len(refs))] if refs else []
+    spans: List[tuple[int, int]] = []
+    lo = 0
+    step: Optional[tuple[int, int]] = None
+    for i in range(1, len(cells)):
+        d = (cells[i][0] - cells[i - 1][0], cells[i][1] - cells[i - 1][1])
+        if d in ((0, 1), (1, 0)) and step in (None, d):
+            step = d
+            continue
+        spans.append((lo, i))
+        lo, step = i, None
+    if cells:
+        spans.append((lo, len(cells)))
+    return spans
+
+
+def _united_spans(
+    rows: List[List[str]],
+    runs: Callable[[List[str]], List[tuple[int, int]]] = _run_spans,
+) -> List[tuple[int, int]]:
+    """Spans of positions over which each of ``rows`` — ranges read side by
+    side, cell ``i`` of each with cell ``i`` of the others — is one run:
+    every row cut where any of them breaks. By position, never by column: a
+    sheet with a start of its own puts its total columns after other
+    periods. ``runs`` splits one row (a renderer passes the split it
+    remembers)."""
+    n = len(rows[0])
+    cuts = sorted({lo for cells in rows for lo, _hi in runs(cells)} | {n})
+    return list(zip(cuts, cuts[1:]))
+
+
+#: The criteria that a number or a date meets and a blank, a text, a
+#: boolean or an error does not: what an average counts.
+_NUMBERS = '">=-9.99999999999999E+307"'
+
+
+def _criteria_ranges(func: str, n: int) -> Optional[tuple[int, ...]]:
+    """The positions of the ranges of a conditional count, sum or mean of
+    ``n`` arguments — the others are its criteria — or None for any other
+    function. These add up over the runs of their ranges."""
+    if func == "COUNTIF":
+        return (0,)
+    if func in ("SUMIF", "AVERAGEIF"):
+        return (0, 2) if n > 2 else (0,)
+    if func == "COUNTIFS":
+        return tuple(range(0, n, 2))
+    if func in ("SUMIFS", "AVERAGEIFS"):
+        return (0, *range(1, n, 2))
+    return None
+
+
+@dataclass(frozen=True)
+class NotOneRun:
+    """Why a call over rows is written as the cell's computed value: the
+    cells it reads as one range are not one run (``limit`` None), or,
+    written as their runs, the call passes a limit of the spreadsheet —
+    ``'arguments'`` (``size`` arguments, past 255) or ``'length'`` (a
+    formula of ``size`` characters, past 8,192). ``lines`` holds what it
+    reads whose cells are not one run: the sheet, the line's id (None for
+    a list of lines) and the cells, in order."""
+
+    limit: Optional[str]
+    lines: tuple[tuple[Optional[str], Optional[str], tuple[str, ...]], ...]
+    size: int = 0
 
 
 # Which names are written as ranges, which pass through as ``=NAME(args)``,
@@ -431,8 +512,13 @@ class ExcelRenderer:
         var_to_sheet: Optional[Dict[str, str]] = None,
         identity_cells: Optional[Dict[int, "tuple[str, int]"]] = None,
         time: Optional[Any] = None,
+        periods: Optional[Dict[str, VariableAddresses]] = None,
     ) -> None:
         self.addresses = addresses
+        #: Where a line read as a range stands, when ``addresses`` puts it
+        #: elsewhere: a total column's formula reads a line at its bucket's
+        #: cell, and the whole line — a range — at its own periods.
+        self.periods = periods or {}
         #: The workbook's time (:class:`~.header.BookTime`): where a
         #: ``mo.time`` read lands — this sheet's header row, the anchor,
         #: or the start cell. ``None`` spells time off each row's window.
@@ -450,17 +536,24 @@ class ExcelRenderer:
         #: What the formula being rendered wrote as a number: ``(node,
         #: literal)`` for each sub-expression inlined into a live formula,
         #: and the nodes no formula could stand for (the cell then
-        #: carries its value). Per formula — the translator clears both
+        #: carries its value), each with its cause where one is known
+        #: (:class:`NotOneRun`). Per formula — the translator clears them
         #: before each walk.
         self.inlined: List[tuple[Expr, str]] = []
         self.lossy: List[Expr] = []
+        self.lossy_causes: List[Optional[NotOneRun]] = []
         #: A list of lines many calls share (one range read once, see
         #: ``functions.criteria``) is read once per render: whether it
-        #: holds a series, and the text of its cells per sheet and period —
-        #: keyed by the node, which each entry holds so its id stays its
-        #: own. Nothing a render reads moves while it lasts.
+        #: holds a series, and the text of its cells per sheet and period
+        #: (or why there is none) — keyed by the node, which each entry
+        #: holds so its id stays its own. Nothing a render reads moves
+        #: while it lasts.
         self._listed: Dict[int, tuple[ListExpr, bool]] = {}
-        self._ranges: Dict[tuple[Any, ...], tuple[ListExpr, Optional[str]]] = {}
+        self._ranges: Dict[tuple[Any, ...],
+                           tuple[ListExpr, Optional[str], Optional[NotOneRun]]] = {}
+        #: The runs of a row's cells (``_run_spans``), by the cells: a
+        #: row is split once, however many cells read it.
+        self._spans: Dict[tuple[str, ...], List[tuple[int, int]]] = {}
         self.walker: Any = None  # set by Walker(renderer) constructor
 
     def _note_inlined(self, node: Expr, literal: str, ctx: RenderCtx) -> str:
@@ -470,18 +563,34 @@ class ExcelRenderer:
         self.inlined.append((node, literal))
         return literal
 
-    def _mark_lossy(self, node: Expr, ctx: RenderCtx) -> None:
+    def _mark_lossy(self, node: Expr, ctx: RenderCtx,
+                    cause: Optional[NotOneRun] = None) -> None:
         """No formula can stand for ``node`` here: the whole cell carries
         its computed value (``RenderCtx.lossy_inline``)."""
         ctx.lossy_inline = True
         self.lossy.append(node)
+        self.lossy_causes.append(cause)
 
-    def _ship_value(self, node: Expr, ctx: RenderCtx) -> str:
+    def _ship_value(self, node: Expr, ctx: RenderCtx,
+                    cause: Optional[NotOneRun] = None) -> str:
         """The cell's own computed value, in place of a formula that
         cannot be written around ``node``."""
-        self._mark_lossy(node, ctx)
+        self._mark_lossy(node, ctx, cause)
         return _value_to_excel_literal(
             _value_at_period(getattr(ctx.self_var, "_value", None), ctx.period_idx))
+
+    def _limited(self, node: Expr, text: str, args: int,
+                 reads: Iterable[tuple[str, List[str]]], ctx: RenderCtx) -> str:
+        """``text`` — a call over the rows ``reads`` (id and cells) written
+        as their runs, of ``args`` arguments — or, past what one call or
+        one formula of the spreadsheet holds, the cell's computed value,
+        with the rows whose cells are not one run named."""
+        if args > _MAX_ARGS:
+            return self._ship_value(node, ctx, NotOneRun("arguments", self._split(reads), args))
+        if len(text) >= _MAX_FORMULA_CHARS:
+            return self._ship_value(
+                node, ctx, NotOneRun("length", self._split(reads), len(text) + 1))
+        return text
 
     # ─── Dispatch targets ───────────────────────────────────────
 
@@ -769,16 +878,16 @@ class ExcelRenderer:
         if addr is None or not addr.values or ctx.period_idx >= len(addr.values):
             return None
         cells = [str(a) for a in addr.values[:ctx.period_idx + 1]]
-        if _contiguous_run(cells):
+        spans = _run_spans(cells)
+        if len(spans) == 1:
             first = self._maybe_qualify(cells[0], var_id, ctx.current_sheet)
             return f"SUM({first}:{cells[-1]})"
         # Its cells are not one run (subtotal columns stand between the
-        # months, or a sheet of buckets): every cell, never a range that
-        # takes in the columns between.
-        from .totals import listed_or_ranged
-        return listed_or_ranged(
-            "sum", cells,
-            qualify=lambda ref: self._maybe_qualify(ref, var_id, ctx.current_sheet))
+        # months, or a sheet of buckets): one argument per run, never a
+        # range that takes in the columns between.
+        text = "SUM({})".format(", ".join(
+            self._run_text(cells, lo, hi, var_id, ctx.current_sheet) for lo, hi in spans))
+        return self._limited(VarRef(var), text, len(spans), [(var_id, cells)], ctx)
 
     def _render_twin(self, twin: Any, ctx: RenderCtx) -> str:
         """A reference that lands on the cell being written: ``twin``
@@ -1216,19 +1325,32 @@ class ExcelRenderer:
             if inlined is not None:
                 return inlined
             # ``SUM(a * b)`` over laid-out rows is Excel's SUMPRODUCT.
-            ranges = self._product_ranges(node, ctx)
-            if ranges is not None:
-                return f"SUMPRODUCT({', '.join(ranges)})"
+            rows = self._product_rows(node, ctx)
+            if rows is not None:
+                return self._sumproduct(node, rows, ctx)
+            # A conditional count or sum over rows whose cells are not one
+            # run is the sum of one call per run.
+            summed = self._per_run(node, func, ctx)
+            if summed is not None:
+                return summed
             # A range position is the row's range; any other position
             # is this period's cell (a per-period criterion, a key).
             positions = range_positions(func)
             parts = [
-                self._render_range_or_cell(a, ctx, func)
+                self._render_range_or_cell(a, ctx, func, node)
                 if positions is None or i in positions
                 else self.walker.render(a, ctx)
                 for i, a in enumerate(node.args)
             ]
-            return f"{file_prefix(func)}{excel_name(func)}({', '.join(parts)})"
+            text = f"{file_prefix(func)}{excel_name(func)}({', '.join(parts)})"
+            if len(text) >= _MAX_FORMULA_CHARS:
+                # A row written as its runs can pass what one formula holds.
+                reads = [self._row_cells(a, ctx) for i, a in enumerate(node.args)
+                         if positions is None or i in positions]
+                rows = [read for read in reads if read is not None]
+                if any(len(self._runs(cells)) > 1 for _cid, cells in rows):
+                    return self._limited(node, text, 0, rows, ctx)
+            return text
 
         if is_range_taking(func):
             # One call per period: a list of lines at a range position is
@@ -1345,8 +1467,11 @@ class ExcelRenderer:
         # last: a declared quarter total stands between March and April,
         # and SUM over Feb..Apr would add it in.
         cells = [str(a) for a in addr_obj.values[start_idx:end_idx + 1]]
-        span = self._cells_as_range(cells, var_id, ctx.current_sheet, ctx, node.func)
-        return f"{node.func}({span})"
+        span = self._cells_as_range(cells, var_id, ctx.current_sheet, ctx, node.func, node)
+        text = f"{node.func}({span})"
+        if len(text) >= _MAX_FORMULA_CHARS:
+            return self._limited(node, text, 0, [(var_id, cells)], ctx)
+        return text
 
     @staticmethod
     def _is_native_row(source: Any, addr_obj: Any) -> bool:
@@ -1577,31 +1702,34 @@ class ExcelRenderer:
         return any(self._expr_reads_own_cell(c, seen) for c in _children(expr))
 
     def _render_range_or_cell(
-        self, arg: Expr, ctx: RenderCtx, func: Optional[str] = None,
+        self, arg: Expr, ctx: RenderCtx, func: Optional[str], call: FuncCall,
     ) -> str:
         if isinstance(arg, ListExpr):
             block = self._render_block(arg, ctx)
             return self._render_cell_list(arg, ctx, func) if block is None else block
-        if isinstance(arg, VarRef):
-            cid = self._coord_var_id(arg.var, ctx)
-            if cid is None:
-                # A range over a coordinate nothing in the book carries:
-                # a per-period literal is not a range, so the whole
-                # aggregate degrades to its computed value.
-                self._mark_lossy(arg, ctx)
-                return self.walker.render(arg, ctx)
-            addr_obj = self.addresses.get(cid)
-            if addr_obj is not None and len(addr_obj.values) > 1:
-                return self._resolve_var_range(
-                    cid, ctx.current_sheet, ctx, func,
-                )
-        # A SLICED row inside an aggregate wants the sliced RANGE:
-        # ``SUM(x[0:12])`` → ``SUM(B1:M1)``. (Element-wise slice
-        # rendering lives in ``render_subscript`` and is period-aware;
-        # this is the one context where the whole window is the point.)
-        # The slice arrives either as a bare Subscript node or — the
-        # common DSL shape — as a VarRef to the intermediate Variable
-        # ``x[0:12]`` produced (its ``_expr`` is the Subscript).
+        row = self._row_cells(arg, ctx)
+        if row is not None:
+            # A row's cells, or a window's — which can step over a totals
+            # column too (``x[0:4]`` = Jan–Apr crosses the Q1 total).
+            cid, cells = row
+            return self._cells_as_range(cells, cid, ctx.current_sheet, ctx, func, call)
+        window = self._window(arg)
+        if (isinstance(arg, VarRef) and self._coord_var_id(arg.var, ctx) is None) or (
+                window is not None and self._coord_var_id(window[0], ctx) is None):
+            # A range over a coordinate nothing in the book carries: a
+            # per-period literal is not a range, so the whole aggregate
+            # degrades to its computed value.
+            self._mark_lossy(arg, ctx)
+        return self.walker.render(arg, ctx)
+
+    def _window(self, arg: Expr) -> Optional[tuple[Any, slice]]:
+        """A SLICED row inside an aggregate wants the sliced RANGE:
+        ``SUM(x[0:12])`` → ``SUM(B1:M1)``. (Element-wise slice rendering
+        lives in ``render_subscript`` and is period-aware; this is the one
+        context where the whole window is the point.) The slice arrives
+        either as a bare Subscript node or — the common DSL shape — as a
+        VarRef to the intermediate Variable ``x[0:12]`` produced (its
+        ``_expr`` is the Subscript). The row sliced, and the slice."""
         sub = arg if isinstance(arg, Subscript) else None
         if (
             sub is None
@@ -1615,20 +1743,116 @@ class ExcelRenderer:
             and isinstance(sub.base, VarRef)
             and isinstance(sub.key, slice)
         ):
-            cid = self._coord_var_id(sub.base.var, ctx)
+            return sub.base.var, sub.key
+        return None
+
+    def _range_addr(self, var_id: str) -> Optional[VariableAddresses]:
+        """The cells of a line read as a range: its own periods (see
+        ``periods``)."""
+        return self.periods.get(var_id) or self.addresses.get(var_id)
+
+    def _row_cells(self, arg: Expr, ctx: RenderCtx) -> Optional[tuple[str, List[str]]]:
+        """The id and the cells of a range argument written as a range of
+        its row's cells (``_render_range_or_cell``) — a laid-out row, or a
+        window of one; None for anything else."""
+        if isinstance(arg, VarRef):
+            cid = self._coord_var_id(arg.var, ctx)
             if cid is None:
-                self._mark_lossy(arg, ctx)
-                return self.walker.render(arg, ctx)
-            addr_obj = self.addresses.get(cid)
-            if addr_obj is not None:
-                values = addr_obj.values[sub.key]
-                if len(values) > 1:
-                    # A window can step over a totals column too
-                    # (``x[0:4]`` = Jan–Apr crosses the Q1 total).
-                    return self._cells_as_range(
-                        values, cid, ctx.current_sheet, ctx, func,
-                    )
-        return self.walker.render(arg, ctx)
+                return None
+            addr_obj = self._range_addr(cid)
+            if addr_obj is not None and len(addr_obj.values) > 1:
+                return cid, addr_obj.values
+        window = self._window(arg)
+        if window is not None:
+            base, key = window
+            cid = self._coord_var_id(base, ctx)
+            addr_obj = self._range_addr(cid) if cid is not None else None
+            if cid is not None and addr_obj is not None and len(addr_obj.values[key]) > 1:
+                return cid, addr_obj.values[key]
+        return None
+
+    def _runs(self, cells: List[str]) -> List[tuple[int, int]]:
+        """The runs of these cells (:func:`_run_spans`), split once per
+        render: nothing a render reads moves while it lasts."""
+        key = tuple(cells)
+        spans = self._spans.get(key)
+        if spans is None:
+            spans = self._spans[key] = _run_spans(cells)
+        return spans
+
+    def _split(self, reads: Iterable[tuple[str, List[str]]],
+               ) -> tuple[tuple[Optional[str], Optional[str], tuple[str, ...]], ...]:
+        """Of the rows read (id and cells), those whose cells are not one
+        run — with their sheet, as :class:`NotOneRun` names them."""
+        return tuple((self.var_to_sheet.get(cid), cid, tuple(cells))
+                     for cid, cells in reads if len(self._runs(cells)) > 1)
+
+    def _run_text(self, cells: List[str], lo: int, hi: int, var_id: str,
+                  current_sheet: Optional[str]) -> str:
+        """Cells ``lo``..``hi`` of a line, one run, as a range — its sheet
+        named once, in front — or the one cell."""
+        first = self._maybe_qualify(cells[lo], var_id, current_sheet)
+        return first if hi - lo == 1 else f"{first}:{cells[hi - 1]}"
+
+    def _per_run(self, call: FuncCall, func: str, ctx: RenderCtx) -> Optional[str]:
+        """``COUNTIF`` / ``SUMIF`` and their ``S`` forms over rows whose
+        cells are not one run: the sum of one call per run, every range cut
+        to the same periods, each criteria written once and read by every
+        call; ``AVERAGEIF(S)`` the ratio of those sums to the count of the
+        numbers they add. None where the ranges are one run, or a range is
+        not a row (a list of lines is one range) or not as long as the
+        others."""
+        at = _criteria_ranges(func, len(call.args))
+        if at is None:
+            return None
+        rows: Dict[int, tuple[str, List[str]]] = {}
+        for i in at:
+            read = self._row_cells(call.args[i], ctx)
+            if read is None:
+                return None
+            rows[i] = read
+        if len({len(cells) for _cid, cells in rows.values()}) != 1:
+            return None
+        spans = _united_spans([cells for _cid, cells in rows.values()], self._runs)
+        if len(spans) == 1:
+            return None
+        if len(spans) > _MAX_ARGS:
+            # Counted before a call per run is written: past what one
+            # call takes, the text is never read.
+            return self._ship_value(
+                call, ctx, NotOneRun("arguments", self._split(rows.values()), len(spans)))
+        # Each criteria once: its text stands in every call.
+        written = {i: self.walker.render(arg, ctx)
+                   for i, arg in enumerate(call.args) if i not in rows}
+        sheet = ctx.current_sheet
+
+        def one(name: str, lo: int, hi: int, order: List[Any]) -> str:
+            # ``order``: the call's arguments by position, a text as it is.
+            parts = [i if isinstance(i, str)
+                     else self._run_text(rows[i][1], lo, hi, rows[i][0], sheet) if i in rows
+                     else written[i] for i in order]
+            return f"{file_prefix(name)}{excel_name(name)}({', '.join(parts)})"
+
+        every = list(range(len(call.args)))
+        if func in ("AVERAGEIF", "AVERAGEIFS"):
+            # The mean of the numbers matched: their sum over their count —
+            # a blank, a text or a boolean in the averaged range is not
+            # counted, as the mean skips it. The averaged range leads the
+            # count, which keeps one criteria pair clear of LibreOffice's
+            # COUNTIFS misread of a blank cell at either end of a range;
+            # with two or more pairs a blank at a run's end of the averaged
+            # row is still misread there (Excel reads it right).
+            single = func == "AVERAGEIF"
+            averaged = 2 if single and len(every) > 2 else 0
+            counted = [averaged, _NUMBERS, *(every[:2] if single else every[1:])]
+            total = "SUM({})".format(", ".join(
+                one("SUMIF" if single else "SUMIFS", lo, hi, every) for lo, hi in spans))
+            count = "SUM({})".format(", ".join(
+                one("COUNTIFS", lo, hi, counted) for lo, hi in spans))
+            text = f"({total} / {count})"
+        else:
+            text = "SUM({})".format(", ".join(one(func, lo, hi, every) for lo, hi in spans))
+        return self._limited(call, text, len(spans), rows.values(), ctx)
 
     def _render_cell_list(
         self, node: ListExpr, ctx: RenderCtx, func: Optional[str],
@@ -1651,11 +1875,11 @@ class ExcelRenderer:
                                            tuple(getattr(frame.var, '_keys', None) or ())))
         hit = self._ranges.get(key)
         if hit is not None and hit[0] is node:
-            return self._ship_value(node, ctx) if hit[1] is None else hit[1]
-        text = self._cell_list_text(node, ctx, func, period)
+            return self._ship_value(node, ctx, hit[2]) if hit[1] is None else hit[1]
+        text, cause = self._cell_list_text(node, ctx, func, period)
         if not self._mirrored(node, ctx):
-            self._ranges[key] = (node, text)
-        return self._ship_value(node, ctx) if text is None else text
+            self._ranges[key] = (node, text, cause)
+        return self._ship_value(node, ctx, cause) if text is None else text
 
     # Does a list of lines hold a series — read once per render.
     def _lists_series(self, node: ListExpr) -> bool:
@@ -1676,28 +1900,29 @@ class ExcelRenderer:
                    for item in node.items)
 
     # The text of ``_render_cell_list``, or None where the cell carries its
-    # computed value.
+    # computed value — then with the cause, where its cells are not one run.
     def _cell_list_text(
         self, node: ListExpr, ctx: RenderCtx, func: Optional[str],
         period: Optional[int],
-    ) -> Optional[str]:
+    ) -> tuple[Optional[str], Optional[NotOneRun]]:
         cells: List[tuple[str, str]] = []
         for item in node.items:
             found = self._cell_of(item, ctx, period)
             if found is None:
-                return None
+                return None, None
             cells.append(found)
         refs = [cell for cell, _vid in cells]
         sheets = {self.var_to_sheet.get(vid) for _cell, vid in cells}
         first, vid = cells[0]
         if len(sheets) == 1 and _contiguous_run(refs):
             start = self._maybe_qualify(first, vid, ctx.current_sheet)
-            return start if len(refs) == 1 else f"{start}:{refs[-1]}"
+            return (start if len(refs) == 1 else f"{start}:{refs[-1]}"), None
         if func in self._LIST_SAFE_FUNCS:
             return ", ".join(
                 self._maybe_qualify(cell, vid, ctx.current_sheet) for cell, vid in cells
-            )
-        return None
+            ), None
+        sheet = sheets.pop() if len(sheets) == 1 else None
+        return None, NotOneRun(None, ((sheet, None, tuple(refs)),))
 
     def _render_block(self, node: ListExpr, ctx: RenderCtx) -> Optional[str]:
         """A list of rows as one rectangular range argument — the records
@@ -1713,6 +1938,7 @@ class ExcelRenderer:
 
         rows: List[List[str]] = []
         owners: List[str] = []
+        series: List[tuple[str, List[str]]] = []
         for item in node.items:
             if isinstance(item, ListExpr):
                 cells = item.items
@@ -1737,11 +1963,12 @@ class ExcelRenderer:
                 isinstance(item.var._value, list) or hasattr(item.var._value, "roles")
             ):
                 vid = self._coord_var_id(item.var, ctx)
-                addr = self.addresses.get(vid) if vid is not None else None
+                addr = self._range_addr(vid) if vid is not None else None
                 if vid is None or addr is None:
                     return self._ship_value(node, ctx)
                 rows.append(list(addr.values))
                 owners.append(vid)
+                series.append((vid, rows[-1]))
             else:
                 return None
         if not rows:
@@ -1754,10 +1981,14 @@ class ExcelRenderer:
         if (
             any([c for _r, c in row] != cols for row in grid)
             or any(len({r for r, _c in row}) != 1 for row in grid)
-            or any(b - a != 1 for a, b in zip(cols, cols[1:]))
             or any(b - a != 1 for a, b in zip(tops, tops[1:]))
         ):
             return self._ship_value(node, ctx)
+        if any(b - a != 1 for a, b in zip(cols, cols[1:])):
+            # Rows one under another, in the same columns: only their
+            # runs keep the block from being one range.
+            split = self._split(series)
+            return self._ship_value(node, ctx, NotOneRun(None, split) if split else None)
         first = self._maybe_qualify(rows[0][0], owners[0], ctx.current_sheet)
         last = rows[-1][-1]
         return first if rows[0][0] == last else f"{first}:{last}"
@@ -1832,17 +2063,17 @@ class ExcelRenderer:
                 base_id = self._coord_var_id(sub.base.var, ctx)
                 if base_id is None or base_id in self.addresses:
                     continue            # a window of a laid-out row
-            if self._product_ranges(call, ctx) is not None:
+            if self._product_rows(call, ctx) is not None:
                 continue                # SUM of a product of laid-out rows
             return arg
         return None
 
-    def _product_ranges(self, call: FuncCall, ctx: RenderCtx) -> Optional[List[str]]:
-        """``SUM(a * b * …)`` over laid-out rows of one period range: the
-        rows' ranges, in order — Excel's ``SUMPRODUCT`` over them. None
-        for any other call: a scalar factor, a row the book has no cells
-        for or whose cells are not side by side, a product aligned
-        across windows."""
+    def _product_rows(self, call: FuncCall,
+                      ctx: RenderCtx) -> Optional[List[tuple[str, List[str]]]]:
+        """``SUM(a * b * …)`` over laid-out rows of one period range: each
+        row's id and cells, in order — Excel's ``SUMPRODUCT`` over them.
+        None for any other call: a scalar factor, a row the book has no
+        cells for, a product aligned across windows."""
         if call.func.upper() != "SUM" or len(call.args) != 1:
             return None
         arg = call.args[0]
@@ -1856,22 +2087,41 @@ class ExcelRenderer:
         factors: List[Any] = []
         if not self._product_factors(arg.var._expr, factors, ctx):
             return None
-        ranges: List[str] = []
+        rows: List[tuple[str, List[str]]] = []
         widths: set[int] = set()
         for var in factors:
             cid = self._coord_var_id(var, ctx)
-            addr = self.addresses.get(cid) if cid is not None else None
+            addr = self._range_addr(cid) if cid is not None else None
             if (
                 cid is None or addr is None or len(addr.values) < 2
-                or not _contiguous_run(addr.values)
                 or not self._is_native_row(var, addr)
             ):
                 return None
             widths.add(len(addr.values))
-            ranges.append(self._resolve_var_range(cid, ctx.current_sheet, ctx, "SUMPRODUCT"))
+            rows.append((cid, list(addr.values)))
         if len(widths) != 1 or len(arg.var._value) not in widths:
             return None
-        return ranges
+        return rows
+
+    def _sumproduct(self, call: FuncCall, rows: List[tuple[str, List[str]]],
+                    ctx: RenderCtx) -> str:
+        """``SUMPRODUCT`` over the rows of ``SUM(a * b)``; over rows whose
+        cells are not one run, the sum of one ``SUMPRODUCT`` per run, every
+        row cut to the same periods."""
+        spans = _united_spans([cells for _cid, cells in rows], self._runs)
+        sheet = ctx.current_sheet
+
+        def one(lo: int, hi: int) -> str:
+            return "SUMPRODUCT({})".format(", ".join(
+                self._run_text(cells, lo, hi, cid, sheet) for cid, cells in rows))
+
+        if len(spans) == 1:
+            return one(*spans[0])
+        if len(spans) > _MAX_ARGS:
+            return self._ship_value(
+                call, ctx, NotOneRun("arguments", self._split(rows), len(spans)))
+        text = "SUM({})".format(", ".join(one(lo, hi) for lo, hi in spans))
+        return self._limited(call, text, len(spans), rows, ctx)
 
     def _product_factors(self, expr: Any, out: List[Any], ctx: RenderCtx) -> bool:
         """Collect the rows of a ``*`` chain into ``out``; False where a
@@ -2110,29 +2360,22 @@ class ExcelRenderer:
     #: entirely.
     _LIST_SAFE_FUNCS = {"SUM", "AVERAGE", "MIN", "MAX", "COUNT", "COUNTA", "NPV"}
 
-    def _resolve_var_range(
-        self,
-        var_id: str,
-        current_sheet: Optional[str] = None,
-        ctx: Optional[RenderCtx] = None,
-        func: Optional[str] = None,
-    ) -> str:
-        addr_obj = self.addresses.get(var_id)
-        if addr_obj is None:
-            return var_id
-        if len(addr_obj.values) == 1:
-            return self._maybe_qualify(addr_obj.values[0], var_id, current_sheet)
-        return self._cells_as_range(
-            addr_obj.values, var_id, current_sheet, ctx, func,
-        )
+    #: The variadic functions that read several references as they read
+    #: one range: a row whose cells are not one run is written as one
+    #: argument per run, ``SUM(Data!C4:E4, Data!G4:I4)``.
+    _RUN_FUNCS = {
+        "SUM", "AVERAGE", "MIN", "MAX", "COUNT", "COUNTA", "PRODUCT", "MEDIAN",
+        "STDEV", "STDEVP", "STDEV_S", "STDEV_P", "VAR", "VARP", "VAR_S", "VAR_P", "NPV",
+    }
 
     def _cells_as_range(
         self,
         cells: List[str],
         var_id: str,
         current_sheet: Optional[str],
-        ctx: Optional[RenderCtx],
+        ctx: RenderCtx,
         func: Optional[str],
+        call: Expr,
     ) -> str:
         # A row's cells are NOT always contiguous: declare quarter
         # totals and the bucket columns stand between the months, so
@@ -2140,22 +2383,23 @@ class ExcelRenderer:
         # 90 where the model says 60, in a file that looks right.
         # ``totals.rule_formula`` follows the same rule; this is where
         # every range is built, for a whole row and for a slice of one.
-        if not _contiguous_run(cells):
-            if func in self._LIST_SAFE_FUNCS:
-                # Every cell carries its own sheet prefix: unlike a
-                # range, a list does not share one.
-                return ", ".join(
-                    self._maybe_qualify(v, var_id, current_sheet)
-                    for v in cells
-                )
-            # IRR and friends need a real range and would read a list
-            # as further arguments. The truth beats a formula that
-            # computes something else: fall back to the computed value
-            # (the cell then carries a value, not a formula).
-            if ctx is not None:
-                ctx.lossy_inline = True
-        first = self._maybe_qualify(cells[0], var_id, current_sheet)
-        return f"{first}:{cells[-1]}"
+        spans = self._runs(cells)
+        if len(spans) == 1:
+            first = self._maybe_qualify(cells[0], var_id, current_sheet)
+            return f"{first}:{cells[-1]}"
+        line = (self.var_to_sheet.get(var_id), var_id, tuple(cells))
+        if func in self._RUN_FUNCS:
+            # One argument per run, each naming its sheet: the call's one
+            # range argument becomes as many as the row has runs.
+            args = len(spans) + (len(call.args) - 1 if isinstance(call, FuncCall) else 0)
+            if args > _MAX_ARGS:
+                return self._ship_value(call, ctx, NotOneRun("arguments", (line,), args))
+            return ", ".join(self._run_text(cells, lo, hi, var_id, current_sheet)
+                             for lo, hi in spans)
+        # IRR and the other readers of one ordered range would read a
+        # list as further arguments. The truth beats a formula that
+        # computes something else: the cell carries its computed value.
+        return self._ship_value(call, ctx, NotOneRun(None, (line,)))
 
     def _format_sheet_reference(self, sheet_name: str, cell_addr: str) -> str:
         if _UNQUOTED_SHEET_NAME.match(sheet_name):

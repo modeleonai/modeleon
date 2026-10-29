@@ -292,10 +292,12 @@ class TestNoRunShipsTheValue:
             m.s.mid = MEDIAN(m.data.v).set_display_name("mid")
             m.s.p = PERCENTILE_INC(m.data.v, 0.5).set_display_name("p")
         rows = _rows(_book(m, tmp_path)["Summary"])
-        # Never =MEDIAN(Data!B3:H3), which would read the Q1 total too.
-        assert rows["mid"][0] == 35 and rows["p"][0] == 35
-        assert [(i.kind, i.qpath) for i in check_compat(m, "excel")] == [
-            ("value", m.s.mid.id), ("value", m.s.p.id)]
+        # Never =MEDIAN(Data!B3:H3), which would read the Q1 total too:
+        # MEDIAN reads the row's runs, PERCENTILE one range — its value.
+        assert rows["mid"][0] == "=MEDIAN(Data!B3:D3, Data!F3:H3)" and rows["p"][0] == 35
+        issues = check_compat(m, "excel")
+        assert [(i.kind, i.qpath) for i in issues] == [("value", m.s.p.id)]
+        assert "timeline={'totals': ['quarter'], 'totals_at': 'end'}" in str(issues[0])
 
     def test_a_row_the_book_has_no_cells_for(self, tmp_path):
         m = _model()

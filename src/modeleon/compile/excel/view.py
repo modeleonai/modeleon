@@ -149,6 +149,14 @@ class ResolvedView:
     #: showing a level above through: existing books depend on it (a sheet
     #: with its own view and no totals under a model whose view has them).
     time_totals: tuple = ()
+    #: Where the total columns stand: ``'between'`` — each after its own
+    #: periods, the form above and what an unset field means — or
+    #: ``'end'`` — every one after the last period, a block per kind, the
+    #: finest first: "Jan … Dec (Q1) … (Q4) (year)". At the end a line's
+    #: periods stay one run, so a function that reads a whole row as one
+    #: range stays a live formula. Unlike ``totals`` it inherits: a nearer
+    #: view says ``'between'`` to take an inherited ``'end'`` back.
+    time_totals_at: Optional[str] = None
     #: The word the total columns wear on the month row — "Total Q1",
     #: "Total 2026". The model declares its own language
     #: (``timeline={'totals_word': 'Gesamt'}``); the engine's default
@@ -260,6 +268,25 @@ def totals_kinds(declared: Any) -> tuple:
     return kinds
 
 
+#: Where a view's ``timeline={'totals_at': ...}`` may stand the total
+#: columns: after each bucket's own periods, or all after the last period.
+TOTALS_PLACES = ("between", "end")
+
+
+def totals_placement(declared: Any) -> Optional[str]:
+    """The declared place of the total columns (``None`` when unset), or a
+    refusal naming the places the book knows."""
+    if declared is None:
+        return None
+    if isinstance(declared, str) and declared in TOTALS_PLACES:
+        return declared
+    raise ValueError(
+        f"ExcelView timeline totals_at may name {', '.join(TOTALS_PLACES)}; "
+        f"got {declared!r}. 'between' stands each total column after its own "
+        f"periods, 'end' stands every one after the last period."
+    )
+
+
 class ExcelView(MultiVariable):
     """Presentation settings for the Excel + notebook renderers, as a model.
 
@@ -345,6 +372,7 @@ class ExcelView(MultiVariable):
                 )
         if isinstance(timeline, dict):
             totals_kinds(timeline.get("totals"))     # refuses by name
+            totals_placement(timeline.get("totals_at"))
         for name, value in (
             ("orient", orient),
             ("font", font),
@@ -435,6 +463,7 @@ class ExcelView(MultiVariable):
             time_header=timeline.get("header"),
             time_label_format=timeline.get("label_format"),
             time_totals=totals_kinds(timeline.get("totals")),
+            time_totals_at=totals_placement(timeline.get("totals_at")),
             time_totals_word=timeline.get("totals_word"),
             time_opening=timeline.get("opening"),
             time_repeat_on_anchor=timeline.get("repeat_on_anchor"),

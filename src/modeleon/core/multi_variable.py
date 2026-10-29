@@ -582,8 +582,8 @@ class MultiVariableBase(_MVLifecycle, _MVInspect, Component):
             # that holds none of them yet places nothing — a line adopted
             # into it later is placed again on its own adoption — so the
             # window every constructor sets moves nothing kept.
-            from .variable_ops import _windows_changed
-            _windows_changed()
+            from .variable_ops import _windows_moved
+            _windows_moved()
         if name == 'default_start' and isinstance(value, (date, Variable)):
             self._set_default_start(value)
             return
@@ -671,8 +671,8 @@ class MultiVariableBase(_MVLifecycle, _MVInspect, Component):
                                       or self.__dict__.get('_sliced')):
             # Deleting a window slot changes the window as setting one
             # does: a formula placed through these lines is placed again.
-            from .variable_ops import _windows_changed
-            _windows_changed()
+            from .variable_ops import _windows_moved
+            _windows_moved()
 
     # ``python_name`` property + setter are inherited from :class:`Base`.
 

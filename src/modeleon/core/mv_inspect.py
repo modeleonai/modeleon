@@ -112,8 +112,9 @@ class _MVInspect:
     def detect_cycles(self) -> Optional[List[str]]:
         """Return the first dependency cycle in this MV's subtree, or None.
 
-        Walks the subtree, collects Variables, follows ``_dependency_refs``
-        to build a DAG, runs iterative DFS. Returned list closes the
+        Walks the subtree, collects Variables, follows the lines each
+        reads (``_dependency_refs``, a range read as one expanded into its
+        lines) to build a DAG, runs iterative DFS. Returned list closes the
         cycle (``cycle[0] == cycle[-1]``).
         """
         variables = self._collect_variables()
@@ -123,7 +124,7 @@ class _MVInspect:
         graph: Dict[str, List[str]] = {
             vid: [ref.id for ref in (same_period_refs(var._expr)
                                      if var._expr is not None
-                                     else var._dependency_refs)]
+                                     else var._dependency_lines())]
             for vid, var in variables.items()
         }
 

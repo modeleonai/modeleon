@@ -33,10 +33,14 @@ call is one per period over that period's cells, written as the run they
 form in its column (``=_xlfn.PERCENTILE.INC(Peers!C3:C7, 0.25)``), with
 ``RANK``'s number this period's value of the line ranked. A list holding
 one series alone is refused: the line itself is read over its periods.
-Cells that form no run cannot be one range, so the cell carries the
-computed value and ``check_compat`` lists it — never a comma list, which
-these functions read as further arguments. Inside a loop container a call
-over two or more values runs one period at a time. ``k``, ``quart``,
+A row whose cells form no run — total columns stand between its
+periods — is one argument per run for ``MEDIAN`` and the spreads
+(``=MEDIAN(B2:D2, F2:H2)``). Every other call over cells that form no
+run (the others' one range, a list of lines) cannot be one range, so the
+cell carries the computed value and ``check_compat`` lists it, with why —
+never a comma list, which these functions read as further arguments.
+Inside a loop container a call over two or more values runs one period
+at a time. ``k``, ``quart``,
 ``RANK``'s number and its order are a line — one value, or a series for
 one call per period — or a value typed in (a list typed in is such a
 series, one value per period, never the spreadsheet's array of ``k``),
@@ -115,7 +119,7 @@ from ._helpers import (
 )
 from .criteria import (
     _ERRORS, _cells, _checked, _from_serial, _label, _Lines, _Range, _range, _series_value,
-    _shared, _unit_items,
+    _shared, _Text, _unit_items, _with_source,
 )
 from .registry import per_period_arity, register
 from .text import _number_of
@@ -229,17 +233,15 @@ _Place = tuple[Any, list[Any] | None]
 _NOWHERE: _Place = (None, None)
 
 
-def _result(func: str, nodes: list[Expr], texts: list[str], value: Any,
+def _result(func: str, nodes: list[Expr], texts: Sequence[_Text], value: Any,
             value_type: str, unit: Any, place: _Place = _NOWHERE) -> Variable:
     if isinstance(value, TrackValues):
         var_type = 'list' if value.time_length else 'scalar'
     else:
         var_type = 'list' if isinstance(value, list) else 'scalar'
     with _checked(nodes):
-        out = make_func_var(
-            func, nodes, value, value_type, var_type,
-            source_code=f"{func}({', '.join(texts)})",
-        )
+        out = make_func_var(func, nodes, value, value_type, var_type)
+    _with_source(out, func, texts)
     out._unit = unit
     return placed(out, *place)
 
@@ -428,10 +430,10 @@ def _each_period(raws: list[Any], call: Callable[[list[Any]], Any]) -> Any:
 # Every cell a reduction reads, in reading order, with the AST nodes, the
 # names in the source and the one unit its lines may be in.
 def _operands(args: tuple[Any, ...], where: str) -> tuple[list[Any], list[Expr],
-                                                          list[str], Any]:
+                                                          list[_Text], Any]:
     cells: list[Any] = []
     nodes: list[Expr] = []
-    texts: list[str] = []
+    texts: list[_Text] = []
     for a in args:
         if isinstance(a, (Variable, list, tuple)):
             rng = _range(a, where)
@@ -457,7 +459,7 @@ def _operands(args: tuple[Any, ...], where: str) -> tuple[list[Any], list[Expr],
 # that period's cells; and the AST nodes, the names in the source, the
 # unit the lines share and where the result runs.
 def _reduction(where: str, args: tuple[Any, ...], reduce: Callable[[list[Any]], Any]
-               ) -> tuple[Any, list[Expr], list[str], Any, _Place]:
+               ) -> tuple[Any, list[Expr], Sequence[_Text], Any, _Place]:
     if not args:
         raise ValueError(
             f"{where}() needs at least one argument. "
@@ -483,9 +485,9 @@ def _reduction(where: str, args: tuple[Any, ...], reduce: Callable[[list[Any]], 
         return _each_period(raws, one), nodes, texts, shared_unit(lines), place
     for a in args:
         _refuse_one_series(where, a, f"mo.{where}({{line}}) reduces the line over its periods.")
-    cells, nodes, texts, unit = _operands(args, where)
+    cells, nodes, names, unit = _operands(args, where)
     counted = _counted(cells)
-    return ((counted if isinstance(counted, str) else reduce(counted)), nodes, texts, unit,
+    return ((counted if isinstance(counted, str) else reduce(counted)), nodes, names, unit,
             _NOWHERE)
 
 
@@ -493,7 +495,7 @@ def _reduction(where: str, args: tuple[Any, ...], reduce: Callable[[list[Any]], 
 # what it gives, as ``_reduction`` reads and refuses them, the value worked
 # out once per function — each call gets a list of its own.
 def _one_reduction(where: str, arg: Any, shared: _Lines, reduce: Callable[[list[Any]], Any]
-                   ) -> tuple[Any, list[Expr], list[str], Any, _Place]:
+                   ) -> tuple[Any, list[Expr], Sequence[_Text], Any, _Place]:
     def reduced(cells: list[Any]) -> Any:
         counted = _counted(cells)
         return counted if isinstance(counted, str) else reduce(counted)
@@ -503,13 +505,14 @@ def _one_reduction(where: str, arg: Any, shared: _Lines, reduce: Callable[[list[
             and len(shared.lines) >= (per_period_arity(where) or 2)):
         rng = shared.keep('per period', lambda: _per_period_range(shared, where))
         refuse_mixed_units(where, lines)
-        if any(isinstance(raw, TrackValues) for raw in rng.values):
-            value = _each_period(list(rng.values), reduced)
-            return value, [rng.node], [rng.text], rng.unit, _NOWHERE
         # The lines read on one window and along one set of keys, worked
         # out once: the same for every call over them.
         cells, place = shared.keep(
             'aligned', lambda: _aligned(where, shared.lines, list(rng.values)))
+        if any(isinstance(raw, TrackValues) for raw in cells):
+            # Each call gets its own tracks.
+            return (_each_period(list(cells), reduced), [rng.node], [rng.text], rng.unit,
+                    place)
         value = shared.keep(('reduced', where), lambda: _each_period(list(cells), reduced))
         value = list(value) if isinstance(value, list) else value
         return value, [rng.node], [rng.text], rng.unit, place
@@ -682,7 +685,7 @@ def _param(value: Any, where: str, name: str) -> tuple[Any, Expr, str, bool]:
 # read by date, lines along keys key by key (``_aligned``).
 def _one_range(where: str, array: Any, at: int, params: list[tuple[str, Any]],
                pick: Callable[..., Any], compared: Sequence[Any] = ()
-               ) -> tuple[Any, _Range, list[Expr], list[str], _Place]:
+               ) -> tuple[Any, _Range, list[Expr], list[_Text], _Place]:
     shared = _shared(array)
     if shared is not None:
         by_period = (not shared.row and shared.series
@@ -708,7 +711,7 @@ def _one_range(where: str, array: Any, at: int, params: list[tuple[str, Any]],
     raws: list[Any] = []
     typed: list[bool] = []
     nodes: list[Expr] = []
-    texts: list[str] = []
+    texts: list[_Text] = []
     owners: list[Any] = []
     for name, value in params:
         raw, node, text, is_typed = _param(value, where, name)

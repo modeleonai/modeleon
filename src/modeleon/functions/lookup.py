@@ -116,7 +116,8 @@ from ._helpers import (
 )
 from .conditional import _blank0, _value_type_of
 from .criteria import (
-    _Range, _as_number, _cells, _checked, _index, _label, _range, _same_length, _wildcard,
+    _Range, _Text, _as_number, _cells, _checked, _index, _label, _range, _same_length,
+    _wildcard, _with_source,
 )
 from .registry import register
 
@@ -529,7 +530,7 @@ def _read(where: str, lines: Sequence[Any],
     return raws, window, keys
 
 
-def _result(func: str, nodes: list[Expr], texts: list[str], value: Any,
+def _result(func: str, nodes: list[Expr], texts: Sequence[_Text], value: Any,
             value_type: str, unit: Any) -> Variable:
     """The cell with its formula: a series when the key or a position is
     one; the unit is the returned range's, never the keys' (a position
@@ -537,8 +538,8 @@ def _result(func: str, nodes: list[Expr], texts: list[str], value: Any,
     with _checked(nodes):
         out = make_func_var(
             func, nodes, value, value_type, 'list' if isinstance(value, list) else 'scalar',
-            source_code=f"{func}({', '.join(texts)})",
         )
+    _with_source(out, func, texts)
     out._unit = unit
     return out
 

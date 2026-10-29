@@ -15,7 +15,7 @@ as data for any tooling that wants to flag fallback-bound nodes.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterator, List, Optional, Set
+from typing import Any, Dict, Iterator, List, Optional, Set
 
 from ..core.expr import Expr, FuncCall, ListExpr, Literal, VarRef
 
@@ -43,6 +43,7 @@ class CompatIssue:
     period: Optional[int] = None    # a cell: its period index
     inlined: Optional[str] = None   # a cell: the sub-expression written as a number
     literal: Optional[str] = None   # an inlined cell: the number written in its place
+    hint: Optional[str] = None      # a value cell: why, and the way out where there is one
 
     def __str__(self) -> str:
         if self.kind == "layout":
@@ -54,7 +55,8 @@ class CompatIssue:
             )
         if self.kind == "value":
             why = f" — no formula stands for {self.inlined}" if self.inlined else ""
-            return f"{self.qpath}[{self.period}]: written as its value{why}"
+            hint = f"; {self.hint}" if self.hint else ""
+            return f"{self.qpath}[{self.period}]: written as its value{why}{hint}"
         backends = ", ".join(sorted(self.declared))
         return (
             f"{self.func}: {self.kind}_backends={{{backends}}} "
@@ -228,6 +230,11 @@ def _excel_cell_issues(root: Any, target: str) -> List[CompatIssue]:
         CompatIssue(func=msg, kind="layout", declared=frozenset(), target=target)
         for msg in engine.refusals
     )
+    # Every line by its id, gathered at the first cause to name the lines
+    # a call read as one range; the way out once per cause and position,
+    # as every period of a call per period gets the same text.
+    lines: Dict[str, Any] = {}
+    hints: Dict[Any, str] = {}
     for sheet_mv, sheet_name in zip(roots, sheet_names):
         for _name, comp in sheet_mv.walk():
             if not isinstance(comp, Variable):
@@ -242,12 +249,150 @@ def _excel_cell_issues(root: Any, target: str) -> List[CompatIssue]:
                 formula = cell_formula(comp, i, var_id, translator, sheet_name, addr)
                 if formula is None:
                     refused = getattr(translator, "last_render_lossy_terms", [])
-                    issues.append(_cell_issue(
-                        "value", target, var_id, i, refused[0] if refused else None, None))
+                    causes = getattr(translator, "last_render_lossy_causes", [])
+                    node = refused[0] if refused else None
+                    cause = causes[0] if causes else None
+                    hint = None
+                    if cause is not None:
+                        if not lines:
+                            lines.update(_lines_by_id(roots, addresses))
+                        key = (cause, _read_by_position(node, cause))
+                        hint = hints.get(key)
+                        if hint is None:
+                            hint = hints[key] = _way_out(
+                                cause, key[1], engine.totals_by_sheet, lines)
+                    issues.append(_cell_issue("value", target, var_id, i, node, None, hint))
                     continue
                 for node, literal in getattr(translator, "last_render_inlined_terms", []):
                     issues.append(_cell_issue("inlined", target, var_id, i, node, literal))
     return issues
+
+
+def _lines_by_id(roots: List[Any], addresses: Dict[str, Any]) -> Dict[str, Any]:
+    """Every line of the workbook by its id."""
+    from ..core.variable import Variable
+    from .excel.writer import _resolve_var_id
+
+    lines: Dict[str, Any] = {}
+    for sheet_mv in roots:
+        for _name, comp in sheet_mv.walk():
+            found = _resolve_var_id(comp, addresses) if isinstance(comp, Variable) else None
+            if found is not None:
+                lines.setdefault(found, comp)
+    return lines
+
+
+def _way_out(cause: Any, at: Optional[int], plans: Dict[Any, Any],
+             lines: Dict[str, Any]) -> str:
+    """Why a call over rows whose cells are not one run is written as its
+    value (a :class:`~.excel.renderer.NotOneRun`), and the way out: where
+    total columns, and nothing else, stand between a line's periods, the
+    view's ``totals_at`` puts them after the last period — and an
+    ``INDEX`` over the one line may read that period by position ``at``
+    (:func:`_read_by_position`) instead."""
+    from .excel.view import resolve_excel_view
+
+    names = list(dict.fromkeys(_line_name(vid, lines) for _sheet, vid, _cells in cause.lines))
+    one = len(names) == 1
+    who = _joined(names)
+    totals = all(_between_totals(plans.get(sheet), cells) for sheet, _vid, cells in cause.lines)
+    if cause.limit == "arguments":
+        text = (f"written as its runs, the call takes {cause.size} arguments, "
+                f"past the 255 one call takes")
+    elif cause.limit == "length":
+        text = (f"written as its runs, the formula is {cause.size:,} characters, "
+                f"past the 8,192 one formula holds")
+    else:
+        text = f"{who} {'is' if one else 'are'} read as one range"
+    if not totals:
+        if cause.limit is None:
+            text += f", and {'its' if one else 'their'} cells are not one run"
+        return text
+    # Each sheet read, in order: its total columns, what its first line
+    # read declares, and the lines read on it.
+    kinds: Dict[Any, List[str]] = {}
+    declared: Dict[Any, List[str]] = {}
+    on: Dict[Any, List[str]] = {}
+    for sheet, vid, _cells in cause.lines:
+        if sheet not in kinds:
+            kinds[sheet] = list(plans[sheet].kinds)
+            line = lines.get(vid) if vid is not None else None
+            declared[sheet] = (list(resolve_excel_view(line).time_totals or ())
+                               if line is not None else [])
+        on.setdefault(sheet, []).append(_line_name(vid, lines))
+    first = next(iter(kinds))
+    if len({(tuple(kinds[s]), tuple(declared[s])) for s in kinds}) == 1:
+        where = (f"the {_joined(kinds[first])} total columns stand between "
+                 + (f"{'its' if one else 'their'} periods" if cause.limit is None
+                    else f"the periods of {who}"))
+        timeline = f"{{'totals': {declared[first] or kinds[first]!r}, 'totals_at': 'end'}}"
+    else:
+        # Sheets with totals of their own: 'totals_at' alone reaches each
+        # of them, and each keeps its own 'totals'.
+        where = ", ".join(
+            f"the {_joined(kinds[sheet])} total columns "
+            f"{'stand between the periods of' if sheet == first else 'between those of'} "
+            f"{_joined(list(dict.fromkeys(on[sheet])))}" for sheet in kinds)
+        timeline = "{'totals_at': 'end'}"
+    text += (f"{', and' if cause.limit is None else ';'} {where}: put them after the last "
+             f"period, timeline={timeline}")
+    if at is not None and one:
+        text += (f", or read {'the last' if at == -1 else 'that'} period by position, "
+                 f"{names[0]}[{at}]")
+    return text
+
+
+def _read_by_position(node: Any, cause: Any) -> Optional[int]:
+    """The period an ``INDEX`` over the one line of ``cause`` reads, as a
+    position: a literal ``k`` is ``k - 1``, the line's own ``COUNT`` is
+    ``-1``; None for any other index, or a call over anything else."""
+    if not (isinstance(node, FuncCall) and node.func.upper() == "INDEX"
+            and len(node.args) == 2 and len(cause.lines) == 1):
+        return None
+    line, index = node.args
+    _sheet, vid, cells = cause.lines[0]
+    if not (isinstance(line, VarRef) and line.var.id == vid):
+        return None
+    if isinstance(index, Literal):
+        k = index.value
+        if isinstance(k, int) and not isinstance(k, bool) and 1 <= k <= len(cells):
+            return k - 1
+        return None
+    count = getattr(index.var, "_expr", None) if isinstance(index, VarRef) else index
+    if (isinstance(count, FuncCall) and count.func.upper() == "COUNT" and len(count.args) == 1
+            and isinstance(count.args[0], VarRef) and count.args[0].var is line.var):
+        return -1
+    return None
+
+
+def _between_totals(plan: Any, cells: Any) -> bool:
+    """Do total columns, and nothing else, stand between these cells of
+    one row — in a book of one column a period (no compare groups)?"""
+    from openpyxl.utils.cell import coordinate_to_tuple
+
+    from .excel.totals import NATIVE
+
+    if plan is None or plan.stride != 1:
+        return False
+    kind_at = {col: key[0] for key, col in plan.col_of.items()}
+    at = [coordinate_to_tuple(cell) for cell in cells]
+    cols = [c for _r, c in at]
+    if len({r for r, _c in at}) != 1 or any(b <= a for a, b in zip(cols, cols[1:])):
+        return False
+    gaps = [g for a, b in zip(cols, cols[1:]) for g in range(a + 1, b)]
+    return bool(gaps) and all(kind_at.get(g, NATIVE) != NATIVE for g in gaps)
+
+
+def _line_name(var_id: Optional[str], lines: Dict[str, Any]) -> str:
+    """A line as a formula spells it; a list of lines is "the list"."""
+    if var_id is None:
+        return "the list"
+    line = lines.get(var_id)
+    return VarRef(line).to_string() if line is not None else var_id.rsplit(".", 1)[-1]
+
+
+def _joined(words: List[str]) -> str:
+    return words[0] if len(words) == 1 else f"{', '.join(words[:-1])} and {words[-1]}"
 
 
 def _tries_a_formula(var: Any, period_idx: int) -> bool:
@@ -272,12 +417,13 @@ def _tries_a_formula(var: Any, period_idx: int) -> bool:
 
 def _cell_issue(
     kind: str, target: str, qpath: str, period: int, node: Any, literal: Optional[str],
+    hint: Optional[str] = None,
 ) -> CompatIssue:
     text = _spelled(node)
     func = node.func.upper() if isinstance(node, FuncCall) else text
     return CompatIssue(
         func=func or "", kind=kind, declared=frozenset(), target=target,
-        qpath=qpath, period=period, inlined=text, literal=literal,
+        qpath=qpath, period=period, inlined=text, literal=literal, hint=hint,
     )
 
 

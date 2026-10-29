@@ -21,7 +21,7 @@ honestly stand:
 import os
 import re
 import tempfile
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import openpyxl
 import pytest
@@ -1296,7 +1296,7 @@ class TestRangesNeverSwallowATotal:
     twice, in a file that looks perfectly valid.
 
     ``totals.rule_formula`` lists explicit refs for its own buckets;
-    the same rule holds wherever a range is built.
+    wherever else a range is built, a row is written as its runs.
     """
 
     def _book(self, totals, n=6, fn=None):
@@ -1325,17 +1325,16 @@ class TestRangesNeverSwallowATotal:
                    if ws.cell(r, 1).value == "Total flow")
         return ws.cell(row, 2).value
 
-    def test_an_interleaved_row_lists_its_cells(self):
+    def test_an_interleaved_row_is_written_as_its_runs(self):
         # Months C,D,E then the Q1 total at F, then G,H,I. The range
-        # form would add F twice over: 90 for a model that says 60.
-        formula = self._book(["quarter"])
-        assert ":" not in formula
-        assert formula.replace(" ", "") == "=SUM(C3,D3,E3,G3,H3,I3)"
+        # form would add F twice over: 90 for a model that says 60. One
+        # argument per run, never a cell each.
+        assert self._book(["quarter"]) == "=SUM(C3:E3, G3:I3)"
 
-    def test_an_interleaved_row_on_another_sheet_qualifies_every_cell(self):
-        # A list of cells is not a range: a sheet prefix binds to one
-        # cell only. Unqualified, every cell after the first would be
-        # read from the CURRENT sheet and the sum would silently be wrong.
+    def test_an_interleaved_row_on_another_sheet_qualifies_every_run(self):
+        # A sheet prefix binds to one argument only. Unqualified, every
+        # run after the first would be read from the CURRENT sheet and
+        # the sum would silently be wrong.
         import os
         import tempfile
 
@@ -1361,10 +1360,7 @@ class TestRangesNeverSwallowATotal:
                    if ws.cell(r, 1).value == "Total flow")
         formula = next(ws.cell(row, c).value for c in range(2, ws.max_column + 1)
                        if str(ws.cell(row, c).value or "").startswith("="))
-        assert formula.startswith("=SUM(") and ":" not in formula
-        cells = [a.strip() for a in formula[len("=SUM("):-1].split(",")]
-        assert len(cells) == 6
-        assert all(c.startswith("P!") for c in cells), formula
+        assert formula == "=SUM(P!B3:D3, P!F3:H3)"
 
     def test_a_contiguous_row_keeps_its_range(self):
         # Nothing stands between the months — the compact form is both
@@ -1433,34 +1429,28 @@ class TestRangesNeverSwallowATotal:
                    if ws.cell(r, 1).value == "Result")
         return wb, ws.cell(row, 2).value, home.result.value
 
-    @staticmethod
-    def _sum_of_listed_cells(wb, formula, sheet):
-        # Read ``=SUM(a, b, …)`` the way Excel does: each argument is
-        # one cell, on its own sheet when it names one.
-        assert formula.startswith("=SUM(") and ":" not in formula, formula
-        total = 0.0
-        for ref in formula[len("=SUM("):-1].split(","):
-            where, _, addr = ref.strip().rpartition("!")
-            total += wb[where or sheet][addr].value
-        return total
+    @classmethod
+    def _sum_of_cells_read(cls, wb, formula, sheet):
+        # Read ``=SUM(a, b:c, …)`` the way Excel does: each argument a
+        # cell or a run of them, on its own sheet when it names one.
+        assert formula.startswith("=SUM("), formula
+        return sum(wb[s].cell(r, c).value for s, c, r in cls._cells_read(formula, sheet))
 
-    def test_a_sliced_window_lists_its_cells(self):
+    def test_a_sliced_window_is_written_as_its_runs(self):
         # C,D,E are Jan–Mar, F the Q1 total, G April. ``C3:G3`` would
         # read 160 for a model that says 100.
         wb, formula, value = self._sliced(
             lambda x: mo.SUM(x[0:4]), [10.0, 20.0, 30.0, 40.0, 50.0, 60.0])
         assert value == 100.0
-        assert formula.replace(" ", "") == "=SUM(C3,D3,E3,G3)"
-        assert self._sum_of_listed_cells(wb, formula, "P") == value
+        assert formula == "=SUM(C3:E3, G3)"
+        assert self._sum_of_cells_read(wb, formula, "P") == value
 
-    def test_a_sliced_window_on_another_sheet_qualifies_every_cell(self):
+    def test_a_sliced_window_on_another_sheet_qualifies_every_run(self):
         wb, formula, value = self._sliced(
             lambda x: mo.SUM(x[0:4]), [10.0, 20.0, 30.0, 40.0, 50.0, 60.0],
             other_sheet=True)
-        cells = [a.strip() for a in formula[len("=SUM("):-1].split(",")]
-        assert len(cells) == 4
-        assert all(c.startswith("P!") for c in cells), formula
-        assert self._sum_of_listed_cells(wb, formula, "S") == value == 100.0
+        assert formula == "=SUM(P!B3:D3, P!F3)"
+        assert self._sum_of_cells_read(wb, formula, "S") == value == 100.0
 
     def test_a_sliced_window_inside_one_quarter_keeps_its_range(self):
         wb, formula, value = self._sliced(
@@ -1477,11 +1467,13 @@ class TestRangesNeverSwallowATotal:
         assert value == 150.0
 
     def test_a_stepped_window_lists_its_cells(self):
-        # Every other month is never side by side, totals or not.
+        # Every other month is never side by side, totals or not: a run
+        # of one cell each.
         wb, formula, value = self._sliced(
             lambda x: mo.SUM(x[0:6:2]), [10.0, 20.0, 30.0, 40.0, 50.0, 60.0])
         assert value == 90.0
-        assert self._sum_of_listed_cells(wb, formula, "P") == value
+        assert formula == "=SUM(C3, E3, H3)"
+        assert self._sum_of_cells_read(wb, formula, "P") == value
 
     def test_a_sliced_window_for_a_range_only_function_is_its_value(self):
         # ``IRR(C3:H3, 0.1)`` would take the Q1 total as a cash flow.
@@ -1571,27 +1563,30 @@ class TestRangesNeverSwallowATotal:
             assert read == [(sheet, c, flow_row) for c in months[i - 2:i + 1]], (i, cell)
             assert fold([wb[s].cell(r, c).value for s, c, r in read]) == pytest.approx(value)
         # Jan..Mar sits inside Q1: the compact range. Feb..Apr steps over
-        # the Q1 total: its cells, listed.
-        assert ":" in cells[2][0] and ":" not in cells[3][0]
+        # the Q1 total: its runs.
+        assert cells[2][0] == f"={func}(B3:D3)" and cells[3][0] == f"={func}(C3:D3, F3)"
 
-    def test_a_rolling_window_on_another_sheet_qualifies_every_cell(self):
+    def test_a_rolling_window_on_another_sheet_qualifies_every_run(self):
         wb, sheet, flow_row, months, cells = self._rolling("SUM", sum, other_sheet=True)
         april, value = cells[3]
-        assert april.count("P!") == 3 and ":" not in april, april
+        assert april == "=SUM(P!C3:D3, P!F3)"
         read = self._cells_read(april, sheet)
         assert read == [("P", c, flow_row) for c in months[1:4]]
         assert sum(wb[s].cell(r, c).value for s, c, r in read) == value
 
-    def test_a_rolling_window_a_list_cannot_feed_is_its_value(self):
-        # MEDIAN is not among the functions that read a list of cells the
-        # way they read a range: across the Q1 total the cell carries the
-        # model's number, inside one quarter it stays a live range.
+    def test_a_rolling_median_reads_its_runs(self):
+        # MEDIAN reads several references as it reads one range: across
+        # the Q1 total the window is its runs, live like the others.
         import statistics
 
-        _wb, _sheet, _row, _months, cells = self._rolling("MEDIAN", statistics.median)
+        wb, sheet, _row, _months, cells = self._rolling("MEDIAN", statistics.median)
         (mar, _), (apr, apr_value), (may, may_value), (jun, _) = cells[2:]
-        assert str(mar).startswith("=MEDIAN(") and str(jun).startswith("=MEDIAN(")
-        assert apr == pytest.approx(apr_value) and may == pytest.approx(may_value)
+        assert mar == "=MEDIAN(B3:D3)" and jun == "=MEDIAN(F3:H3)"
+        assert apr == "=MEDIAN(C3:D3, F3)" and may == "=MEDIAN(D3, F3:G3)"
+        for cell, value in ((apr, apr_value), (may, may_value)):
+            read = self._cells_read(cell, sheet)
+            assert statistics.median(
+                wb[s].cell(r, c).value for s, c, r in read) == pytest.approx(value)
 
 
 class TestADurationIsADayCount:
@@ -2463,3 +2458,93 @@ class TestHowAValueAddsUp:
         assert self._year(m.e.cost)._value == "#VALUE!"
         v = m.e.cum_rev.value
         assert self._year(m.e.cum_rev)._value == [v[11], v[23]]      # a running total of its sum
+
+
+class TestAOneCellFormulaOverTracks:
+    """A reduction over a plan/actual line (``mo.SUM``) is one cell per
+    track, the same number at every grain: it copies, as the same formula
+    over an untracked line does, instead of a ``#VALUE!`` total."""
+
+    def test_a_sum_over_a_tracked_line_keeps_its_cells(self):
+        from modeleon.core.projection import project_line
+        from modeleon.core.tracks import TrackValues
+
+        m = mo.Model("m", default_grain="month", default_start="2026-01", default_periods=12,
+                     tracks=mo.Tracks("plan", "actual"),
+                     default_excel_view=mo.ExcelView(timeline={"totals": ["quarter", "year"]}))
+        with m:
+            m.p = mo.MultiVariable("PnL")
+            m.p.revenue = mo.Variable(plan=[100.0] * 12, actual=[90.0] * 3 + [None] * 9,
+                                      regrain=mo.up("sum"), display_name="Revenue")
+            m.s = mo.MultiVariable("FY", default_grain="year", default_start="2026",
+                                   default_periods=1)
+            m.s.revenue = mo.SUM(m.p.revenue).set_display_name("Revenue FY")
+            m.s.half = (m.s.revenue / 2).set_display_name("Half of it")
+        for line in (m.s.revenue, m.s.half):
+            for grain in ("quarter", "year"):
+                got = project_line(line, grain, {}, on_error="absorb")
+                assert not getattr(got, "_regrain_error", None), (line.python_name, grain)
+                assert isinstance(got._value, TrackValues)
+                assert got._value["plan"] == line._value["plan"]
+                assert got._value["actual"] == line._value["actual"]
+        path = os.path.join(tempfile.mkdtemp(), "t.xlsx")
+        m.to_excel(path)
+        ws = openpyxl.load_workbook(path)["FY"]
+        cells = [c for row in ws.iter_rows(values_only=True) for c in row if c is not None]
+        assert "#VALUE!" not in cells, cells
+
+
+class TestHeaderRows:
+    """The rows repeated at the top of each sheet (``default_header``)
+    are no rows of the model — the layout makes them — so the lines'
+    pass never met them and their buckets stood empty (a book viewed
+    «only year» showed blank header rows). Each reads the bucket cell
+    of the row it repeats."""
+
+    @staticmethod
+    def _model():
+        m = mo.Model("m", default_grain="quarter", default_start="2024-Q1", default_periods=8)
+        with m:
+            m.default_excel_view = mo.ExcelView(
+                timeline={"header": True, "totals": ["year"], "repeat_on_anchor": True})
+            m.timing = mo.MultiVariable("Timing")
+            with m.timing as t:
+                t.start = mo.Variable(mo.time.start, display_name="Period start")
+                t.end = mo.Variable(mo.time.end, display_name="Period end")
+                t.index = mo.Variable(mo.time.index, display_name="Period number")
+            m.ops = mo.MultiVariable("Operations")
+            with m.ops as o:
+                o.revenue = mo.Variable([1.0] * 8, display_name="Revenue", regrain=mo.up("sum"))
+            m.default_header = [m.timing.start, m.timing.end, m.timing.index]
+        return m
+
+    def test_a_header_row_reads_the_bucket_of_the_row_it_repeats(self):
+        wb = _book(self._model())
+        ops, timing = wb["Operations"], wb["Timing"]
+        # Each year total of a header row is the row's own year total.
+        assert [ops[c].value for c in ("F3", "F4", "F5")] == [
+            "=Timing!F7", "=Timing!F8", "=Timing!F9"]
+        assert [ops[c].value for c in ("K3", "K4", "K5")] == [
+            "=Timing!K7", "=Timing!K8", "=Timing!K9"]
+        # The anchor repeating its own rows at its top reads them below.
+        assert [timing[c].value for c in ("F3", "F4", "F5")] == ["=F7", "=F8", "=F9"]
+        assert timing["F7"].value == "=DATE(2024,1,1)"
+        # Bold as a bucket, in the mirror's look as its period cells are,
+        # in the row's own number format.
+        assert ops["F3"].font.bold and ops["F3"].font.italic
+        assert ops["F3"].number_format == timing["F7"].number_format
+        assert ops["B3"].font.italic and not ops["B3"].font.bold
+
+    def test_a_header_row_whose_anchor_draws_no_bucket_shows_its_value(self):
+        # The anchor's sheet opts out of the totals: the row it repeats
+        # has no bucket cell to read, so the header row shows the value
+        # the row would have there.
+        m = self._model()
+        m.timing.default_excel_view = mo.ExcelView(timeline={"totals": []})
+        wb = _book(m)
+        assert [c.value for c in wb["Timing"][1]][1:3] == ["Q1 2024", "Q2 2024"]
+        ops = wb["Operations"]
+        assert [ops[c].value for c in ("F3", "F4", "F5")] == [
+            datetime(2024, 1, 1), datetime(2024, 12, 31), 1]
+        assert ops["K3"].value == datetime(2025, 1, 1)
+        assert ops["F7"].value == "=SUM(B7,C7,D7,E7)"

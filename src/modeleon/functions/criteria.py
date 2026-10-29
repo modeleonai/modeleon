@@ -13,9 +13,17 @@ cells, over scalars only one number. A range argument is a row
 Python list of scalar lines whose cells stand one under another in a
 column (a field down the records of a table, a block of scalar lines),
 written as a vertical range, ``Deals!C3:C5``; one element of a row,
-``flow[0]``, is such a line too. Cells that form no run cannot be one
-range: the cell carries the computed value and ``check_compat`` lists it
-— never a comma list, which these functions read as further arguments.
+``flow[0]``, is such a line too. A row whose cells form no run — total
+columns stand between its periods — is read run by run: ``COUNT`` and
+``COUNTA`` take one argument per run, a conditional count or sum is the
+sum of one call per run, every range cut to the same periods
+(``=SUM(COUNTIF(B2:D2, ">5"), COUNTIF(F2:H2, ">5"))``), and a
+conditional mean the ratio of those sums to the count of the numbers
+they add. ``MAXIFS`` / ``MINIFS`` over such a row, and a conditional
+aggregate over a list of lines whose cells form no run, cannot be one
+range: the cell carries the computed value and ``check_compat`` lists it,
+with why — never a comma list, which these functions read as further
+arguments (``COUNT`` and ``COUNTA`` list such a list's cells).
 
 The criteria is read as the spreadsheet reads it, once, in
 :func:`parse_criteria` and :func:`matches`: a number, a date or a boolean
@@ -100,11 +108,12 @@ from functools import partial
 from itertools import chain
 from typing import Any, Callable, Iterator, Sequence
 
+from ..core import variable_ops
 from ..core.expr import Expr, FuncCall, ListExpr, Literal, Subscript, VarRef
 from ..core.shape import reject_axised
 from ..core.unit import UNSETTLED
 from ..core.variable import Variable
-from ..core.variable_ops import _to_serial
+from ..core.variable_ops import _RANGE_WINDOWS, _reads_on, _to_serial, _watch
 from ._helpers import (
     UnitLaw, _per_period, align_keyed, align_located, is_error, make_func_var, placed,
     operand_unit, same_unit,
@@ -455,11 +464,35 @@ def matches(value: Any, criteria: Any) -> bool:
 # ─── The arguments ──────────────────────────────────────────────────
 
 
+# A list of lines as a call's source names it, ``[a.amount, b.amount]``,
+# written once each time the range is read, from the lines as they are
+# named then: every call over the range holds this one object, never a text
+# that lists each line (``Variable._source_call``), and a call keeps the
+# names its lines had when it was made, as the rest of its source does.
+class _RangeText:
+    __slots__ = ('text',)
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    def __str__(self) -> str:
+        return self.text
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (_RangeText, (self.text,))
+
+
+#: An argument's name in a call's source: a text, or the text of a list of
+#: lines, written when its range was read.
+_Text = str | _RangeText
+
+
 @dataclass
 class _Range:
     values: list[Any]
     node: Expr
-    text: str
+    #: Its name in the source; ``str()`` of it reads it.
+    text: _Text
     unit: Any
     value_type: str | None
     #: The range read once, when the range is one (see ``_shared``).
@@ -482,20 +515,13 @@ def _label(var: Variable) -> str:
     """How a line in a list is named in ``_source_code``: the record it
     belongs to and its own name (``a.amount``), one element of a row as
     ``a.flow[0]``, else its name."""
-    return _label_of(var)[0]
-
-
-# The name, and whether it is read off the line's own path alone — a path
-# the line keeps (``_qualified_id``), replaced whenever the line moves or
-# is named (one element of a row is named by the row's).
-def _label_of(var: Variable) -> tuple[str, bool]:
     parts = str(var.path).split('.')
     if len(parts) >= 2 and parts[0] != '__floating__' and var.python_name:
-        return '.'.join(parts[-2:]), var._qualified_id is not None
+        return '.'.join(parts[-2:])
     inner = getattr(var, '_expr', None)
     if isinstance(inner, Subscript) and isinstance(inner.base, VarRef):
-        return f"{_label(inner.base.var)}[{inner.key!r}]", False
-    return src(var), var._qualified_id is not None
+        return f"{_label(inner.base.var)}[{inner.key!r}]"
+    return src(var)
 
 
 def _series_value(raw: Any) -> bool:
@@ -510,6 +536,17 @@ def _typed_in(var: Variable) -> bool:
         var = inner.base.var
         inner = var._expr
     return not var.is_formula
+
+
+def _rows_named(lines: Sequence[Variable]) -> Iterator[Variable]:
+    """The rows the elements among ``lines`` are elements of (``flow[0]``
+    of ``flow``), in order."""
+    for var in lines:
+        inner = var._expr
+        while isinstance(inner, Subscript) and isinstance(inner.base, VarRef):
+            row = inner.base.var
+            yield row
+            inner = row._expr
 
 
 def _cells(var: Variable, raw: Any) -> list[Any]:
@@ -576,27 +613,68 @@ def _series_in_range(where: str, item: Variable) -> ValueError:
 
 # A row, or a list of lines, is read once and shared by every call over
 # the same lines — the same objects, in the same order: one AST node that
-# every call's formula holds, so a renderer writes the range once, and
-# what the calls read of the lines (their cells, their names in the
-# source, the unit they share) and derive from the cells (the numbers
-# sorted, the cells indexed by value), each read or derived once and kept
-# with the node. Each call first checks that every line still holds the
-# value it held when read — the same object, and of a list each cell the
-# same object, the list as long — and the same unit and path, and reads
-# the lines again when one does not: the engine replaces a line's value
-# when it computes it again (a loop closing, a schedule laid out on
-# adoption), and a list can be changed in place (the caller's own list a
-# line was given, the one ``value`` hands out). A list holding a value
-# typed in among its lines is read by each call, as it is short.
+# every call's formula holds, and depends on as ONE dependency (the node
+# depends on its lines, ``Variable._dependency_refs``), so a renderer writes
+# the range once, and what the calls read of the lines (their cells, the
+# unit they share) and derive from the cells (the numbers sorted, the cells
+# indexed by value), each read or derived once and kept with the node; a
+# call's source names the lines as they are named when the range is read
+# (``_RangeText``).
+#
+# Before each reuse the range is read again when anything it was read from
+# may have changed. Each line it reads holds it weakly (``_watched``; one
+# element of a row, ``flow[0]``, is named by its row, which holds it too),
+# and a write to such a line marks the ranges read from it, and no other
+# (``core/variable_ops._line_written``): its value replaced — the engine
+# replaces a line's value when it computes it again, a loop closing, a
+# schedule laid out on adoption — its unit, its path or name, its
+# expression, any field set on it but how it is shown; a row read ahead
+# taking its line's definition; its placement dropped. A window that moves
+# moves the windows' count (the dates a line runs on). A range holding an
+# unnamed per-period formula, which runs on the window of the lines it
+# reads, asks where each such formula runs once the placements' count has
+# moved, and is read again only when one runs elsewhere. The mark and the
+# counts answer for everything a write announces, whatever the range's size.
+# What no write announces is compared at each reuse: a list can be changed
+# in place (the caller's own list a line was given, the one ``value`` hands
+# out), so each cell of a list a line holds is compared by identity, the
+# list as long — a cheaper law would have to trust the caller never to
+# touch the list again; and empty text a line holds reads as a blank or as
+# a formula's empty text by what the line is, which an element of a row
+# takes from its row. A list holding a value typed in among its lines is
+# read by each call, as it is short.
 
 _VALUE = operator.attrgetter('_value')
 _UNIT = operator.attrgetter('_unit')
-_PATH = operator.attrgetter('_qualified_id')
 
 #: The ranges read, by the identities of their lines, each a weak
 #: reference to its node; what was read lives on the node and goes with it.
 _ROWS: dict[int, Any] = {}
 _LISTS: dict[tuple[int, ...], Any] = {}
+#: The range last found for a list object, by the object's identity — a
+#: weak reference to its node. A call over the same list (the rank of each
+#: record among one list of peers) finds its range there, its items compared
+#: with the range's lines one by one by identity, as the list may have
+#: changed since — a tuple cannot change, so a tuple found once is its
+#: range at once after; a list met for the first time, or changed, is
+#: looked up by the identities of all its lines.
+_BY_LIST: dict[int, Any] = {}
+
+
+# A per-period formula that runs on the window of the lines it reads, which
+# any window moving may move: an unnamed one, or one named in containers
+# that declare no dated window (``variable_ops._place_of`` places it so). A
+# single value runs on none.
+def _placed_by_its_lines(var: Variable) -> bool:
+    d = var.__dict__
+    if not (_series_value(var._value) and var._grain is None and var._expr is not None):
+        return False
+    if d.get('_forward_of'):
+        return False
+    if not (d.get('_owner') or d.get('_parent')):
+        return True
+    loc = var.time
+    return loc is None or loc.start is None
 
 
 def _holds_empty_text(raw: Any) -> bool:
@@ -606,13 +684,23 @@ def _holds_empty_text(raw: Any) -> bool:
 
 
 class _Lines:
-    __slots__ = ('lines', 'node', 'row', 'raws', 'lists', 'sizes', 'flat', 'units', 'rooted',
-                 'paths', 'named', 'blanks', 'first_type', 'text', 'series', 'kept')
+    __slots__ = ('lines', 'node', 'row', 'raws', 'lists', 'sizes', 'flat', 'units',
+                 'blanks', 'first_type', 'text', 'series', 'kept', 'placed', 'places',
+                 'read_at', 'ref', 'stale', 'rows', '__weakref__')
 
     def __init__(self, lines: tuple[Variable, ...], node: Expr, row: bool) -> None:
         self.lines = lines
         self.node = node
         self.row = row
+        self.text: _Text = ''
+        #: What each of its lines holds: one weak reference, the same for each.
+        self.ref = weakref.ref(self)
+        for var in lines:
+            _watch(var, self.ref)
+        #: Set by a write to one of its lines: read them again before reuse.
+        self.stale = False
+        #: The rows the elements among its lines name, each holding it too.
+        self.rows: tuple[Variable, ...] = ()
         self._read()
 
     # A copy or a pickle of the node takes none of it: the lines are read
@@ -622,6 +710,17 @@ class _Lines:
 
     def _read(self) -> None:
         lines = self.lines
+        # One element of a row is named by the row (``_label``): the row's
+        # name or path written is a write to what was read. An element
+        # written may name another row: the rows are taken at each read.
+        rows = tuple(_rows_named(lines))
+        if len(rows) != len(self.rows) or not all(map(operator.is_, rows, self.rows)):
+            noted = set(map(id, self.rows))
+            for row in rows:
+                if id(row) not in noted:
+                    noted.add(id(row))
+                    _watch(row, self.ref)
+            self.rows = rows
         self.raws = tuple(map(_VALUE, lines))
         # The lists among the values — their lengths and their cells as read.
         self.lists = tuple(raw for raw in self.raws if isinstance(raw, list))
@@ -629,42 +728,41 @@ class _Lines:
         self.flat = tuple(chain.from_iterable(self.lists))
         self.units = tuple(map(_UNIT, lines))
         self.first_type = lines[0].value_type
-        rooted: list[Variable] = []
-        named: list[tuple[Variable, str]] = []
-        labels: list[str] = []
-        for var in lines:
-            label, by_path = ((src(var), var._qualified_id is not None) if self.row
-                              else _label_of(var))
-            labels.append(label)
-            if by_path:
-                rooted.append(var)
-            else:
-                named.append((var, label))
-        self.rooted = tuple(rooted)
-        self.paths = tuple(map(_PATH, rooted))
-        self.named = tuple(named)
-        self.text = labels[0] if self.row else f"[{', '.join(labels)}]"
+        if self.row:
+            self.text = src(lines[0])
+        else:
+            items = self.node.items if isinstance(self.node, ListExpr) else []
+            labels = (_label(item.var) for item in items if isinstance(item, VarRef))
+            self.text = _RangeText(f"[{', '.join(labels)}]")
+        # The lines that run on the window of the lines they read (per-period
+        # formulas placed by them), and where each runs: any window moving
+        # may move one.
+        self.placed = tuple(var for var in lines if _placed_by_its_lines(var))
+        self.places = tuple(map(_reads_on, self.placed))
         self.blanks = tuple((var, _typed_in(var)) for var, raw in zip(lines, self.raws)
                             if _holds_empty_text(raw))
         self.series = any(map(_series_value, self.raws))
         self.kept: dict[Any, Any] = {}
-
-    def _unchanged(self) -> bool:
-        lines = self.lines
-        if not (all(map(operator.is_, map(_VALUE, lines), self.raws))
-                and tuple(map(len, self.lists)) == self.sizes
-                and all(map(operator.is_, chain.from_iterable(self.lists), self.flat))
-                and all(map(operator.is_, map(_UNIT, lines), self.units))
-                and all(map(operator.is_, map(_PATH, self.rooted), self.paths))
-                and lines[0].value_type == self.first_type):
-            return False
-        name = src if self.row else _label
-        return (all(name(var) == label for var, label in self.named)
-                and all(_typed_in(var) is typed for var, typed in self.blanks))
+        # Taken last: naming the lines may settle their paths, which is a
+        # write, and marks this range.
+        self.stale = False
+        self.read_at = (_RANGE_WINDOWS[0],
+                        variable_ops._WINDOWS_EPOCH if self.placed else None)
 
     def check(self) -> None:
-        if not self._unchanged():
+        read_at = self.read_at
+        if (self.stale or read_at[0] != _RANGE_WINDOWS[0]
+                or tuple(map(len, self.lists)) != self.sizes
+                or not all(map(operator.is_, chain.from_iterable(self.lists), self.flat))
+                or not all(_typed_in(var) is typed for var, typed in self.blanks)):
             self._read()
+        elif read_at[1] is not None and read_at[1] != variable_ops._WINDOWS_EPOCH:
+            # A window moved somewhere since: read again only when a line
+            # placed by the lines it reads runs elsewhere now.
+            if tuple(map(_reads_on, self.placed)) != self.places:
+                self._read()
+            else:
+                self.read_at = (read_at[0], variable_ops._WINDOWS_EPOCH)
 
     # What ``make`` derives from the lines as they are now, derived once.
     def keep(self, key: Any, make: Callable[[], Any]) -> Any:
@@ -730,7 +828,23 @@ def _shared(arg: Any) -> _Lines | None:
     if isinstance(arg, Variable):
         return _find(_ROWS, id(arg), (arg,), True)
     if isinstance(arg, (list, tuple)) and arg:
-        return _find(_LISTS, tuple(map(id, arg)), arg, False)
+        ref = _BY_LIST.get(id(arg))
+        node = ref() if ref is not None else None
+        if node is not None:
+            shared: _Lines = node.__dict__['_lines']
+            lines = shared.lines
+            if lines is arg or (len(lines) == len(arg) and all(map(operator.is_, arg, lines))):
+                if type(arg) is tuple:
+                    shared.lines = arg      # the same lines, in a tuple that stays so
+                shared.check()
+                return shared
+        found = _find(_LISTS, tuple(map(id, arg)), arg, False)
+        if found is not None:
+            if type(arg) is tuple:
+                found.lines = arg
+            key = id(arg)
+            _BY_LIST[key] = weakref.ref(found.node, partial(_forget, _BY_LIST, key))
+        return found
     return None
 
 
@@ -1068,7 +1182,7 @@ def _pairs(args: tuple[Any, ...], where: str, example: str) -> list[tuple[Any, A
 
 
 def _mask(pairs: list[tuple[Any, Any]], where: str, like: _Range | None,
-          nodes: list[Expr], texts: list[str]
+          nodes: list[Expr], texts: list[_Text]
           ) -> tuple[list[tuple[_Range, _Criterion]], str | None]:
     """Every ``(range, criteria)`` pair read, and the error of the first
     criteria cell holding one; the ranges must be as long as ``like`` (the
@@ -1168,15 +1282,25 @@ def _ranked_type(rng: _Range) -> str:
     return rng.value_type if rng.value_type in ('int', 'float', 'datetime') else 'float'
 
 
-def _result(func: str, nodes: list[Expr], texts: list[str], value: Any,
+def _with_source(out: Variable, func: str, texts: Sequence[_Text]) -> Variable:
+    """``out`` with the call's source text: written out when every part is
+    a text, else composed when it is read (``Variable._source_call``) — a
+    list of lines among the parts named as its lines were named when its
+    range was read, in the one text every call over the range shares."""
+    if all(isinstance(text, str) for text in texts):
+        out._source_code = f"{func}({', '.join(map(str, texts))})"
+    else:
+        out._source_call = (func, tuple(texts))
+    return out
+
+
+def _result(func: str, nodes: list[Expr], texts: Sequence[_Text], value: Any,
             value_type: str) -> Variable:
     """One number with its formula; its unit is the function's law (see
     Units below)."""
     with _checked(nodes):
-        return make_func_var(
-            func, nodes, value, value_type, 'scalar',
-            source_code=f"{func}({', '.join(texts)})",
-        )
+        out = make_func_var(func, nodes, value, value_type, 'scalar')
+    return _with_source(out, func, texts)
 
 
 # ─── The functions ──────────────────────────────────────────────────
@@ -1239,7 +1363,7 @@ def COUNTIFS(*criteria: Any) -> Variable:
     (renders ``=COUNTIFS(...)``): ``mo.COUNTIFS(region, "North", amount, ">0")``."""
     where = "COUNTIFS"
     nodes: list[Expr] = []
-    texts: list[str] = []
+    texts: list[_Text] = []
     pairs = _pairs(criteria, where, "mo.COUNTIFS(range1, criteria1, range2, criteria2)")
     read, error = _mask(pairs, where, None, nodes, texts)
     value = error or len(_admitted(read))
@@ -1307,7 +1431,7 @@ def MINIFS(min_range: RangeArg, *criteria: Any) -> Variable:
 
 
 def _count_operands(args: tuple[Any, ...], where: str) -> tuple[list[tuple[Any, bool]],
-                                                                 list[Expr], list[str]]:
+                                                                 list[Expr], list[_Text]]:
     """``(value, typed)`` per cell — ``typed`` for a value given in the
     call itself, not read from a cell or a list (an array) — with the
     AST nodes and names."""
@@ -1318,7 +1442,7 @@ def _count_operands(args: tuple[Any, ...], where: str) -> tuple[list[tuple[Any, 
         )
     cells: list[tuple[Any, bool]] = []
     nodes: list[Expr] = []
-    texts: list[str] = []
+    texts: list[_Text] = []
     for a in args:
         if isinstance(a, (Variable, list, tuple)):
             rng = _range(a, where)
@@ -1387,7 +1511,7 @@ def _count_each_period(where: str, args: tuple[Any, ...],
     raws: list[Any] = []
     typed: list[bool] = []
     nodes: list[Expr] = []
-    texts: list[str] = []
+    texts: list[_Text] = []
     for a in args:
         if isinstance(a, Variable):
             reject_axised(a, where)
@@ -1431,9 +1555,8 @@ def _count_each_period(where: str, args: tuple[Any, ...],
         value = _per_period(raws, one)
         var_type = 'list' if isinstance(value, list) else 'scalar'
     with _checked(nodes):
-        out = make_func_var(where, nodes, value, 'int', var_type,
-                            source_code=f"{where}({', '.join(texts)})")
-    return placed(out, window, keys)
+        out = make_func_var(where, nodes, value, 'int', var_type)
+    return placed(_with_source(out, where, texts), window, keys)
 
 
 def _counta_counts(value: Any, typed: bool) -> bool:
